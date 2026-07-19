@@ -16,7 +16,7 @@ pub fn generate_application(spec: &AppSpec) -> anyhow::Result<GeneratedStack> {
     let mut document = Document::default();
     let environment = spec.environment.clone();
     let mut service = Service {
-        image: spec.image.clone(),
+        image: format!("{}:{}", spec.image, spec.version),
         container_name: Some(format!("nihility-{}", spec.name)),
         command: spec.command.clone(),
         restart: Some(String::from("unless-stopped")),
@@ -65,12 +65,14 @@ pub fn generate_static_site(spec: &StaticSiteSpec) -> anyhow::Result<GeneratedSt
     let app = AppSpec {
         name: spec.name.clone(),
         service: String::from("web"),
-        image: format!("nginx:{}", spec.nginx_version),
+        image: String::from("nginx"),
+        version: spec.nginx_version.clone(),
         command: Vec::new(),
         container_port: 80,
         routes: vec![super::Route {
             host: spec.host.clone(),
             path_prefix: None,
+            container_port: 80,
         }],
         published_ports: Vec::new(),
         volumes: vec![Volume {
@@ -114,9 +116,10 @@ fn route_labels(spec: &AppSpec) -> Vec<String> {
             format!("traefik.http.routers.{router}.entrypoints=https"),
             format!("traefik.http.routers.{router}.tls=true"),
             format!("traefik.http.routers.{router}.tls.certresolver=cloudflare"),
+            format!("traefik.http.routers.{router}.service={router}"),
             format!(
                 "traefik.http.services.{router}.loadbalancer.server.port={}",
-                spec.container_port
+                route.container_port
             ),
         ]);
         if !spec.middlewares.is_empty() {
@@ -168,8 +171,14 @@ fn format_volume(volume: &Volume) -> String {
 fn validate_app(spec: &AppSpec) -> anyhow::Result<()> {
     crate::orchestrator::validate_stack_name(&spec.name)?;
     crate::orchestrator::validate_stack_name(&spec.service)?;
-    if spec.image.trim().is_empty() || spec.image.contains(['\n', '\r', '\0']) {
-        anyhow::bail!("镜像不能为空或包含控制字符");
+    if spec.image.trim().is_empty()
+        || spec.image.contains(['\n', '\r', '\0', '@'])
+        || image_has_tag(&spec.image)
+    {
+        anyhow::bail!("镜像名不能为空、不能包含摘要或版本标签；请使用 --version 指定标签");
+    }
+    if !crate::orchestrator::valid_image_version(&spec.version) {
+        anyhow::bail!("镜像版本标签格式无效，且不能使用 latest");
     }
     if spec.container_port == 0 && !spec.routes.is_empty() {
         anyhow::bail!("配置 HTTP 路由时必须指定容器端口");
@@ -211,6 +220,14 @@ fn validate_app(spec: &AppSpec) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// 判断镜像名最后一个路径片段是否已经包含标签。
+fn image_has_tag(image: &str) -> bool {
+    let last_slash = image.rfind('/');
+    image
+        .rfind(':')
+        .is_some_and(|colon| last_slash.is_none_or(|slash| colon > slash))
 }
 
 /// 引用环境变量文件中的值。

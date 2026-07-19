@@ -47,16 +47,24 @@ pub(super) fn application_spec(input: CreateApplicationRequest) -> anyhow::Resul
         name: input.name,
         service: input.service,
         image: input.image,
+        version: input.version,
         command: input.command,
         container_port: checked_port(input.container_port, "容器端口")?,
         routes: input
             .routes
             .into_iter()
-            .map(|route| Route {
-                host: route.host,
-                path_prefix: (!route.path_prefix.is_empty()).then_some(route.path_prefix),
+            .map(|route| {
+                Ok(Route {
+                    host: route.host,
+                    path_prefix: (!route.path_prefix.is_empty()).then_some(route.path_prefix),
+                    container_port: if route.container_port == 0 {
+                        checked_port(input.container_port, "容器端口")?
+                    } else {
+                        checked_port(route.container_port, "路由容器端口")?
+                    },
+                })
             })
-            .collect(),
+            .collect::<anyhow::Result<Vec<_>>>()?,
         published_ports: input
             .published_ports
             .into_iter()

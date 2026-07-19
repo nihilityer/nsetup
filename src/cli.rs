@@ -101,6 +101,17 @@ pub enum Commands {
         /// 应用名称。
         app: String,
     },
+    /// 设置应用镜像版本，拉取镜像并重新创建服务。
+    Upgrade {
+        /// 应用名称。
+        app: String,
+        /// Compose 服务名；单服务应用可以省略。
+        #[arg(long)]
+        service: Option<String>,
+        /// 新镜像版本标签。
+        #[arg(long, value_parser = validate_version_arg)]
+        version: String,
+    },
     /// 拉取 Compose 项目的最新镜像。
     Pull {
         /// 应用名称。
@@ -188,6 +199,17 @@ pub enum RpcCmd {
         /// 项目名称。
         name: String,
     },
+    /// 设置服务镜像版本并立即更新。
+    Upgrade {
+        /// 项目名称。
+        name: String,
+        /// Compose 服务名；单服务应用可以省略。
+        #[arg(long)]
+        service: Option<String>,
+        /// 新镜像版本标签。
+        #[arg(long, value_parser = validate_version_arg)]
+        version: String,
+    },
     /// 拉取远程项目镜像。
     Pull {
         /// 项目名称。
@@ -214,4 +236,15 @@ pub enum RpcCmd {
         #[arg(short = 'f', long)]
         follow: bool,
     },
+}
+
+/// 在发起 RPC 前校验镜像版本参数。
+fn validate_version_arg(value: &str) -> Result<String, String> {
+    if crate::orchestrator::valid_image_version(value) {
+        Ok(value.to_string())
+    } else {
+        Err(String::from(
+            "必须指定明确的镜像版本标签，且不能使用 latest",
+        ))
+    }
 }

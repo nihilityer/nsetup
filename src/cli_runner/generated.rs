@@ -43,10 +43,12 @@ pub(super) async fn run_app(action: AppCmd) -> anyhow::Result<()> {
             let AddArgs {
                 name,
                 image,
+                version,
                 service,
                 command,
                 container_port,
                 hosts,
+                routes,
                 path_prefix,
                 tcp_ports,
                 udp_ports,
@@ -94,6 +96,7 @@ pub(super) async fn run_app(action: AppCmd) -> anyhow::Result<()> {
                 name,
                 service,
                 image,
+                version,
                 command,
                 container_port: u32::from(container_port),
                 routes: hosts
@@ -101,7 +104,13 @@ pub(super) async fn run_app(action: AppCmd) -> anyhow::Result<()> {
                     .map(|host| ApplicationRoute {
                         host,
                         path_prefix: path_prefix.clone().unwrap_or_default(),
+                        container_port: u32::from(container_port),
                     })
+                    .chain(routes.into_iter().map(|route| ApplicationRoute {
+                        host: route.host,
+                        path_prefix: path_prefix.clone().unwrap_or_default(),
+                        container_port: u32::from(route.container_port),
+                    }))
                     .collect(),
                 published_ports,
                 volumes: mapped_volumes,
@@ -120,6 +129,28 @@ pub(super) async fn run_app(action: AppCmd) -> anyhow::Result<()> {
             };
             let mut client = RpcClient::connect(None, None).await?;
             tracing::info!("{}", client.create_application(input).await?.message);
+        }
+        AppCmd::Edit {
+            name,
+            compose,
+            env_file,
+            start,
+        } => {
+            let compose_yaml = std::fs::read_to_string(&compose)
+                .with_context(|| format!("无法读取 Compose 文件 {}", compose.display()))?;
+            let env_content = env_file
+                .as_deref()
+                .map(std::fs::read_to_string)
+                .transpose()
+                .context("无法读取环境变量文件")?;
+            let mut client = RpcClient::connect(None, None).await?;
+            tracing::info!(
+                "{}",
+                client
+                    .update(name, compose_yaml, env_content, start)
+                    .await?
+                    .message
+            );
         }
         AppCmd::AddStatic {
             name,

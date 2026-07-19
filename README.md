@@ -89,9 +89,12 @@ Cloudflare DNS-01、TLS 1.2 最低版本、容器健康检查及日志轮转。
 常规单服务应用可以直接从镜像生成。有限选项使用枚举，当前中间件包括
 `gzip`、`forwarded-headers` 和 `internal-only`：
 
+所有容器镜像都必须指定明确版本；`latest` 和省略标签的镜像引用会被拒绝。
+
 ```bash
 nsetup app add whoami \
-  --image traefik/whoami:v1.11 \
+  --image traefik/whoami \
+  --version v1.11 \
   --container-port 80 \
   --host whoami.example.com \
   --middleware gzip \
@@ -102,7 +105,8 @@ nsetup app add whoami \
 
 ```bash
 nsetup app add api \
-  --image ghcr.io/example/api:1.0 \
+  --image ghcr.io/example/api \
+  --version 1.0 \
   --container-port 8080 \
   --host api.example.com \
   --publish 12780:8080 \
@@ -110,6 +114,9 @@ nsetup app add api \
   --env LOG_LEVEL=info \
   --start
 ```
+
+同一个容器暴露多个 HTTP 服务时，使用 `--route HOST:PORT` 为每个域名指定不同的
+容器端口；原有 `--host` 仍使用 `--container-port` 指定的统一端口。
 
 静态站点会递归上传普通文件到 daemon，拒绝符号链接、路径穿越、超过 10000 个文件
 或总计超过 64 MiB 的输入：
@@ -122,7 +129,20 @@ nsetup app add-static docs \
   --start
 ```
 
-复杂的多服务项目继续使用 `nsetup deploy --compose ...`，不会被单服务生成器限制。
+复杂的多服务项目使用完整 Compose 文件创建或修改，不受单服务生成器限制：
+
+```bash
+nsetup deploy media --compose ./compose.yaml --env-file ./.env --start
+nsetup app edit media --compose ./compose.yaml --env-file ./.env --start
+```
+
+升级时分别指定应用、服务和版本。单服务应用可以省略 `--service`；多服务应用必须指定，
+命令会修改保存的 Compose 镜像标签、拉取新镜像并重新创建目标服务：
+
+```bash
+nsetup upgrade whoami --version v1.12
+nsetup upgrade media --service api --version 2.4.0
+```
 
 ## 配置
 

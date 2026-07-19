@@ -89,6 +89,28 @@ message DeployStackRequest {
   bool start = 4;
 }
 
+// 修改已有 Compose 项目的请求。
+message UpdateStackRequest {
+  // 已存在的 Compose 项目名。
+  string name = 1;
+  // 新的完整 Compose YAML 文件内容。
+  string compose_yaml = 2;
+  // 新的环境变量文件内容；省略时保留服务端现有文件。
+  optional string env_file = 3;
+  // 是否在修改成功后执行 compose up。
+  bool start = 4;
+}
+
+// 设置应用中某个 Compose 服务的镜像版本并立即更新。
+message UpgradeApplicationRequest {
+  // Compose 项目名。
+  string name = 1;
+  // Compose 服务名；项目只有一个服务时可以留空。
+  string service = 2;
+  // 新镜像版本标签，不包含冒号。
+  string version = 3;
+}
+
 // 删除 Compose 项目的请求。
 message RemoveStackRequest {
   // 要删除的 Compose 项目名。

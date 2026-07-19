@@ -18,6 +18,9 @@ service Orchestrator {
   // 根据类型化参数生成并部署单服务应用。
   rpc CreateApplication(CreateApplicationRequest) returns (OperationResponse);
 
+  // 设置 Compose 服务的镜像版本，拉取镜像并重新创建该服务。
+  rpc UpgradeApplication(UpgradeApplicationRequest) returns (OperationResponse);
+
   // 根据本地静态文件生成并部署 Nginx 静态站点。
   rpc CreateStaticSite(CreateStaticSiteRequest) returns (OperationResponse);
 
@@ -29,6 +32,9 @@ service Orchestrator {
 
   // 创建或更新 Compose 项目，并可选择在部署后立即启动。
   rpc DeployStack(DeployStackRequest) returns (OperationResponse);
+
+  // 修改已有 Compose 项目，未提供环境文件时保留原内容。
+  rpc UpdateStack(UpdateStackRequest) returns (OperationResponse);
 
   // 停止项目并删除其 Compose 配置，可选择同时删除命名卷。
   rpc RemoveStack(RemoveStackRequest) returns (OperationResponse);
@@ -104,7 +110,7 @@ message CreateApplicationRequest {
   string name = 1;
   // Compose 服务名。
   string service = 2;
-  // 容器镜像及标签。
+  // 不含标签的容器镜像名。
   string image = 3;
   // 覆盖镜像默认命令的参数列表。
   repeated string command = 4;
@@ -129,6 +135,8 @@ message CreateApplicationRequest {
   bool start = 14;
   // 是否覆盖已有项目配置。
   bool force = 15;
+  // 容器镜像版本标签。
+  string version = 16;
 }
 
 // 创建静态站点的请求。
@@ -155,6 +163,8 @@ message ApplicationRoute {
   string host = 1;
   // 可选的 URL 路径前缀。
   string path_prefix = 2;
+  // 此路由连接的容器端口；未指定时使用应用默认容器端口。
+  uint32 container_port = 3;
 }
 
 // 宿主机端口映射。

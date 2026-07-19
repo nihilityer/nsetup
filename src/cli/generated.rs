@@ -19,7 +19,7 @@ pub enum InfraCmd {
         #[arg(long)]
         cloudflare_token_file: PathBuf,
         /// Traefik 镜像版本。
-        #[arg(long, default_value = "v3.7.8")]
+        #[arg(long, default_value = "v3.7.8", value_parser = super::validate_version_arg)]
         traefik_version: String,
         /// 生成后立即启动。
         #[arg(long)]
@@ -35,6 +35,20 @@ pub enum InfraCmd {
 pub enum AppCmd {
     /// 从镜像生成常规单服务应用。
     Add(Box<AddArgs>),
+    /// 使用完整 Compose 文件修改现有应用，支持多服务项目。
+    Edit {
+        /// Compose 项目名。
+        name: String,
+        /// 新的 Compose YAML 文件路径。
+        #[arg(long)]
+        compose: PathBuf,
+        /// 新的环境变量文件路径；不指定时保留现有内容。
+        #[arg(long)]
+        env_file: Option<PathBuf>,
+        /// 修改后立即启动或重新创建应用。
+        #[arg(long)]
+        start: bool,
+    },
     /// 从目录生成 Nginx 静态站点。
     AddStatic {
         /// Compose 项目名。
@@ -49,7 +63,7 @@ pub enum AppCmd {
         #[arg(long, value_enum)]
         middleware: Vec<MiddlewareArg>,
         /// Nginx 镜像版本。
-        #[arg(long, default_value = "1.27-alpine")]
+        #[arg(long, default_value = "1.27-alpine", value_parser = super::validate_version_arg)]
         nginx_version: String,
         /// 生成后立即启动。
         #[arg(long)]
@@ -65,9 +79,12 @@ pub enum AppCmd {
 pub struct AddArgs {
     /// Compose 项目名。
     pub name: String,
-    /// 容器镜像及标签。
+    /// 不含版本标签的容器镜像名。
     #[arg(long)]
     pub image: String,
+    /// 容器镜像版本标签。
+    #[arg(long, value_parser = super::validate_version_arg)]
+    pub version: String,
     /// Compose 服务名。
     #[arg(long, default_value = "app")]
     pub service: String,
@@ -80,6 +97,9 @@ pub struct AddArgs {
     /// 完整访问域名；可重复指定。
     #[arg(long = "host")]
     pub hosts: Vec<String>,
+    /// 指向指定容器端口的路由，格式为 HOST:PORT；可重复指定。
+    #[arg(long = "route")]
+    pub routes: Vec<RouteArg>,
     /// 应用于全部域名的 URL 路径前缀。
     #[arg(long)]
     pub path_prefix: Option<String>,
@@ -144,6 +164,32 @@ pub struct PortMappingArg {
     pub host: u16,
     /// 容器端口。
     pub container: u16,
+}
+
+/// CLI HTTP 路由。
+#[derive(Debug, Clone)]
+pub struct RouteArg {
+    /// 完整访问域名。
+    pub host: String,
+    /// 此路由连接的容器端口。
+    pub container_port: u16,
+}
+
+impl FromStr for RouteArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (host, port) = value
+            .rsplit_once(':')
+            .ok_or_else(|| String::from("路由格式必须为 HOST:PORT"))?;
+        if host.is_empty() {
+            return Err(String::from("路由域名不能为空"));
+        }
+        Ok(Self {
+            host: host.to_string(),
+            container_port: parse_port(port)?,
+        })
+    }
 }
 
 impl FromStr for PortMappingArg {

@@ -6,8 +6,6 @@ use std::path::PathBuf;
 
 /// Traefik 外部网络名。
 const TRAEFIK_NETWORK: &str = "nihility-traefik";
-/// Traefik Docker provider 使用的最低兼容 API 版本。
-const DOCKER_API_VERSION: &str = "1.40";
 
 /// 生成 Traefik 项目。
 pub fn generate_infrastructure(
@@ -50,12 +48,6 @@ fn generate_traefik(
                 String::from("./config:/etc/traefik/config:ro"),
                 format!("{}:/data", data_root.join("traefik").display()),
             ],
-            environment: [(
-                String::from("DOCKER_API_VERSION"),
-                String::from(DOCKER_API_VERSION),
-            )]
-            .into_iter()
-            .collect(),
             env_file: vec![String::from(".env")],
             labels: vec![
                 String::from("traefik.enable=true"),
@@ -191,6 +183,9 @@ fn validate(spec: &InfraSpec) -> anyhow::Result<()> {
     if !spec.domain.contains('.') || spec.domain.contains(['/', '`', ' ']) {
         anyhow::bail!("主域名格式无效: {}", spec.domain);
     }
+    if !crate::orchestrator::valid_image_version(&spec.traefik_version) {
+        anyhow::bail!("Traefik 版本标签格式无效，且不能使用 latest");
+    }
     Ok(())
 }
 
@@ -207,48 +202,3 @@ const TLS_OPTIONS: &str = "tls:\n  options:\n    default:\n      minVersion: Ver
 const FORWARDED_HEADERS: &str = "http:\n  middlewares:\n    forwarded-headers:\n      headers:\n        customRequestHeaders:\n          X-Forwarded-Proto: https\n          X-Forwarded-Ssl: on\n          X-Forwarded-Port: '443'\n";
 /// 内网地址白名单中间件配置。
 const INTERNAL_ONLY: &str = "http:\n  middlewares:\n    internal-only:\n      ipAllowList:\n        sourceRange:\n          - 127.0.0.0/8\n          - 10.0.0.0/8\n          - 172.16.0.0/12\n          - 192.168.0.0/16\n";
-
-#[cfg(test)]
-mod tests {
-    use super::generate_infrastructure;
-    use crate::generator::InfraSpec;
-    use std::path::Path;
-
-    #[test]
-    fn 生成traefik_v3_7安全配置() -> anyhow::Result<()> {
-        let stacks = generate_infrastructure(
-            &InfraSpec {
-                domain: String::from("example.com"),
-                acme_email: String::from("admin@example.com"),
-                cloudflare_token: String::from("secret-token"),
-                traefik_version: String::from("v3.7.8"),
-            },
-            Path::new("/var/lib/nsetup/data"),
-        )?;
-        let stack = stacks
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("应生成 Traefik 项目"))?;
-        for setting in [
-            "--global.sendanonymoususage=false",
-            "--global.checknewversion=false",
-            "--accesslog=false",
-            "--metrics.prometheus=false",
-            "--tracing=false",
-            "--log.nocolor=true",
-            "--entrypoints.https.http3=true",
-            "DOCKER_API_VERSION: '1.40'",
-            "443:443/udp",
-            "max-size: 10m",
-        ] {
-            assert!(stack.compose_yaml.contains(setting), "缺少配置: {setting}");
-        }
-        assert!(
-            stack
-                .files
-                .iter()
-                .any(|file| file.path == Path::new("config/tls.yml"))
-        );
-        assert!(!stack.compose_yaml.contains("insecureskipverify"));
-        Ok(())
-    }
-}

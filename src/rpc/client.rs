@@ -5,7 +5,7 @@ use super::proto::{
     CreateApplicationRequest, CreateStaticSiteRequest, DeployStackRequest, GetLogsRequest,
     GetStackRequest, HealthRequest, HealthResponse, InitializeInfrastructureRequest,
     ListStacksRequest, ListStacksResponse, LogLine, OperationResponse, PullProgress,
-    RemoveStackRequest, Stack, StackActionRequest,
+    RemoveStackRequest, Stack, StackActionRequest, UpdateStackRequest, UpgradeApplicationRequest,
 };
 use crate::config::config_dir;
 use crate::constants::{AUTH_TOKEN_FILE, GRPC_SOCKET};
@@ -78,6 +78,26 @@ impl RpcClient {
         Ok(self.inner.create_application(request).await?.into_inner())
     }
 
+    /// 设置应用服务的镜像版本并立即更新。
+    pub async fn upgrade_application(
+        &mut self,
+        name: String,
+        service: Option<String>,
+        version: String,
+    ) -> anyhow::Result<OperationResponse> {
+        let request = self.request(UpgradeApplicationRequest {
+            name,
+            service: service.unwrap_or_default(),
+            version,
+        });
+        Ok(self
+            .inner
+            .upgrade_application(request)
+            .await
+            .map_err(rpc_error)?
+            .into_inner())
+    }
+
     /// 生成并部署静态站点。
     pub async fn create_static_site(
         &mut self,
@@ -114,6 +134,28 @@ impl RpcClient {
             start,
         });
         Ok(self.inner.deploy_stack(request).await?.into_inner())
+    }
+
+    /// 修改已有项目，环境变量内容为 `None` 时由服务端保留现有文件。
+    pub async fn update(
+        &mut self,
+        name: String,
+        compose_yaml: String,
+        env_file: Option<String>,
+        start: bool,
+    ) -> anyhow::Result<OperationResponse> {
+        let request = self.request(UpdateStackRequest {
+            name,
+            compose_yaml,
+            env_file,
+            start,
+        });
+        Ok(self
+            .inner
+            .update_stack(request)
+            .await
+            .map_err(rpc_error)?
+            .into_inner())
     }
 
     /// 停止并删除项目。

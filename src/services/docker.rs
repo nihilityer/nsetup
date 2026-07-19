@@ -14,6 +14,11 @@ pub fn compose_up(app_dir: &Path) -> anyhow::Result<()> {
     run_compose(app_dir, &["up", "-d"]).map(|_| ())
 }
 
+/// 执行 `docker compose up -d SERVICE`，重新创建指定服务及其依赖。
+pub fn compose_up_service(app_dir: &Path, service: &str) -> anyhow::Result<()> {
+    run_compose(app_dir, &["up", "-d", service]).map(|_| ())
+}
+
 /// 执行 `docker compose down`
 pub fn compose_down(app_dir: &Path, remove_volumes: bool) -> anyhow::Result<()> {
     if remove_volumes {
@@ -135,6 +140,11 @@ pub fn compose_pull(
     Ok(())
 }
 
+/// 执行 `docker compose pull SERVICE`。
+pub fn compose_pull_service(app_dir: &Path, service: &str) -> anyhow::Result<()> {
+    run_compose(app_dir, &["pull", service]).map(|_| ())
+}
+
 /// 执行 `docker compose build`
 pub fn compose_build(app_dir: &Path) -> anyhow::Result<()> {
     run_compose(app_dir, &["build"]).map(|_| ())
@@ -231,9 +241,9 @@ pub fn compose_logs(
     Ok(())
 }
 
-/// 使用 Docker Compose 解析并验证项目配置
-pub fn compose_validate(app_dir: &Path) -> anyhow::Result<()> {
-    run_compose(app_dir, &["config", "--quiet"]).map(|_| ())
+/// 使用 Docker Compose 解析项目配置并返回完成变量插值的 YAML。
+pub fn compose_config(app_dir: &Path) -> anyhow::Result<String> {
+    run_compose(app_dir, &["config"])
 }
 
 /// 为指定项目构建参数完整且与当前目录无关的 Compose 命令

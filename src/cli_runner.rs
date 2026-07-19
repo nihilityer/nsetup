@@ -54,6 +54,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Start { app } => run_remote_action(app, StackAction::Start).await,
         Commands::Stop { app } => run_remote_action(app, StackAction::Stop).await,
         Commands::Restart { app } => run_remote_action(app, StackAction::Restart).await,
+        Commands::Upgrade {
+            app,
+            service,
+            version,
+        } => run_upgrade(app, service, version).await,
         Commands::Pull { app } => run_default_pull(app).await,
         Commands::Build { app } => run_remote_action(app, StackAction::Build).await,
         Commands::Show { app } => {
@@ -111,6 +116,16 @@ async fn run_rpc(
         RpcCmd::Start { name } => run_action(&mut client, name, StackAction::Start).await?,
         RpcCmd::Stop { name } => run_action(&mut client, name, StackAction::Stop).await?,
         RpcCmd::Restart { name } => run_action(&mut client, name, StackAction::Restart).await?,
+        RpcCmd::Upgrade {
+            name,
+            service,
+            version,
+        } => log_message(
+            &client
+                .upgrade_application(name, service, version)
+                .await?
+                .message,
+        ),
         RpcCmd::Pull { name } => run_pull(&mut client, name).await?,
         RpcCmd::Build { name } => run_action(&mut client, name, StackAction::Build).await?,
         RpcCmd::Show { name } => show_stack(client.get_stack(name).await?, false),
@@ -140,6 +155,18 @@ async fn run_remote_action(app: String, action: StackAction) -> anyhow::Result<(
 async fn run_default_pull(app: String) -> anyhow::Result<()> {
     let mut client = RpcClient::connect(None, None).await?;
     run_pull(&mut client, app).await
+}
+
+/// 设置应用服务的镜像版本并完成拉取与重新创建。
+async fn run_upgrade(app: String, service: Option<String>, version: String) -> anyhow::Result<()> {
+    let mut client = RpcClient::connect(None, None).await?;
+    log_message(
+        &client
+            .upgrade_application(app, service, version)
+            .await?
+            .message,
+    );
+    Ok(())
 }
 
 /// 使用已有 RPC 客户端执行应用生命周期操作。

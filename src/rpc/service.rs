@@ -9,7 +9,7 @@ use super::proto::{
     CreateApplicationRequest, CreateStaticSiteRequest, DeployStackRequest, GetLogsRequest,
     GetStackRequest, HealthRequest, HealthResponse, InitializeInfrastructureRequest,
     ListStacksRequest, ListStacksResponse, LogLine, OperationResponse, PullProgress,
-    RemoveStackRequest, Stack, StackActionRequest,
+    RemoveStackRequest, Stack, StackActionRequest, UpdateStackRequest, UpgradeApplicationRequest,
 };
 use crate::config::{Config, check_docker};
 use crate::generator::{self, Route};
@@ -156,6 +156,30 @@ impl Orchestrator for OrchestratorService {
         Ok(operation_response(format!("应用 {name} 已生成")))
     }
 
+    async fn upgrade_application(
+        &self,
+        request: Request<UpgradeApplicationRequest>,
+    ) -> Result<Response<OperationResponse>, Status> {
+        let config = self.config.clone();
+        let input = request.into_inner();
+        let name = input.name.clone();
+        let version = input.version.clone();
+        let service = (!input.service.is_empty()).then_some(input.service);
+        let (service, image) = self
+            .mutate(move || {
+                orchestrator::upgrade_application(
+                    &config,
+                    &input.name,
+                    service.as_deref(),
+                    &input.version,
+                )
+            })
+            .await?;
+        Ok(operation_response(format!(
+            "应用 {name} 的服务 {service} 已升级到 {image}（版本 {version}）"
+        )))
+    }
+
     async fn create_static_site(
         &self,
         request: Request<CreateStaticSiteRequest>,
@@ -170,6 +194,7 @@ impl Orchestrator for OrchestratorService {
             let routes = vec![Route {
                 host: spec.host.clone(),
                 path_prefix: None,
+                container_port: 80,
             }];
             orchestrator::ensure_no_conflicts(&config, &spec.name, &routes, &[])?;
             let generated = generator::generate_static_site(&spec).map_err(invalid_generation)?;
@@ -223,6 +248,26 @@ impl Orchestrator for OrchestratorService {
         })
         .await?;
         Ok(operation_response(format!("项目 {name} 已部署")))
+    }
+
+    async fn update_stack(
+        &self,
+        request: Request<UpdateStackRequest>,
+    ) -> Result<Response<OperationResponse>, Status> {
+        let config = self.config.clone();
+        let input = request.into_inner();
+        let name = input.name.clone();
+        self.mutate(move || {
+            orchestrator::update_stack(
+                &config,
+                &input.name,
+                &input.compose_yaml,
+                input.env_file.as_deref(),
+                input.start,
+            )
+        })
+        .await?;
+        Ok(operation_response(format!("项目 {name} 已修改")))
     }
 
     async fn remove_stack(

@@ -23,8 +23,10 @@ pub struct AppSpec {
     pub name: String,
     /// Compose 服务名。
     pub service: String,
-    /// 容器镜像。
+    /// 不含版本标签的容器镜像名。
     pub image: String,
+    /// 容器镜像版本标签。
+    pub version: String,
     /// 覆盖镜像默认命令的参数。
     pub command: Vec<String>,
     /// Traefik 连接的容器端口。
@@ -65,6 +67,8 @@ pub struct Route {
     pub host: String,
     /// 可选的 URL 路径前缀。
     pub path_prefix: Option<String>,
+    /// 此路由连接的容器端口。
+    pub container_port: u16,
 }
 
 /// 宿主机端口映射。
