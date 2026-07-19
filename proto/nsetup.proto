@@ -102,6 +102,10 @@ message InitializeInfrastructureRequest {
   bool start = 10;
   // 是否覆盖已有的基础设施配置。
   bool force = 11;
+  // Traefik HTTP 入口映射到宿主机的端口；未指定时为 80。
+  uint32 http_port = 12;
+  // Traefik HTTPS 和 HTTP/3 入口映射到宿主机的端口；未指定时为 443。
+  uint32 https_port = 13;
 }
 
 // 创建常规单服务应用的请求。

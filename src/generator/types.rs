@@ -14,6 +14,10 @@ pub struct InfraSpec {
     pub cloudflare_token: String,
     /// Traefik 镜像版本。
     pub traefik_version: String,
+    /// 映射到宿主机的 HTTP 端口。
+    pub http_port: u16,
+    /// 映射到宿主机的 HTTPS 和 HTTP/3 端口。
+    pub https_port: u16,
 }
 
 /// 常规单服务应用生成参数。

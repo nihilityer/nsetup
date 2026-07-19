@@ -105,7 +105,7 @@ impl Orchestrator for OrchestratorService {
         let config = self.config.clone();
         let input = request.into_inner();
         self.mutate(move || {
-            let spec = infrastructure_spec(&input);
+            let spec = infrastructure_spec(&input)?;
             let stacks = generator::generate_infrastructure(&spec, &config.paths.data_root)
                 .map_err(invalid_generation)?;
             if !input.force {

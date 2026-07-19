@@ -8,17 +8,17 @@
 
 两种安装方式均遵循 FHS 和 systemd 的目录约定：
 
-| 内容 | 路径 | 管理者 |
-| --- | --- | --- |
-| 单文件安装的二进制 | `/usr/local/bin/nsetup` | `nsetup init` |
-| 单文件安装的 systemd unit | `/etc/systemd/system/nsetup.service` | `nsetup init` |
-| Debian 包二进制 | `/usr/bin/nsetup` | dpkg |
-| Debian 包 systemd unit | `/lib/systemd/system/nsetup.service` | dpkg |
-| 配置 | `/etc/nsetup/config.toml` | 管理员；升级时保留 |
-| Compose 项目 | `/var/lib/nsetup/stacks` | daemon |
-| 容器数据默认根目录 | `/var/lib/nsetup/data` | daemon |
-| 本机 gRPC socket | `/run/nsetup/nsetup.sock` | systemd/daemon |
-| 远程 TCP token | `/etc/nsetup/auth.token` | daemon |
+| 内容                    | 路径                                   | 管理者            |
+|-----------------------|--------------------------------------|----------------|
+| 单文件安装的二进制             | `/usr/local/bin/nsetup`              | `nsetup init`  |
+| 单文件安装的 systemd unit   | `/etc/systemd/system/nsetup.service` | `nsetup init`  |
+| Debian 包二进制           | `/usr/bin/nsetup`                    | dpkg           |
+| Debian 包 systemd unit | `/lib/systemd/system/nsetup.service` | dpkg           |
+| 配置                    | `/etc/nsetup/config.toml`            | 管理员；升级时保留      |
+| Compose 项目            | `/var/lib/nsetup/stacks`             | daemon         |
+| 容器数据默认根目录             | `/var/lib/nsetup/data`               | daemon         |
+| 本机 gRPC socket        | `/run/nsetup/nsetup.sock`            | systemd/daemon |
+| 远程 TCP token          | `/etc/nsetup/auth.token`             | daemon         |
 
 运行目录随重启清理，配置和持久数据保存在系统目录，不写入 `~/.nsetup`。
 
@@ -75,6 +75,20 @@ nsetup infra init \
   --domain example.com \
   --acme-email admin@example.com \
   --cloudflare-token-file ./cloudflare.token \
+  --start
+```
+
+需要规避防火墙的标准端口限制时，可以修改宿主机入口端口。容器内仍监听 80/443，
+HTTPS 重定向和 HTTP/3 广播端口会自动同步：
+
+```bash
+nsetup infra init \
+  --domain example.com \
+  --acme-email admin@example.com \
+  --cloudflare-token-file ./cloudflare.token \
+  --http-port 8080 \
+  --https-port 8443 \
+  --force \
   --start
 ```
 

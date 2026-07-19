@@ -18,6 +18,8 @@ pub(super) async fn run_infra(action: InfraCmd) -> anyhow::Result<()> {
             acme_email,
             cloudflare_token_file,
             traefik_version,
+            http_port,
+            https_port,
             start,
             force,
         } => {
@@ -26,6 +28,8 @@ pub(super) async fn run_infra(action: InfraCmd) -> anyhow::Result<()> {
                 acme_email,
                 cloudflare_token: read_secret(&cloudflare_token_file)?,
                 traefik_version,
+                http_port: u32::from(http_port),
+                https_port: u32::from(https_port),
                 start,
                 force,
             };

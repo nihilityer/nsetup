@@ -103,13 +103,27 @@ pub(super) fn application_spec(input: CreateApplicationRequest) -> anyhow::Resul
 }
 
 /// 将基础设施协议请求转换为内部生成参数。
-pub(super) fn infrastructure_spec(input: &InitializeInfrastructureRequest) -> InfraSpec {
-    InfraSpec {
+pub(super) fn infrastructure_spec(
+    input: &InitializeInfrastructureRequest,
+) -> anyhow::Result<InfraSpec> {
+    let http_port = if input.http_port == 0 {
+        80
+    } else {
+        checked_port(input.http_port, "Traefik HTTP 宿主机端口")?
+    };
+    let https_port = if input.https_port == 0 {
+        443
+    } else {
+        checked_port(input.https_port, "Traefik HTTPS 宿主机端口")?
+    };
+    Ok(InfraSpec {
         domain: input.domain.clone(),
         acme_email: input.acme_email.clone(),
         cloudflare_token: input.cloudflare_token.clone(),
         traefik_version: input.traefik_version.clone(),
-    }
+        http_port,
+        https_port,
+    })
 }
 
 /// 将静态站点协议请求转换为内部生成参数。

@@ -21,6 +21,12 @@ pub enum InfraCmd {
         /// Traefik 镜像版本。
         #[arg(long, default_value = "v3.7.8", value_parser = super::validate_version_arg)]
         traefik_version: String,
+        /// Traefik HTTP 入口映射到宿主机的端口。
+        #[arg(long, default_value_t = 80)]
+        http_port: u16,
+        /// Traefik HTTPS 和 HTTP/3 入口映射到宿主机的端口。
+        #[arg(long, default_value_t = 443)]
+        https_port: u16,
         /// 生成后立即启动。
         #[arg(long)]
         start: bool,
