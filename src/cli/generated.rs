@@ -9,9 +9,9 @@ use std::str::FromStr;
 pub enum InfraCmd {
     /// 生成 Traefik 项目。
     Init {
-        /// Nihility 服务使用的主域名。
+        /// Nihility 服务使用的主域名；省略时读取全局配置。
         #[arg(long)]
-        domain: String,
+        domain: Option<String>,
         /// ACME 证书通知邮箱。
         #[arg(long)]
         acme_email: String,
@@ -62,7 +62,7 @@ pub enum AppCmd {
         /// 本地静态文件目录。
         #[arg(long)]
         source: PathBuf,
-        /// 站点完整域名。
+        /// 站点完整域名或全局域名下的短子域名。
         #[arg(long)]
         host: String,
         /// Traefik 中间件；可重复指定。
@@ -100,10 +100,10 @@ pub struct AddArgs {
     /// 提供给 Traefik 的容器端口。
     #[arg(long, default_value_t = 80)]
     pub container_port: u16,
-    /// 完整访问域名；可重复指定。
+    /// 完整访问域名或全局域名下的短子域名；可重复指定。
     #[arg(long = "host")]
     pub hosts: Vec<String>,
-    /// 指向指定容器端口的路由，格式为 HOST:PORT；可重复指定。
+    /// 指向指定容器端口的路由，格式为 HOST:PORT；HOST 可为短子域名。
     #[arg(long = "route")]
     pub routes: Vec<RouteArg>,
     /// 应用于全部域名的 URL 路径前缀。
@@ -175,7 +175,7 @@ pub struct PortMappingArg {
 /// CLI HTTP 路由。
 #[derive(Debug, Clone)]
 pub struct RouteArg {
-    /// 完整访问域名。
+    /// 完整访问域名或全局域名下的短子域名。
     pub host: String,
     /// 此路由连接的容器端口。
     pub container_port: u16,

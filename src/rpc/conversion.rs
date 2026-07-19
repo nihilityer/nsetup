@@ -16,7 +16,10 @@ use crate::orchestrator::{
 use tonic::{Response, Status};
 
 /// 将常规应用协议请求转换为内部生成参数。
-pub(super) fn application_spec(input: CreateApplicationRequest) -> anyhow::Result<AppSpec> {
+pub(super) fn application_spec(
+    input: CreateApplicationRequest,
+    configured_domain: &str,
+) -> anyhow::Result<AppSpec> {
     let network_mode = match ApplicationNetworkMode::try_from(input.network_mode)
         .unwrap_or(ApplicationNetworkMode::Unspecified)
     {
@@ -55,7 +58,7 @@ pub(super) fn application_spec(input: CreateApplicationRequest) -> anyhow::Resul
             .into_iter()
             .map(|route| {
                 Ok(Route {
-                    host: route.host,
+                    host: resolve_host(&route.host, configured_domain)?,
                     path_prefix: (!route.path_prefix.is_empty()).then_some(route.path_prefix),
                     container_port: if route.container_port == 0 {
                         checked_port(input.container_port, "容器端口")?
@@ -105,6 +108,7 @@ pub(super) fn application_spec(input: CreateApplicationRequest) -> anyhow::Resul
 /// 将基础设施协议请求转换为内部生成参数。
 pub(super) fn infrastructure_spec(
     input: &InitializeInfrastructureRequest,
+    configured_domain: &str,
 ) -> anyhow::Result<InfraSpec> {
     let http_port = if input.http_port == 0 {
         80
@@ -116,8 +120,15 @@ pub(super) fn infrastructure_spec(
     } else {
         checked_port(input.https_port, "Traefik HTTPS 宿主机端口")?
     };
+    let domain = if input.domain.is_empty() {
+        configured_domain.to_string()
+    } else {
+        input.domain.clone()
+    };
+    crate::config::validate_domain(&domain)
+        .map_err(|error| orchestrator::InvalidInput(error.to_string()))?;
     Ok(InfraSpec {
-        domain: input.domain.clone(),
+        domain,
         acme_email: input.acme_email.clone(),
         cloudflare_token: input.cloudflare_token.clone(),
         traefik_version: input.traefik_version.clone(),
@@ -127,10 +138,13 @@ pub(super) fn infrastructure_spec(
 }
 
 /// 将静态站点协议请求转换为内部生成参数。
-pub(super) fn static_site_spec(input: CreateStaticSiteRequest) -> anyhow::Result<StaticSiteSpec> {
+pub(super) fn static_site_spec(
+    input: CreateStaticSiteRequest,
+    configured_domain: &str,
+) -> anyhow::Result<StaticSiteSpec> {
     Ok(StaticSiteSpec {
         name: input.name,
-        host: input.host,
+        host: resolve_host(&input.host, configured_domain)?,
         assets: input
             .assets
             .into_iter()
@@ -146,6 +160,30 @@ pub(super) fn static_site_spec(input: CreateStaticSiteRequest) -> anyhow::Result
             .collect::<anyhow::Result<Vec<_>>>()?,
         nginx_version: input.nginx_version,
     })
+}
+
+/// 将单个 DNS 标签扩展为全局主域名下的完整域名。
+fn resolve_host(host: &str, configured_domain: &str) -> anyhow::Result<String> {
+    if host.contains('.') {
+        return Ok(host.to_string());
+    }
+    let valid = !host.is_empty()
+        && host.len() <= 63
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && host
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && host
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric);
+    if !valid {
+        return Err(orchestrator::InvalidInput(format!("短子域名格式无效: {host}")).into());
+    }
+    Ok(format!("{host}.{configured_domain}"))
 }
 
 /// 将内部项目状态转换为协议响应。

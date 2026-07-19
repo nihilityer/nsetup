@@ -96,6 +96,7 @@ impl Orchestrator for OrchestratorService {
             version: env!("CARGO_PKG_VERSION").to_string(),
             docker_available,
             compose_root: self.config.paths.apps_root.display().to_string(),
+            domain: self.config.home.domain.clone(),
         }))
     }
     async fn initialize_infrastructure(
@@ -105,7 +106,7 @@ impl Orchestrator for OrchestratorService {
         let config = self.config.clone();
         let input = request.into_inner();
         self.mutate(move || {
-            let spec = infrastructure_spec(&input)?;
+            let spec = infrastructure_spec(&input, &config.home.domain)?;
             let stacks = generator::generate_infrastructure(&spec, &config.paths.data_root)
                 .map_err(invalid_generation)?;
             if !input.force {
@@ -138,7 +139,7 @@ impl Orchestrator for OrchestratorService {
         self.mutate(move || {
             let start = input.start;
             let force = input.force;
-            let spec = application_spec(input)?;
+            let spec = application_spec(input, &config.home.domain)?;
             orchestrator::ensure_no_conflicts(
                 &config,
                 &spec.name,
@@ -190,7 +191,7 @@ impl Orchestrator for OrchestratorService {
         let start = input.start;
         let force = input.force;
         self.mutate(move || {
-            let spec = static_site_spec(input)?;
+            let spec = static_site_spec(input, &config.home.domain)?;
             let routes = vec![Route {
                 host: spec.host.clone(),
                 path_prefix: None,

@@ -24,7 +24,7 @@ pub(super) async fn run_infra(action: InfraCmd) -> anyhow::Result<()> {
             force,
         } => {
             let input = InitializeInfrastructureRequest {
-                domain,
+                domain: domain.unwrap_or_default(),
                 acme_email,
                 cloudflare_token: read_secret(&cloudflare_token_file)?,
                 traefik_version,

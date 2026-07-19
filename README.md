@@ -28,13 +28,17 @@
 
 ```bash
 chmod +x ./nsetup
-sudo ./nsetup init
+sudo ./nsetup init \
+  --domain example.com \
+  --stacks-root /mnt/persistent/nsetup/stacks
 sudo usermod -aG nihility "$USER"
 ```
 
 该命令会把当前可执行文件安装到 `/usr/local/bin/nsetup`，创建 `nihility` 系统组、
-配置与状态目录，写入内嵌的默认配置和 systemd unit，并立即启用服务。目标文件已存在
-时默认停止；确认替换单文件安装及配置时使用 `sudo ./nsetup init --force`。
+配置与状态目录，写入配置和 systemd unit，并立即启用服务。`--domain` 会成为基础设施
+及应用的默认主域名；`--stacks-root` 可将 Compose 项目放到不会随 `/var` 清理的持久化
+挂载点。目标文件已存在时默认停止；确认替换单文件安装及配置时使用
+`sudo ./nsetup init --force`，未重复指定的配置值会保留。
 
 单文件初始化会拒绝与 Debian/RPM 风格的安装共存。使用包管理器安装后，升级和卸载
 也必须继续通过包管理器完成。
@@ -72,11 +76,13 @@ Traefik Compose 项目。Cloudflare 令牌通过文件读取，避免出现在 s
 install -m 600 /dev/null ./cloudflare.token
 
 nsetup infra init \
-  --domain example.com \
   --acme-email admin@example.com \
   --cloudflare-token-file ./cloudflare.token \
   --start
 ```
+
+未指定 `--domain` 时使用 `/etc/nsetup/config.toml` 中的 `home.domain`；需要临时生成到
+其他主域名时仍可显式传入 `--domain`。
 
 需要规避防火墙的标准端口限制时，可以修改宿主机入口端口。容器内仍监听 80/443，
 HTTPS 重定向和 HTTP/3 广播端口会自动同步：
@@ -110,7 +116,7 @@ nsetup app add whoami \
   --image traefik/whoami \
   --version v1.11 \
   --container-port 80 \
-  --host whoami.example.com \
+  --host whoami \
   --middleware gzip \
   --start
 ```
@@ -122,7 +128,7 @@ nsetup app add api \
   --image ghcr.io/example/api \
   --version 1.0 \
   --container-port 8080 \
-  --host api.example.com \
+  --host api \
   --publish 12780:8080 \
   --volume /var/lib/example:/var/lib/example \
   --env LOG_LEVEL=info \
@@ -130,7 +136,8 @@ nsetup app add api \
 ```
 
 同一个容器暴露多个 HTTP 服务时，使用 `--route HOST:PORT` 为每个域名指定不同的
-容器端口；原有 `--host` 仍使用 `--container-port` 指定的统一端口。
+容器端口；原有 `--host` 仍使用 `--container-port` 指定的统一端口。`HOST` 可以是
+`whoami`、`s3` 这样的短子域名，daemon 会拼接配置的主域名；传入完整域名时保持不变。
 
 静态站点会递归上传普通文件到 daemon，拒绝符号链接、路径穿越、超过 10000 个文件
 或总计超过 64 MiB 的输入：
@@ -138,7 +145,7 @@ nsetup app add api \
 ```bash
 nsetup app add-static docs \
   --source ./dist \
-  --host docs.example.com \
+  --host docs \
   --middleware gzip \
   --start
 ```
@@ -179,6 +186,10 @@ listen = "unix:///run/nsetup/nsetup.sock"
 ```bash
 sudo systemctl restart nsetup
 ```
+
+`stacks_root` 和 `data_root` 必须是不同的绝对路径。若系统会清理 `/var`，应将需要
+保留的路径设置到持久化磁盘或挂载点；daemon 启动及 `nsetup status` 会显示实际使用的
+Compose 项目目录和主域名。
 
 ## gRPC 与远程开发
 

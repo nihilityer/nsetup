@@ -14,7 +14,11 @@ use std::path::Path;
 /// 根据 CLI 参数分发到对应子命令。
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Commands::Init { force } => installer::init(force),
+        Commands::Init {
+            force,
+            domain,
+            stacks_root,
+        } => installer::init(force, domain, stacks_root),
         Commands::Daemon => rpc::serve(Config::load_or_default()?).await,
         Commands::Service { action } => run_service_action(action),
         Commands::Infra { action } => generated::run_infra(action).await,
@@ -386,6 +390,7 @@ fn show_health(health: &HealthResponse) {
     tracing::info!("守护进程版本: {}", health.version);
     tracing::info!("Docker 可用: {}", health.docker_available);
     tracing::info!("Compose 项目目录: {}", health.compose_root);
+    tracing::info!("主域名: {}", health.domain);
 }
 
 /// 输出 Compose 项目信息。

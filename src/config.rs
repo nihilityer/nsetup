@@ -75,8 +75,9 @@ impl Config {
         }
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("无法读取配置文件: {}", path.display()))?;
-        let config = toml::from_str(&content)
+        let config: Self = toml::from_str(&content)
             .with_context(|| format!("配置文件格式错误: {}", path.display()))?;
+        config.validate()?;
         Ok(Some(config))
     }
 
@@ -88,6 +89,55 @@ impl Config {
         // 返回一个未初始化的配置，由 init 命令填写
         Ok(Self::default_system())
     }
+
+    /// 校验域名、路径和监听地址，避免 daemon 使用含糊或临时配置。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_domain(&self.home.domain)?;
+        for (label, path) in [
+            ("stacks_root", &self.paths.apps_root),
+            ("data_root", &self.paths.data_root),
+        ] {
+            if !path.is_absolute() {
+                anyhow::bail!("{label} 必须是绝对路径: {}", path.display());
+            }
+            if path == std::path::Path::new("/") {
+                anyhow::bail!("{label} 不能使用文件系统根目录");
+            }
+        }
+        if self.paths.apps_root == self.paths.data_root {
+            anyhow::bail!("stacks_root 和 data_root 不能指向同一目录");
+        }
+        if self.grpc.listen.trim().is_empty() {
+            anyhow::bail!("grpc.listen 不能为空");
+        }
+        Ok(())
+    }
+}
+
+/// 校验可用于应用子域名拼接的主域名。
+pub fn validate_domain(domain: &str) -> anyhow::Result<()> {
+    let valid = !domain.is_empty()
+        && domain.len() <= 253
+        && domain.contains('.')
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        });
+    if !valid {
+        anyhow::bail!("domain 必须是有效的全小写完整域名");
+    }
+    Ok(())
 }
 
 /// 获取配置文件路径

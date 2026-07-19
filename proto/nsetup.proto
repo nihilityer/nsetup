@@ -71,6 +71,9 @@ message HealthResponse {
 
   // 守护进程使用的 Compose 项目根目录绝对路径。
   string compose_root = 3;
+
+  // 基础设施和应用短子域名使用的主域名。
+  string domain = 4;
 }
 
 // Docker Compose 拉取镜像时报告的单个进度事件。

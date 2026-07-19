@@ -25,6 +25,12 @@ pub enum Commands {
         /// 覆盖已有的单文件安装、配置和 unit。
         #[arg(long)]
         force: bool,
+        /// 写入配置并供基础设施和应用复用的主域名。
+        #[arg(long)]
+        domain: Option<String>,
+        /// Compose 项目的持久化根目录。
+        #[arg(long)]
+        stacks_root: Option<PathBuf>,
     },
     /// 启动 gRPC 编排守护进程。
     #[command(hide = true)]

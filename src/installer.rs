@@ -1,5 +1,6 @@
 //! 单可执行文件系统初始化。
 
+use crate::config::Config;
 use crate::services::process;
 use anyhow::Context;
 use std::fs::{self, OpenOptions};
@@ -22,32 +23,44 @@ const CONFIG_PATH: &str = "/etc/nsetup/config.toml";
 const SYSTEM_GROUP: &str = "nihility";
 /// 系统文件的用户与组所有权。
 const SYSTEM_OWNERSHIP: &str = "root:nihility";
-/// 内嵌的默认配置。
-const DEFAULT_CONFIG: &str = include_str!("../packaging/config.toml");
 /// 内嵌的 systemd unit。
 const SYSTEMD_UNIT: &str = include_str!("../packaging/systemd/nsetup.service");
 
 /// 从当前可执行文件初始化系统服务。
-pub fn init(force: bool) -> anyhow::Result<()> {
+pub fn init(
+    force: bool,
+    domain: Option<String>,
+    stacks_root: Option<PathBuf>,
+) -> anyhow::Result<()> {
     ensure_root()?;
     ensure_standalone_install()?;
     ensure_command(&["systemctl", "--version"], "检查 systemd")?;
     ensure_command(&["docker", "compose", "version"], "检查 Docker Compose")?;
     preflight(force)?;
+    let mut config = load_existing_config()?.unwrap_or_else(Config::default_system);
+    if let Some(domain) = domain {
+        config.home.domain = domain;
+    }
+    if let Some(stacks_root) = stacks_root {
+        config.paths.apps_root = stacks_root;
+    }
+    config.validate()?;
+    let rendered_config = toml::to_string_pretty(&config).context("无法序列化 nsetup 配置")?;
+
     ensure_group()?;
-    ensure_directories()?;
+    ensure_directories(&config)?;
 
     let current_exe = std::env::current_exe().context("无法定位当前 nsetup 可执行文件")?;
     install_copy(&current_exe, Path::new(INSTALL_BINARY), 0o755, force)?;
     install_bytes(
         Path::new(CONFIG_PATH),
-        DEFAULT_CONFIG.as_bytes(),
+        rendered_config.as_bytes(),
         0o640,
         force,
     )?;
     let unit = render_unit(INSTALL_BINARY);
     install_bytes(Path::new(INSTALL_UNIT), unit.as_bytes(), 0o644, force)?;
-    set_group_ownership()?;
+    set_group_ownership(&config)?;
 
     run_status(
         Command::new("systemctl").arg("daemon-reload"),
@@ -67,6 +80,20 @@ pub fn init(force: bool) -> anyhow::Result<()> {
     tracing::info!("systemd 服务: nsetup.service");
     tracing::info!("允许用户访问本机服务: sudo usermod -aG nihility <用户名>");
     Ok(())
+}
+
+/// 读取已有系统配置，以便 `--force` 时保留未显式修改的值。
+fn load_existing_config() -> anyhow::Result<Option<Config>> {
+    let path = Path::new(CONFIG_PATH);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("无法读取已有配置: {}", path.display()))?;
+    let config: Config = toml::from_str(&content)
+        .with_context(|| format!("已有配置格式错误: {}", path.display()))?;
+    config.validate()?;
+    Ok(Some(config))
 }
 
 /// 在产生系统变更前检查所有安装目标。
@@ -136,14 +163,12 @@ fn ensure_group() -> anyhow::Result<()> {
 }
 
 /// 创建配置与状态目录。
-fn ensure_directories() -> anyhow::Result<()> {
-    for directory in [
-        "/etc/nsetup",
-        "/var/lib/nsetup",
-        "/var/lib/nsetup/stacks",
-        "/var/lib/nsetup/data",
+fn ensure_directories(config: &Config) -> anyhow::Result<()> {
+    for path in [
+        Path::new("/etc/nsetup"),
+        config.paths.apps_root.as_path(),
+        config.paths.data_root.as_path(),
     ] {
-        let path = Path::new(directory);
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 anyhow::bail!("初始化路径不是普通目录: {}", path.display());
@@ -161,18 +186,15 @@ fn ensure_directories() -> anyhow::Result<()> {
 }
 
 /// 设置配置和状态目录的组所有权。
-fn set_group_ownership() -> anyhow::Result<()> {
-    run_status(
-        Command::new("chown").args([
-            SYSTEM_OWNERSHIP,
-            "/etc/nsetup",
-            "/etc/nsetup/config.toml",
-            "/var/lib/nsetup",
-            "/var/lib/nsetup/stacks",
-            "/var/lib/nsetup/data",
-        ]),
-        "设置 nsetup 目录所有权",
-    )
+fn set_group_ownership(config: &Config) -> anyhow::Result<()> {
+    let mut command = Command::new("chown");
+    command
+        .arg(SYSTEM_OWNERSHIP)
+        .arg("/etc/nsetup")
+        .arg(CONFIG_PATH)
+        .arg(&config.paths.apps_root)
+        .arg(&config.paths.data_root);
+    run_status(&mut command, "设置 nsetup 目录所有权")
 }
 
 /// 原子复制当前可执行文件。
