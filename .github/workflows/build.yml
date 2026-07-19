@@ -27,7 +27,10 @@ jobs:
           cache: true
 
       - name: Check (lint + compile)
-        run: cargo check --target x86_64-unknown-linux-musl
+        run: |
+          cargo fmt --check
+          cargo check --target x86_64-unknown-linux-musl
+          cargo clippy --all-targets --target x86_64-unknown-linux-musl -- -D warnings
 
       - name: Test
         run: cargo test --target x86_64-unknown-linux-musl
@@ -35,11 +38,23 @@ jobs:
       - name: Build release
         run: cargo build --release --target x86_64-unknown-linux-musl
 
+      - name: Build Debian package
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: homespace-linux-amd64
-          path: target/x86_64-unknown-linux-musl/release/homespace
+          name: nsetup-linux-amd64
+          path: target/x86_64-unknown-linux-musl/release/nsetup
+          if-no-files-found: error
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsetup-debian-amd64
+          path: target/debian/*.deb
           if-no-files-found: error
 
   release:
@@ -53,7 +68,12 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: homespace-linux-amd64
+          name: nsetup-linux-amd64
+
+      - name: Download Debian package
+        uses: actions/download-artifact@v4
+        with:
+          name: nsetup-debian-amd64
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -64,8 +84,10 @@ jobs:
             基于提交 [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) 构建的 musl 静态链接二进制。
 
             ### 二进制
-            - `homespace` — 静态链接，可在任意 Linux x86_64 发行版上运行（包括 TrueNAS SCALE）
-          files: homespace
+            - `nsetup`：静态链接，可在任意 Linux x86_64 发行版上运行，包括 TrueNAS SCALE。
+          files: |
+            nsetup
+            *.deb
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,33 @@
+[Unit]
+Description=Nihility machine daemon
+Documentation=https://github.com/nihilityer/nsetup
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=nihility
+ExecStart=/usr/bin/nsetup daemon
+Restart=on-failure
+RestartSec=3s
+RuntimeDirectory=nsetup
+RuntimeDirectoryMode=0750
+StateDirectory=nsetup
+StateDirectoryMode=0750
+ConfigurationDirectory=nsetup
+UMask=0007
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nsetup /run/nsetup /etc/nsetup
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

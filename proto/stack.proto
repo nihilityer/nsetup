@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package nsetup.v1;
+
+// 项目列表请求；当前不包含筛选条件。
+message ListStacksRequest {}
+
+// 项目列表响应。
+message ListStacksResponse {
+  // 按项目名排序的 Compose 项目。
+  repeated Stack stacks = 1;
+}
+
+// 单个项目查询请求。
+message GetStackRequest {
+  // Compose 项目名；必须符合服务端的安全命名规则。
+  string name = 1;
+}
+
+// Compose 项目及其当前运行状态。
+message Stack {
+  // Compose 项目名。
+  string name = 1;
+  // 服务端保存该项目的目录绝对路径。
+  string project_directory = 2;
+  // 服务端 Compose YAML 文件的绝对路径。
+  string compose_file = 3;
+  // 服务端环境变量文件的绝对路径。
+  string env_file = 4;
+  // 当前由该 Compose 项目创建的容器。
+  repeated Container containers = 5;
+}
+
+// Compose 服务对应的容器状态。
+message Container {
+  // Compose 文件中声明的服务名。
+  string service = 1;
+  // Docker 中实际创建的容器名。
+  string name = 2;
+  // Docker 报告的容器运行状态。
+  ContainerState state = 3;
+  // Docker 健康检查状态。
+  ContainerHealth health = 4;
+}
+
+// Docker 容器运行状态。
+enum ContainerState {
+  // 未提供状态，或 Docker 返回了当前版本尚不认识的状态。
+  CONTAINER_STATE_UNSPECIFIED = 0;
+  // 容器已创建但尚未运行。
+  CONTAINER_STATE_CREATED = 1;
+  // 容器正在运行。
+  CONTAINER_STATE_RUNNING = 2;
+  // 容器已暂停。
+  CONTAINER_STATE_PAUSED = 3;
+  // 容器正在重启。
+  CONTAINER_STATE_RESTARTING = 4;
+  // 容器正在删除。
+  CONTAINER_STATE_REMOVING = 5;
+  // 容器已经退出。
+  CONTAINER_STATE_EXITED = 6;
+  // 容器处于不可恢复状态。
+  CONTAINER_STATE_DEAD = 7;
+}
+
+// Docker 容器健康检查状态。
+enum ContainerHealth {
+  // 未配置健康检查。
+  CONTAINER_HEALTH_UNSPECIFIED = 0;
+  // 健康检查正在等待初始结果。
+  CONTAINER_HEALTH_STARTING = 1;
+  // 健康检查通过。
+  CONTAINER_HEALTH_HEALTHY = 2;
+  // 健康检查失败。
+  CONTAINER_HEALTH_UNHEALTHY = 3;
+  // Docker 返回了当前版本尚不认识的健康状态。
+  CONTAINER_HEALTH_UNKNOWN = 4;
+}
+
+// 创建或更新 Compose 项目的请求。
+message DeployStackRequest {
+  // Compose 项目名；同时用作服务端目录名和 project name。
+  string name = 1;
+  // 完整的 Compose YAML 文件内容。
+  string compose_yaml = 2;
+  // 完整的环境变量文件内容；没有变量时传空字符串。
+  string env_file = 3;
+  // 是否在文件校验和写入成功后执行 compose up。
+  bool start = 4;
+}
+
+// 删除 Compose 项目的请求。
+message RemoveStackRequest {
+  // 要删除的 Compose 项目名。
+  string name = 1;
+  // 是否向 compose down 传递 volumes，从而删除命名卷。
+  bool remove_volumes = 2;
+}
+
+// 作用于单个 Compose 项目的生命周期请求。
+message StackActionRequest {
+  // 要执行操作的 Compose 项目名。
+  string name = 1;
+}
+
+// 改变项目状态的操作响应。
+message OperationResponse {
+  // 操作是否成功；失败通常由非 OK `gRPC` 状态表示。
+  bool success = 1;
+  // 适合直接展示给 CLI 用户的中文结果说明。
+  string message = 2;
+}
+
+// 查询 Compose 项目日志的请求。
+message GetLogsRequest {
+  // 要查询日志的 Compose 项目名。
+  string name = 1;
+  // 每个 Compose 服务最多返回的末尾日志行数。
+  uint32 tail = 2;
+  // 是否在输出现有日志后持续等待新日志。
+  bool follow = 3;
+}
+
+// Compose 项目输出的一行日志。
+message LogLine {
+  // 单行日志文本，不包含末尾换行符。
+  string content = 1;
+}

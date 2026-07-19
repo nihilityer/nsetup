@@ -1,10 +1,13 @@
 [package]
-name = "homespace"
+name = "nsetup"
 version = "0.1.0"
 edition = "2024"
+authors = ["nihilityer"]
+description = "Nihility 机器守护进程及其 nsetup 管理 CLI"
+publish = false
 
 [[bin]]
-name = "homespace"
+name = "nsetup"
 path = "src/main.rs"
 
 [dependencies]
@@ -18,15 +21,37 @@ anyhow = "1.0"
 rand = "0.10"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-sha1 = "0.10"
-base64 = "0.22"
+hyper-util = { version = "0.1", features = ["tokio"] }
+prost = "0.14"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tower = "0.5"
+
+[build-dependencies]
+prettyplease = "0.2"
+syn = { version = "2", features = ["full", "visit-mut"] }
+tonic-prost-build = "0.14"
+
+[package.metadata.deb]
+maintainer = "nihilityer <nihilityer@users.noreply.github.com>"
+maintainer-scripts = "packaging/debian"
+assets = [
+    ["target/release/nsetup", "usr/bin/nsetup", "755"],
+    ["packaging/systemd/nsetup.service", "lib/systemd/system/nsetup.service", "644"],
+    ["packaging/config.toml", "etc/nsetup/config.toml", "600"],
+]
+conf-files = ["/etc/nsetup/config.toml"]
+depends = "docker.io | docker-ce, docker-compose-plugin"
+extended-description = "Nihility 机器守护进程以 root systemd 服务运行。nsetup CLI 通过本机 Unix domain socket 上的 gRPC API 管理 Docker Compose 项目。"
 
 [lints.rust]
 # 所有公开类型、函数、模块必须有文档注释
 missing_docs = "deny"
 # 禁止死代码，所有代码必须被调用或被公共 API 引用
 dead_code = "deny"
-# 禁止使用 unsafe 代码块，除非通过 #[allow(unsafe_code)] 明确放行
+# 禁止使用 unsafe 代码块
 unsafe_code = "deny"
 # 禁止未使用的导入项，保持 use 区域干净
 unused_imports = "deny"
