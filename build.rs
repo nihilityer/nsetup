@@ -188,7 +188,7 @@ fn is_match_accessor(item: &syn::ImplItemFn) -> bool {
     let Some(syn::FnArg::Receiver(receiver)) = item.sig.inputs.first() else {
         return false;
     };
-    receiver.reference.is_some()
+    matches!(&receiver.kind, syn::ReceiverKind::Reference(..))
         && item.sig.inputs.len() == 1
         && matches!(
             item.block.stmts.as_slice(),
@@ -201,7 +201,7 @@ fn is_field_setter(item: &syn::ImplItemFn) -> bool {
     let Some(syn::FnArg::Receiver(receiver)) = item.sig.inputs.first() else {
         return false;
     };
-    if receiver.reference.is_some() || receiver.mutability.is_none() {
+    if matches!(&receiver.kind, syn::ReceiverKind::Reference(..)) || receiver.mutability.is_none() {
         return false;
     }
 

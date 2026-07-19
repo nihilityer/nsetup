@@ -30,8 +30,8 @@ tonic-prost = "0.14"
 tower = "0.5"
 
 [build-dependencies]
-prettyplease = "0.2"
-syn = { version = "2", features = ["full", "visit-mut"] }
+prettyplease = "0.3"
+syn = { version = "3", features = ["full", "visit-mut"] }
 tonic-prost-build = "0.14"
 
 [package.metadata.deb]
