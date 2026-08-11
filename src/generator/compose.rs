@@ -12,7 +12,14 @@ pub struct Document {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     /// Compose 网络。
     pub networks: BTreeMap<String, Network>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    /// Compose 命名卷。
+    pub volumes: BTreeMap<String, Volume>,
 }
+
+/// Compose 命名卷定义。
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Volume {}
 
 #[derive(Debug, Default, Serialize)]
 /// Compose 服务定义。

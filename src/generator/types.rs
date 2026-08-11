@@ -47,6 +47,19 @@ pub struct AppSpec {
     pub network_mode: NetworkMode,
     /// Traefik 中间件。
     pub middlewares: Vec<Middleware>,
+    /// 附加到容器的自定义 Docker 标签。
+    pub labels: Vec<String>,
+    /// 应用命名卷。
+    pub named_volumes: Vec<NamedVolume>,
+}
+
+/// 应用命名卷。
+#[derive(Debug, Clone)]
+pub struct NamedVolume {
+    /// 命名卷名。
+    pub name: String,
+    /// 容器路径。
+    pub container_path: String,
 }
 
 /// 静态站点生成参数。

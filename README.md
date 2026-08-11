@@ -121,7 +121,7 @@ nsetup app add whoami \
   --start
 ```
 
-端口、卷、环境变量和网络可以按需声明：
+端口、卷、环境变量、网络、自定义 Docker 标签和命名卷可以按需声明：
 
 ```bash
 nsetup app add api \
@@ -155,6 +155,83 @@ nsetup app add-static docs \
 ```bash
 nsetup deploy media --compose ./compose.yaml --env-file ./.env --start
 nsetup app edit media --compose ./compose.yaml --env-file ./.env --start
+```
+
+## 高级参数：自定义标签与命名卷
+
+单服务生成器自动为每个路由创建 `Host(...)` 路由器，并追加你通过 `--label`
+传入的任意 Docker/Traefik 标签。需要自定义路由器（路径前缀、优先级、h2c
+后端、中间件等）时直接覆盖或补充同名标签即可；`--label` 在自动生成的路由
+标签之后生效。`--command` 每次传入一个命令参数，并允许以 `-` 开头的值
+（如 `--config`）；需要多个参数时重复指定。
+命名卷通过 `--named-volume NAME:CONTAINER` 声明，会写入 Compose 的
+`volumes` 段：
+
+```bash
+nsetup app add netbird-server \
+  --image netbirdio/netbird-server \
+  --version 0.76.3 \
+  --command --config \
+  --command /etc/netbird/config.yaml \
+  --network external \
+  --external-network nihility-traefik \
+  --publish-udp 3478:3478 \
+  --named-volume netbird-data:/var/lib/netbird \
+  --read-only-volume /etc/nsetup/netbird-config.yaml:/etc/netbird/config.yaml \
+  --label "traefik.http.routers.netbird-grpc.rule=Host(\`netbird.example.com\`) && (PathPrefix(\`/signalexchange.SignalExchange/\`) || PathPrefix(\`/management.ManagementService/\`) || PathPrefix(\`/management.ProxyService/\`))" \
+  --label "traefik.http.routers.netbird-grpc.entrypoints=https" \
+  --label "traefik.http.routers.netbird-grpc.tls=true" \
+  --label "traefik.http.routers.netbird-grpc.tls.certresolver=cloudflare" \
+  --label "traefik.http.routers.netbird-grpc.service=netbird-server-h2c" \
+  --label "traefik.http.routers.netbird-grpc.priority=100" \
+  --label "traefik.http.routers.netbird-backend.rule=Host(\`netbird.example.com\`) && (PathPrefix(\`/relay\`) || PathPrefix(\`/ws-proxy/\`) || PathPrefix(\`/api\`) || PathPrefix(\`/oauth2\`))" \
+  --label "traefik.http.routers.netbird-backend.entrypoints=https" \
+  --label "traefik.http.routers.netbird-backend.tls=true" \
+  --label "traefik.http.routers.netbird-backend.tls.certresolver=cloudflare" \
+  --label "traefik.http.routers.netbird-backend.service=netbird-server" \
+  --label "traefik.http.routers.netbird-backend.priority=100" \
+  --label "traefik.http.services.netbird-server.loadbalancer.server.port=80" \
+  --label "traefik.http.services.netbird-server-h2c.loadbalancer.server.port=80" \
+  --label "traefik.http.services.netbird-server-h2c.loadbalancer.server.scheme=h2c" \
+  --start
+```
+
+### 示例：自托管 NetBird
+
+新版 NetBird 自托管部署（`netbirdio/netbird-server` 合并管理、信号、中继与
+内嵌 STUN 的单一容器）通过上面的参数即可完整表达。`config.yaml` 是服务端统一
+配置，替代旧版 `management.json` 与 `relay.env`，请参考
+[官方配置参考](https://docs.netbird.io/selfhosted/maintenance/configuration-files)
+编写后挂载进容器；`dashboard.env` 中的变量改用 `--env` 传给 Dashboard：
+
+```bash
+# 1. 编写 config.yaml（含 authSecret、加密密钥等），保存到 /etc/nsetup/
+# 2. 添加管理面板（自动创建 Host(netbird.example.com) 路由）
+nsetup app add netbird \
+  --image netbirdio/dashboard \
+  --version v2.90.10 \
+  --container-port 80 \
+  --host netbird \
+  --env NETBIRD_MGMT_API_ENDPOINT=https://netbird.example.com \
+  --env NETBIRD_MGMT_GRPC_API_ENDPOINT=https://netbird.example.com \
+  --env AUTH_AUDIENCE=netbird-dashboard \
+  --env AUTH_CLIENT_ID=netbird-dashboard \
+  --env AUTH_AUTHORITY=https://netbird.example.com/oauth2 \
+  --env "AUTH_SUPPORTED_SCOPES=openid profile email groups" \
+  --env AUTH_REDIRECT_URI=/nb-auth \
+  --env AUTH_SILENT_REDIRECT_URI=/nb-silent-auth \
+  --label "traefik.http.routers.netbird-0.priority=1" \
+  --start
+
+# 3. 添加合并服务器（上面的 netbird-server 示例）
+# 4. 确认 3478/udp 已对公网开放（STUN 无法通过 HTTP 反向代理转发）
+```
+
+升级新版时分别升级两个应用；`config.yaml` 与数据卷会保留：
+
+```bash
+nsetup upgrade netbird-server --version 0.77.0
+nsetup upgrade netbird --version v2.91.0
 ```
 
 升级时分别指定应用、服务和版本。单服务应用可以省略 `--service`；多服务应用必须指定，

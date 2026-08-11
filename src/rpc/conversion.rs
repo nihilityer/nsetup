@@ -6,8 +6,8 @@ use super::proto::{
     OperationResponse, PortProtocol, Stack,
 };
 use crate::generator::{
-    self, AppSpec, InfraSpec, Middleware, NetworkMode, PublishedPort, Route, StaticAsset,
-    StaticSiteSpec, Volume,
+    self, AppSpec, InfraSpec, Middleware, NamedVolume, NetworkMode, PublishedPort, Route,
+    StaticAsset, StaticSiteSpec, Volume,
 };
 use crate::orchestrator::{
     self, ContainerHealth as InternalContainerHealth, ContainerState as InternalContainerState,
@@ -45,6 +45,28 @@ pub(super) fn application_spec(
                 orchestrator::InvalidInput(format!("环境变量重复: {}", variable.key)).into(),
             );
         }
+    }
+    let mut labels = Vec::with_capacity(input.labels.len());
+    for label in input.labels {
+        let (key, value) = label.split_once('=').ok_or_else(|| {
+            orchestrator::InvalidInput(String::from("自定义标签格式必须为 KEY=VALUE"))
+        })?;
+        if key.trim().is_empty()
+            || key.contains(['\0', '\n', '\r'])
+            || value.contains(['\0', '\n', '\r'])
+        {
+            return Err(
+                orchestrator::InvalidInput(format!("自定义标签 {key} 的名称或值无效")).into(),
+            );
+        }
+        if labels.iter().any(|existing: &String| {
+            existing
+                .split_once('=')
+                .is_some_and(|(existing_key, _)| existing_key == key)
+        }) {
+            return Err(orchestrator::InvalidInput(format!("自定义标签重复: {key}")).into());
+        }
+        labels.push(label);
     }
     Ok(AppSpec {
         name: input.name,
@@ -101,6 +123,17 @@ pub(super) fn application_spec(
             .middlewares
             .into_iter()
             .map(middleware_from_proto)
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        labels,
+        named_volumes: input
+            .named_volumes
+            .into_iter()
+            .map(|volume| {
+                Ok(NamedVolume {
+                    name: volume.name,
+                    container_path: volume.container_path,
+                })
+            })
             .collect::<anyhow::Result<Vec<_>>>()?,
     })
 }

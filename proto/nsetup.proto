@@ -144,6 +144,10 @@ message CreateApplicationRequest {
   bool force = 15;
   // 容器镜像版本标签。
   string version = 16;
+  // 附加到容器的自定义 Docker 标签，格式为 KEY=VALUE；覆盖自动生成的同名标签。
+  repeated string labels = 17;
+  // 应用命名卷。
+  repeated NamedVolume named_volumes = 18;
 }
 
 // 创建静态站点的请求。
@@ -192,6 +196,14 @@ message ApplicationVolume {
   string container_path = 2;
   // 是否只读挂载。
   bool read_only = 3;
+}
+
+// 应用命名卷。
+message NamedVolume {
+  // 命名卷名。
+  string name = 1;
+  // 容器路径。
+  string container_path = 2;
 }
 
 // 容器环境变量。

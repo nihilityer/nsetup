@@ -95,7 +95,7 @@ pub struct AddArgs {
     #[arg(long, default_value = "app")]
     pub service: String,
     /// 覆盖镜像默认命令；可重复传入参数。
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub command: Vec<String>,
     /// 提供给 Traefik 的容器端口。
     #[arg(long, default_value_t = 80)]
@@ -133,6 +133,12 @@ pub struct AddArgs {
     /// Traefik 中间件；可重复指定。
     #[arg(long, value_enum)]
     pub middleware: Vec<MiddlewareArg>,
+    /// 附加到容器的自定义 Docker 标签，格式为 KEY=VALUE；可重复指定。
+    #[arg(long = "label")]
+    pub labels: Vec<LabelArg>,
+    /// 命名卷挂载，格式为 NAME:CONTAINER；可重复指定。
+    #[arg(long = "named-volume")]
+    pub named_volumes: Vec<NamedVolumeArg>,
     /// 生成后立即启动。
     #[arg(long)]
     pub start: bool,
@@ -264,6 +270,61 @@ impl FromStr for EnvironmentArg {
         Ok(Self {
             key: key.to_string(),
             value: value.to_string(),
+        })
+    }
+}
+
+/// CLI 自定义 Docker 标签。
+#[derive(Debug, Clone)]
+pub struct LabelArg {
+    /// 标签键。
+    pub key: String,
+    /// 标签值。
+    pub value: String,
+}
+
+impl FromStr for LabelArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (key, value) = value
+            .split_once('=')
+            .ok_or_else(|| String::from("自定义标签格式必须为 KEY=VALUE"))?;
+        if key.trim().is_empty()
+            || key.contains(['\0', '\n', '\r'])
+            || value.contains(['\0', '\n', '\r'])
+        {
+            return Err(String::from("自定义标签名称或值无效"));
+        }
+        Ok(Self {
+            key: key.to_string(),
+            value: value.to_string(),
+        })
+    }
+}
+
+/// CLI 命名卷挂载。
+#[derive(Debug, Clone)]
+pub struct NamedVolumeArg {
+    /// 命名卷名。
+    pub name: String,
+    /// 容器路径。
+    pub container: String,
+}
+
+impl FromStr for NamedVolumeArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (name, container) = value
+            .split_once(':')
+            .ok_or_else(|| String::from("命名卷格式必须为 NAME:CONTAINER"))?;
+        if name.is_empty() || container.is_empty() {
+            return Err(String::from("命名卷名称和容器路径不能为空"));
+        }
+        Ok(Self {
+            name: name.to_string(),
+            container: container.to_string(),
         })
     }
 }

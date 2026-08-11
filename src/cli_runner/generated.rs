@@ -5,7 +5,7 @@ use crate::rpc::RpcClient;
 use crate::rpc::proto::{
     ApplicationMiddleware, ApplicationNetworkMode, ApplicationRoute, ApplicationVolume,
     CreateApplicationRequest, CreateStaticSiteRequest, EnvironmentVariable,
-    InitializeInfrastructureRequest, PortProtocol, PublishedPort, StaticAsset,
+    InitializeInfrastructureRequest, NamedVolume, PortProtocol, PublishedPort, StaticAsset,
 };
 use anyhow::Context;
 use std::path::Path;
@@ -62,6 +62,8 @@ pub(super) async fn run_app(action: AppCmd) -> anyhow::Result<()> {
                 network,
                 external_network,
                 middleware,
+                labels,
+                named_volumes,
                 start,
                 force,
             } = *arguments;
@@ -128,6 +130,17 @@ pub(super) async fn run_app(action: AppCmd) -> anyhow::Result<()> {
                 network_mode: network_mode.into(),
                 external_network,
                 middlewares: middleware.into_iter().map(middleware_input).collect(),
+                labels: labels
+                    .into_iter()
+                    .map(|label| format!("{}={}", label.key, label.value))
+                    .collect(),
+                named_volumes: named_volumes
+                    .into_iter()
+                    .map(|volume| NamedVolume {
+                        name: volume.name,
+                        container_path: volume.container,
+                    })
+                    .collect(),
                 start,
                 force,
             };

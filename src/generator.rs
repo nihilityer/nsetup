@@ -8,6 +8,6 @@ mod types;
 pub use app::{generate_application, generate_static_site};
 pub use infra::generate_infrastructure;
 pub use types::{
-    AppSpec, GeneratedFile, GeneratedStack, InfraSpec, Middleware, NetworkMode, PortProtocol,
-    PublishedPort, Route, StaticAsset, StaticSiteSpec, Volume,
+    AppSpec, GeneratedFile, GeneratedStack, InfraSpec, Middleware, NamedVolume, NetworkMode,
+    PortProtocol, PublishedPort, Route, StaticAsset, StaticSiteSpec, Volume,
 };

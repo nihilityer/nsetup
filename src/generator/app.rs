@@ -23,9 +23,17 @@ pub fn generate_application(spec: &AppSpec) -> anyhow::Result<GeneratedStack> {
         ports: spec.published_ports.iter().map(format_port).collect(),
         volumes: spec.volumes.iter().map(format_volume).collect(),
         env_file: vec![String::from(".env")],
-        labels: route_labels(spec),
+        labels: service_labels(spec),
         ..Service::default()
     };
+    for volume in &spec.named_volumes {
+        service
+            .volumes
+            .push(format!("{}:{}", volume.name, volume.container_path));
+        document
+            .volumes
+            .insert(volume.name.clone(), compose::Volume {});
+    }
 
     match &spec.network_mode {
         NetworkMode::Bridge => {}
@@ -83,6 +91,8 @@ pub fn generate_static_site(spec: &StaticSiteSpec) -> anyhow::Result<GeneratedSt
         environment: BTreeMap::new(),
         network_mode: NetworkMode::Bridge,
         middlewares: spec.middlewares.clone(),
+        labels: Vec::new(),
+        named_volumes: Vec::new(),
     };
     let mut generated = generate_application(&app)?;
     generated.files = spec
@@ -95,6 +105,13 @@ pub fn generate_static_site(spec: &StaticSiteSpec) -> anyhow::Result<GeneratedSt
         })
         .collect();
     Ok(generated)
+}
+
+/// 合并自动生成的路由标签与用户附加的自定义标签。
+fn service_labels(spec: &AppSpec) -> Vec<String> {
+    let mut labels = route_labels(spec);
+    labels.extend(spec.labels.iter().cloned());
+    labels
 }
 
 /// 生成应用的 Traefik 标签。
@@ -211,6 +228,33 @@ fn validate_app(spec: &AppSpec) -> anyhow::Result<()> {
             anyhow::bail!("卷挂载路径无效");
         }
     }
+    for label in &spec.labels {
+        let Some((key, value)) = label.split_once('=') else {
+            anyhow::bail!("自定义标签格式必须为 KEY=VALUE");
+        };
+        if key.trim().is_empty()
+            || key.contains(['\0', '\n', '\r'])
+            || value.contains(['\0', '\n', '\r'])
+        {
+            anyhow::bail!("自定义标签 {key} 的名称或值无效");
+        }
+    }
+    for volume in &spec.named_volumes {
+        let valid_name = !volume.name.is_empty()
+            && volume.name.len() <= 63
+            && volume.name.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_' | b'.')
+            });
+        if !valid_name
+            || !volume.container_path.starts_with('/')
+            || volume.name.contains(['\0', '\n', '\r'])
+            || volume.container_path.contains(['\0', '\n', '\r'])
+        {
+            anyhow::bail!("命名卷名称或容器路径无效");
+        }
+    }
     for route in &spec.routes {
         validate_host(&route.host)?;
         if let Some(prefix) = &route.path_prefix
@@ -246,4 +290,173 @@ fn validate_host(host: &str) -> anyhow::Result<()> {
         anyhow::bail!("域名格式无效: {host}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+// 测试断言直接暴露失败原因，允许在测试中调用 unwrap。
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::generator::{NamedVolume, PortProtocol, PublishedPort, Route};
+
+    /// 验证自定义标签、命名卷和以连字符开头的命令参数进入生成的 Compose。
+    #[test]
+    fn custom_parameters_reach_compose() {
+        let spec = AppSpec {
+            name: String::from("netbird-server"),
+            service: String::from("app"),
+            image: String::from("netbirdio/netbird-server"),
+            version: String::from("0.76.3"),
+            command: vec![
+                String::from("--config"),
+                String::from("/etc/netbird/config.yaml"),
+            ],
+            container_port: 80,
+            routes: Vec::new(),
+            published_ports: vec![PublishedPort {
+                host_port: 3478,
+                container_port: 3478,
+                protocol: PortProtocol::Udp,
+            }],
+            volumes: vec![Volume {
+                host_path: String::from("/etc/netbird/config.yaml"),
+                container_path: String::from("/etc/netbird/config.yaml"),
+                read_only: true,
+            }],
+            environment: BTreeMap::new(),
+            network_mode: NetworkMode::External(String::from("nihility-traefik")),
+            middlewares: Vec::new(),
+            labels: vec![
+                String::from(
+                    "traefik.http.routers.netbird-grpc.rule=Host(`netbird.example.com`) && (PathPrefix(`/api`))",
+                ),
+                String::from("traefik.http.routers.netbird-grpc.priority=100"),
+            ],
+            named_volumes: vec![NamedVolume {
+                name: String::from("netbird-data"),
+                container_path: String::from("/var/lib/netbird"),
+            }],
+        };
+
+        let generated = generate_application(&spec).unwrap();
+        let document: serde_yaml::Value = serde_yaml::from_str(&generated.compose_yaml).unwrap();
+        let service = &document["services"]["app"];
+
+        assert_eq!(
+            service["command"],
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String(String::from("--config")),
+                serde_yaml::Value::String(String::from("/etc/netbird/config.yaml")),
+            ])
+        );
+        let volumes = service["volumes"]
+            .as_sequence()
+            .map(|list| {
+                list.iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert!(volumes.contains(&"netbird-data:/var/lib/netbird"));
+        assert!(volumes.contains(&"/etc/netbird/config.yaml:/etc/netbird/config.yaml:ro"));
+        let labels = service["labels"]
+            .as_sequence()
+            .map(|list| {
+                list.iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.starts_with("traefik.http.routers.netbird-grpc.rule="))
+        );
+        assert!(document["volumes"]["netbird-data"].is_mapping());
+        assert_eq!(
+            document["networks"]["application"]["name"],
+            serde_yaml::Value::String(String::from("nihility-traefik"))
+        );
+    }
+
+    /// 验证自定义标签追加在自动生成的路由标签之后。
+    #[test]
+    fn custom_labels_append_after_route_labels() {
+        let spec = AppSpec {
+            name: String::from("netbird"),
+            service: String::from("app"),
+            image: String::from("netbirdio/dashboard"),
+            version: String::from("v2.90.10"),
+            command: Vec::new(),
+            container_port: 80,
+            routes: vec![Route {
+                host: String::from("netbird.example.com"),
+                path_prefix: None,
+                container_port: 80,
+            }],
+            published_ports: Vec::new(),
+            volumes: Vec::new(),
+            environment: BTreeMap::new(),
+            network_mode: NetworkMode::Bridge,
+            middlewares: Vec::new(),
+            labels: vec![String::from("traefik.http.routers.netbird-0.priority=1")],
+            named_volumes: Vec::new(),
+        };
+
+        let generated = generate_application(&spec).unwrap();
+        let document: serde_yaml::Value = serde_yaml::from_str(&generated.compose_yaml).unwrap();
+        let labels = document["services"]["app"]["labels"]
+            .as_sequence()
+            .map(|list| {
+                list.iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        let route_index = labels
+            .iter()
+            .position(|label| label.starts_with("traefik.http.routers.netbird-0.rule="))
+            .unwrap();
+        let custom_index = labels
+            .iter()
+            .position(|label| *label == "traefik.http.routers.netbird-0.priority=1")
+            .unwrap();
+        assert!(custom_index > route_index);
+    }
+
+    /// 验证非法标签和命名卷会被拒绝。
+    #[test]
+    fn invalid_custom_parameters_rejected() {
+        let base = || AppSpec {
+            name: String::from("demo"),
+            service: String::from("app"),
+            image: String::from("example/demo"),
+            version: String::from("1.0"),
+            command: Vec::new(),
+            container_port: 80,
+            routes: Vec::new(),
+            published_ports: Vec::new(),
+            volumes: Vec::new(),
+            environment: BTreeMap::new(),
+            network_mode: NetworkMode::Bridge,
+            middlewares: Vec::new(),
+            labels: Vec::new(),
+            named_volumes: Vec::new(),
+        };
+
+        let bad_label = AppSpec {
+            labels: vec![String::from("missing-equals")],
+            ..base()
+        };
+        assert!(generate_application(&bad_label).is_err());
+
+        let bad_volume = AppSpec {
+            named_volumes: vec![NamedVolume {
+                name: String::from("Bad_Name"),
+                container_path: String::from("relative/path"),
+            }],
+            ..base()
+        };
+        assert!(generate_application(&bad_volume).is_err());
+    }
 }
