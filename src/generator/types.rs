@@ -51,6 +51,23 @@ pub struct AppSpec {
     pub labels: Vec<String>,
     /// 应用命名卷。
     pub named_volumes: Vec<NamedVolume>,
+    /// 容器健康检查。
+    pub healthcheck: Option<HealthcheckSpec>,
+}
+
+/// 应用健康检查参数。
+#[derive(Debug, Clone)]
+pub struct HealthcheckSpec {
+    /// 健康检查命令（`CMD-SHELL` 形式）。
+    pub command: String,
+    /// 检查间隔。
+    pub interval: String,
+    /// 单次检查超时。
+    pub timeout: String,
+    /// 启动宽限期。
+    pub start_period: Option<String>,
+    /// 失败重试次数。
+    pub retries: u32,
 }
 
 /// 应用命名卷。
@@ -158,6 +175,16 @@ impl Middleware {
             Self::Gzip => "gzip@file",
             Self::ForwardedHeaders => "forwarded-headers@file",
             Self::InternalOnly => "internal-only@file",
+        }
+    }
+
+    /// 从 Traefik 文件提供者引用还原中间件。
+    pub fn from_label_ref(value: &str) -> Option<Self> {
+        match value {
+            "gzip@file" => Some(Self::Gzip),
+            "forwarded-headers@file" => Some(Self::ForwardedHeaders),
+            "internal-only@file" => Some(Self::InternalOnly),
+            _ => None,
         }
     }
 }

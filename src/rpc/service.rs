@@ -1,15 +1,16 @@
 //! gRPC 编排服务实现。
 
 use super::conversion::{
-    application_spec, infrastructure_spec, invalid_generation, operation_response, stack_to_proto,
-    static_site_spec, status_from_error,
+    application_edit, application_spec, infrastructure_spec, invalid_generation,
+    operation_response, stack_to_proto, static_site_spec, status_from_error,
 };
 use super::proto::orchestrator_server::Orchestrator;
 use super::proto::{
     CreateApplicationRequest, CreateStaticSiteRequest, DeployStackRequest, GetLogsRequest,
     GetStackRequest, HealthRequest, HealthResponse, InitializeInfrastructureRequest,
     ListStacksRequest, ListStacksResponse, LogLine, OperationResponse, PullProgress,
-    RemoveStackRequest, Stack, StackActionRequest, UpdateStackRequest, UpgradeApplicationRequest,
+    RemoveStackRequest, Stack, StackActionRequest, UpdateApplicationRequest, UpdateStackRequest,
+    UpgradeApplicationRequest,
 };
 use crate::config::{Config, check_docker};
 use crate::generator::{self, Route};
@@ -139,6 +140,7 @@ impl Orchestrator for OrchestratorService {
         self.mutate(move || {
             let start = input.start;
             let force = input.force;
+            let join = input.join;
             let spec = application_spec(input, &config.home.domain)?;
             orchestrator::ensure_no_conflicts(
                 &config,
@@ -146,15 +148,54 @@ impl Orchestrator for OrchestratorService {
                 &spec.routes,
                 &spec.published_ports,
             )?;
-            let generated = generator::generate_application(&spec).map_err(invalid_generation)?;
-            orchestrator::deploy_generated_stack(&config, &generated, force, false)?;
-            if start {
-                docker::compose_up(&orchestrator::stack_dir(&config, &spec.name)?)?;
+            if join {
+                orchestrator::add_service(&config, &spec, force, start)?;
+            } else {
+                let generated =
+                    generator::generate_application(&spec).map_err(invalid_generation)?;
+                orchestrator::deploy_generated_stack(&config, &generated, force, false)?;
+                if start {
+                    docker::compose_up(&orchestrator::stack_dir(&config, &spec.name)?)?;
+                }
             }
             Ok(())
         })
         .await?;
         Ok(operation_response(format!("应用 {name} 已生成")))
+    }
+
+    async fn update_application(
+        &self,
+        request: Request<UpdateApplicationRequest>,
+    ) -> Result<Response<OperationResponse>, Status> {
+        let config = self.config.clone();
+        let input = request.into_inner();
+        let name = input.name.clone();
+        self.mutate(move || {
+            let edit = application_edit(input, &config.home.domain)?;
+            if !edit.hosts.is_empty() || !edit.routes.is_empty() || !edit.published_ports.is_empty()
+            {
+                let mut routes = edit
+                    .hosts
+                    .iter()
+                    .map(|host| Route {
+                        host: host.clone(),
+                        path_prefix: None,
+                        container_port: 0,
+                    })
+                    .collect::<Vec<_>>();
+                routes.extend(edit.routes.iter().cloned());
+                orchestrator::ensure_no_conflicts(
+                    &config,
+                    &edit.name,
+                    &routes,
+                    &edit.published_ports,
+                )?;
+            }
+            orchestrator::update_application(&config, &edit)
+        })
+        .await?;
+        Ok(operation_response(format!("应用 {name} 已修改")))
     }
 
     async fn upgrade_application(

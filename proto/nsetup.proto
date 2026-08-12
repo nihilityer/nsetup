@@ -18,6 +18,9 @@ service Orchestrator {
   // 根据类型化参数生成并部署单服务应用。
   rpc CreateApplication(CreateApplicationRequest) returns (OperationResponse);
 
+  // 解析现有 Compose 项目并按传入参数局部修改应用。
+  rpc UpdateApplication(UpdateApplicationRequest) returns (OperationResponse);
+
   // 设置 Compose 服务的镜像版本，拉取镜像并重新创建该服务。
   rpc UpgradeApplication(UpgradeApplicationRequest) returns (OperationResponse);
 
@@ -148,6 +151,68 @@ message CreateApplicationRequest {
   repeated string labels = 17;
   // 应用命名卷。
   repeated NamedVolume named_volumes = 18;
+  // 容器健康检查。
+  optional HealthcheckSpec healthcheck = 19;
+  // 追加到已有项目的服务；name 仍为项目名，service 为新增服务名。
+  bool join = 20;
+}
+
+// 按参数局部修改已有应用的请求；未提供的字段保持原样。
+message UpdateApplicationRequest {
+  // 已存在的 Compose 项目名。
+  string name = 1;
+  // 要修改的 Compose 服务名；项目只有一个服务时可以省略。
+  optional string service = 2;
+  // 新的镜像仓库名；省略时保留当前仓库。
+  optional string image = 3;
+  // 新的镜像版本标签；省略时保留当前标签。
+  optional string version = 4;
+  // 覆盖镜像默认命令的参数列表；省略时保留原命令。
+  repeated string command = 5;
+  // 路由默认容器端口；省略时保留原端口。
+  optional uint32 container_port = 6;
+  // 重建后的 HTTP 路由；与 hosts 一起替换现有路由。
+  repeated ApplicationRoute routes = 7;
+  // 替换后的宿主机端口映射。
+  repeated PublishedPort published_ports = 8;
+  // 追加到现有卷挂载之后的卷。
+  repeated ApplicationVolume volumes = 9;
+  // 合并到现有环境变量中的键值。
+  repeated EnvironmentVariable environment = 10;
+  // 新的容器网络模式；省略时保留原网络。
+  optional ApplicationNetworkMode network_mode = 11;
+  // external 网络模式使用的 Docker 网络名。
+  optional string external_network = 12;
+  // 替换路由中间件；省略时保留现有中间件。
+  repeated ApplicationMiddleware middlewares = 13;
+  // 按标签键替换的自定义 Docker 标签。
+  repeated string labels = 14;
+  // 追加到现有命名卷之后的命名卷。
+  repeated NamedVolume named_volumes = 15;
+  // 应用于全部路由的 URL 路径前缀。
+  optional string path_prefix = 16;
+  // 重建路由时使用的短子域名或完整域名。
+  repeated string hosts = 17;
+  // 新的健康检查；提供时替换现有健康检查。
+  optional HealthcheckSpec healthcheck = 18;
+  // 移除现有健康检查。
+  bool remove_healthcheck = 19;
+  // 是否在修改成功后执行 compose up。
+  bool start = 20;
+}
+
+// 容器健康检查参数。
+message HealthcheckSpec {
+  // 健康检查命令（CMD-SHELL 形式）。
+  string command = 1;
+  // 检查间隔，如 30s；为空时使用默认值。
+  string interval = 2;
+  // 单次检查超时，如 3s；为空时使用默认值。
+  string timeout = 3;
+  // 启动宽限期，如 10s。
+  optional string start_period = 4;
+  // 失败重试次数；为 0 时使用默认值。
+  uint32 retries = 5;
 }
 
 // 创建静态站点的请求。

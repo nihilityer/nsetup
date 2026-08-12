@@ -76,6 +76,7 @@ fn generate_traefik(
                 ],
                 interval: String::from("10s"),
                 timeout: String::from("3s"),
+                start_period: None,
                 retries: 3,
             }),
             logging: Some(Logging {

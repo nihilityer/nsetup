@@ -41,20 +41,8 @@ pub enum InfraCmd {
 pub enum AppCmd {
     /// 从镜像生成常规单服务应用。
     Add(Box<AddArgs>),
-    /// 使用完整 Compose 文件修改现有应用，支持多服务项目。
-    Edit {
-        /// Compose 项目名。
-        name: String,
-        /// 新的 Compose YAML 文件路径。
-        #[arg(long)]
-        compose: PathBuf,
-        /// 新的环境变量文件路径；不指定时保留现有内容。
-        #[arg(long)]
-        env_file: Option<PathBuf>,
-        /// 修改后立即启动或重新创建应用。
-        #[arg(long)]
-        start: bool,
-    },
+    /// 修改现有应用；可用参数局部修改，或用 --compose 整体替换。
+    Edit(Box<EditArgs>),
     /// 从目录生成 Nginx 静态站点。
     AddStatic {
         /// Compose 项目名。
@@ -80,26 +68,15 @@ pub enum AppCmd {
     },
 }
 
-/// 常规单服务应用参数。
+/// add 与 edit 共用的应用参数。
 #[derive(Debug, Args)]
-pub struct AddArgs {
-    /// Compose 项目名。
-    pub name: String,
-    /// 不含版本标签的容器镜像名。
-    #[arg(long)]
-    pub image: String,
-    /// 容器镜像版本标签。
-    #[arg(long, value_parser = super::validate_version_arg)]
-    pub version: String,
-    /// Compose 服务名。
-    #[arg(long, default_value = "app")]
-    pub service: String,
-    /// 覆盖镜像默认命令；可重复传入参数。
+pub struct AppParams {
+    /// 覆盖镜像默认命令；每次传入一个参数，可重复指定。
     #[arg(long, allow_hyphen_values = true)]
     pub command: Vec<String>,
     /// 提供给 Traefik 的容器端口。
-    #[arg(long, default_value_t = 80)]
-    pub container_port: u16,
+    #[arg(long)]
+    pub container_port: Option<u16>,
     /// 完整访问域名或全局域名下的短子域名；可重复指定。
     #[arg(long = "host")]
     pub hosts: Vec<String>,
@@ -125,8 +102,8 @@ pub struct AddArgs {
     #[arg(long = "env")]
     pub environment: Vec<EnvironmentArg>,
     /// 容器网络模式。
-    #[arg(long, value_enum, default_value_t = NetworkArg::Bridge)]
-    pub network: NetworkArg,
+    #[arg(long, value_enum)]
+    pub network: Option<NetworkArg>,
     /// external 网络模式使用的 Docker 网络名。
     #[arg(long)]
     pub external_network: Option<String>,
@@ -139,12 +116,80 @@ pub struct AddArgs {
     /// 命名卷挂载，格式为 NAME:CONTAINER；可重复指定。
     #[arg(long = "named-volume")]
     pub named_volumes: Vec<NamedVolumeArg>,
+    /// 健康检查命令（CMD-SHELL 形式）。
+    #[arg(long)]
+    pub healthcheck_cmd: Option<String>,
+    /// 健康检查间隔，如 30s。
+    #[arg(long)]
+    pub healthcheck_interval: Option<String>,
+    /// 单次健康检查超时，如 3s。
+    #[arg(long)]
+    pub healthcheck_timeout: Option<String>,
+    /// 健康检查启动宽限期，如 10s。
+    #[arg(long)]
+    pub healthcheck_start_period: Option<String>,
+    /// 健康检查失败重试次数。
+    #[arg(long)]
+    pub healthcheck_retries: Option<u32>,
+}
+
+/// 常规单服务应用参数。
+#[derive(Debug, Args)]
+pub struct AddArgs {
+    /// Compose 项目名。
+    pub name: String,
+    /// 不含版本标签的容器镜像名。
+    #[arg(long)]
+    pub image: String,
+    /// 容器镜像版本标签。
+    #[arg(long, value_parser = super::validate_version_arg)]
+    pub version: String,
+    /// Compose 服务名；省略时使用 app，追加服务时必须指定。
+    #[arg(long)]
+    pub service: Option<String>,
+    #[command(flatten)]
+    /// 应用参数。
+    pub params: AppParams,
+    /// 追加为已有项目的新服务，而不是新建项目。
+    #[arg(long)]
+    pub join: bool,
     /// 生成后立即启动。
     #[arg(long)]
     pub start: bool,
     /// 覆盖已有项目配置。
     #[arg(long)]
     pub force: bool,
+}
+
+/// 参数化修改已有应用的参数；未提供的字段保持原样。
+#[derive(Debug, Args)]
+pub struct EditArgs {
+    /// Compose 项目名。
+    pub name: String,
+    /// 完整的 Compose YAML 文件路径；不指定时按参数局部修改现有 Compose。
+    #[arg(long)]
+    pub compose: Option<PathBuf>,
+    /// 新的环境变量文件路径；仅与 --compose 一起使用。
+    #[arg(long)]
+    pub env_file: Option<PathBuf>,
+    /// Compose 服务名；项目只有一个服务时可以省略。
+    #[arg(long)]
+    pub service: Option<String>,
+    /// 新的镜像仓库名；省略时保留当前仓库。
+    #[arg(long)]
+    pub image: Option<String>,
+    /// 新的镜像版本标签；省略时保留当前标签。
+    #[arg(long, value_parser = super::validate_version_arg)]
+    pub version: Option<String>,
+    #[command(flatten)]
+    /// 应用参数。
+    pub params: AppParams,
+    /// 修改后立即启动或重新创建应用。
+    #[arg(long)]
+    pub start: bool,
+    /// 移除现有健康检查。
+    #[arg(long)]
+    pub no_healthcheck: bool,
 }
 
 /// CLI 网络模式。

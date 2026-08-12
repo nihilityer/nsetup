@@ -1,9 +1,11 @@
 //! Compose 项目的持久化与编排逻辑。
 
 mod container;
+mod edit;
 mod generated;
 mod types;
 
+pub use edit::{ApplicationEdit, add_service, update_application};
 pub use generated::{deploy_generated_stack, ensure_no_conflicts};
 pub use types::{
     ContainerHealth, ContainerInfo, ContainerState, InvalidInput, StackAction, StackInfo,

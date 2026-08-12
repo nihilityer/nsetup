@@ -5,9 +5,11 @@ mod compose;
 mod infra;
 mod types;
 
-pub use app::{generate_application, generate_static_site};
+pub use app::{
+    application_route_labels, build_service, generate_application, generate_static_site,
+};
 pub use infra::generate_infrastructure;
 pub use types::{
-    AppSpec, GeneratedFile, GeneratedStack, InfraSpec, Middleware, NamedVolume, NetworkMode,
-    PortProtocol, PublishedPort, Route, StaticAsset, StaticSiteSpec, Volume,
+    AppSpec, GeneratedFile, GeneratedStack, HealthcheckSpec, InfraSpec, Middleware, NamedVolume,
+    NetworkMode, PortProtocol, PublishedPort, Route, StaticAsset, StaticSiteSpec, Volume,
 };

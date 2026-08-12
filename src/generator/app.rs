@@ -15,15 +15,40 @@ pub fn generate_application(spec: &AppSpec) -> anyhow::Result<GeneratedStack> {
     validate_app(spec)?;
     let mut document = Document::default();
     let environment = spec.environment.clone();
+    let (service, fragment) = build_service(spec, 0, &format!("nihility-{}", spec.name))?;
+    merge_fragment(&mut document, fragment);
+    document.services.insert(spec.service.clone(), service);
+    Ok(GeneratedStack {
+        name: spec.name.clone(),
+        compose_yaml: compose::to_yaml(&document)?,
+        env_file: environment
+            .iter()
+            .map(|(key, value)| format!("{key}={}\n", quote_env(value)))
+            .collect(),
+        files: Vec::new(),
+    })
+}
+
+/// 构建单个 Compose 服务及其项目级网络与卷声明。
+///
+/// `route_offset` 是该项目中已使用的路由序号数量，用于多服务应用避免
+/// Traefik 路由器重名；`container_name` 由调用方指定以区分主服务与追加服务。
+pub fn build_service(
+    spec: &AppSpec,
+    route_offset: usize,
+    container_name: &str,
+) -> anyhow::Result<(Service, Document)> {
+    validate_app(spec)?;
+    let mut document = Document::default();
     let mut service = Service {
         image: format!("{}:{}", spec.image, spec.version),
-        container_name: Some(format!("nihility-{}", spec.name)),
+        container_name: Some(container_name.to_string()),
         command: spec.command.clone(),
         restart: Some(String::from("unless-stopped")),
         ports: spec.published_ports.iter().map(format_port).collect(),
         volumes: spec.volumes.iter().map(format_volume).collect(),
         env_file: vec![String::from(".env")],
-        labels: service_labels(spec),
+        labels: service_labels(spec, route_offset),
         ..Service::default()
     };
     for volume in &spec.named_volumes {
@@ -33,6 +58,15 @@ pub fn generate_application(spec: &AppSpec) -> anyhow::Result<GeneratedStack> {
         document
             .volumes
             .insert(volume.name.clone(), compose::Volume {});
+    }
+    if let Some(healthcheck) = &spec.healthcheck {
+        service.healthcheck = Some(compose::Healthcheck {
+            test: vec![String::from("CMD-SHELL"), healthcheck.command.clone()],
+            interval: healthcheck.interval.clone(),
+            timeout: healthcheck.timeout.clone(),
+            start_period: healthcheck.start_period.clone(),
+            retries: healthcheck.retries,
+        });
     }
 
     match &spec.network_mode {
@@ -52,16 +86,13 @@ pub fn generate_application(spec: &AppSpec) -> anyhow::Result<GeneratedStack> {
     if !spec.routes.is_empty() {
         add_external_network(&mut document, &mut service, "traefik", TRAEFIK_NETWORK);
     }
-    document.services.insert(spec.service.clone(), service);
-    Ok(GeneratedStack {
-        name: spec.name.clone(),
-        compose_yaml: compose::to_yaml(&document)?,
-        env_file: environment
-            .iter()
-            .map(|(key, value)| format!("{key}={}\n", quote_env(value)))
-            .collect(),
-        files: Vec::new(),
-    })
+    Ok((service, document))
+}
+
+/// 将服务构建产生的网络与卷声明合并进项目文档。
+fn merge_fragment(document: &mut Document, fragment: Document) {
+    document.networks.extend(fragment.networks);
+    document.volumes.extend(fragment.volumes);
 }
 
 /// 生成 Nginx 静态站点。
@@ -93,6 +124,7 @@ pub fn generate_static_site(spec: &StaticSiteSpec) -> anyhow::Result<GeneratedSt
         middlewares: spec.middlewares.clone(),
         labels: Vec::new(),
         named_volumes: Vec::new(),
+        healthcheck: None,
     };
     let mut generated = generate_application(&app)?;
     generated.files = spec
@@ -108,22 +140,28 @@ pub fn generate_static_site(spec: &StaticSiteSpec) -> anyhow::Result<GeneratedSt
 }
 
 /// 合并自动生成的路由标签与用户附加的自定义标签。
-fn service_labels(spec: &AppSpec) -> Vec<String> {
-    let mut labels = route_labels(spec);
+fn service_labels(spec: &AppSpec, route_offset: usize) -> Vec<String> {
+    let mut labels =
+        application_route_labels(&spec.name, &spec.routes, &spec.middlewares, route_offset);
     labels.extend(spec.labels.iter().cloned());
     labels
 }
 
-/// 生成应用的 Traefik 标签。
-fn route_labels(spec: &AppSpec) -> Vec<String> {
+/// 生成指定项目与路由集合的 Traefik 标签；参数化编辑与多服务追加复用同一套格式。
+pub fn application_route_labels(
+    name: &str,
+    routes: &[super::Route],
+    middlewares: &[Middleware],
+    start_index: usize,
+) -> Vec<String> {
     let mut labels = Vec::new();
-    if spec.routes.is_empty() {
+    if routes.is_empty() {
         return labels;
     }
     labels.push(String::from("traefik.enable=true"));
     labels.push(String::from("traefik.docker.network=nihility-traefik"));
-    for (index, route) in spec.routes.iter().enumerate() {
-        let router = format!("{}-{index}", spec.name);
+    for (index, route) in routes.iter().enumerate() {
+        let router = format!("{name}-{}", start_index + index);
         let mut rule = format!("Host(`{}`)", route.host);
         if let Some(prefix) = &route.path_prefix {
             rule.push_str(&format!(" && PathPrefix(`{prefix}`)"));
@@ -139,10 +177,10 @@ fn route_labels(spec: &AppSpec) -> Vec<String> {
                 route.container_port
             ),
         ]);
-        if !spec.middlewares.is_empty() {
+        if !middlewares.is_empty() {
             labels.push(format!(
                 "traefik.http.routers.{router}.middlewares={}",
-                spec.middlewares
+                middlewares
                     .iter()
                     .copied()
                     .map(Middleware::label_ref)
@@ -336,6 +374,7 @@ mod tests {
                 name: String::from("netbird-data"),
                 container_path: String::from("/var/lib/netbird"),
             }],
+            healthcheck: None,
         };
 
         let generated = generate_application(&spec).unwrap();
@@ -401,6 +440,7 @@ mod tests {
             middlewares: Vec::new(),
             labels: vec![String::from("traefik.http.routers.netbird-0.priority=1")],
             named_volumes: Vec::new(),
+            healthcheck: None,
         };
 
         let generated = generate_application(&spec).unwrap();
@@ -442,6 +482,7 @@ mod tests {
             middlewares: Vec::new(),
             labels: Vec::new(),
             named_volumes: Vec::new(),
+            healthcheck: None,
         };
 
         let bad_label = AppSpec {
@@ -458,5 +499,58 @@ mod tests {
             ..base()
         };
         assert!(generate_application(&bad_volume).is_err());
+    }
+
+    /// 验证健康检查参数进入生成的 Compose。
+    #[test]
+    fn healthcheck_reaches_compose() {
+        let spec = AppSpec {
+            name: String::from("demo"),
+            service: String::from("app"),
+            image: String::from("example/demo"),
+            version: String::from("1.0"),
+            command: Vec::new(),
+            container_port: 80,
+            routes: Vec::new(),
+            published_ports: Vec::new(),
+            volumes: Vec::new(),
+            environment: BTreeMap::new(),
+            network_mode: NetworkMode::Bridge,
+            middlewares: Vec::new(),
+            labels: Vec::new(),
+            named_volumes: Vec::new(),
+            healthcheck: Some(crate::generator::HealthcheckSpec {
+                command: String::from("curl -f http://localhost:8080/health || exit 1"),
+                interval: String::from("30s"),
+                timeout: String::from("3s"),
+                start_period: Some(String::from("10s")),
+                retries: 5,
+            }),
+        };
+
+        let generated = generate_application(&spec).unwrap();
+        let document: serde_yaml::Value = serde_yaml::from_str(&generated.compose_yaml).unwrap();
+        let healthcheck = &document["services"]["app"]["healthcheck"];
+        assert_eq!(
+            healthcheck["test"],
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String(String::from("CMD-SHELL")),
+                serde_yaml::Value::String(String::from(
+                    "curl -f http://localhost:8080/health || exit 1"
+                )),
+            ])
+        );
+        assert_eq!(
+            healthcheck["interval"],
+            serde_yaml::Value::String(String::from("30s"))
+        );
+        assert_eq!(
+            healthcheck["start_period"],
+            serde_yaml::Value::String(String::from("10s"))
+        );
+        assert_eq!(
+            healthcheck["retries"],
+            serde_yaml::Value::Number(serde_yaml::Number::from(5_u64))
+        );
     }
 }

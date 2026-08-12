@@ -5,7 +5,8 @@ use super::proto::{
     CreateApplicationRequest, CreateStaticSiteRequest, DeployStackRequest, GetLogsRequest,
     GetStackRequest, HealthRequest, HealthResponse, InitializeInfrastructureRequest,
     ListStacksRequest, ListStacksResponse, LogLine, OperationResponse, PullProgress,
-    RemoveStackRequest, Stack, StackActionRequest, UpdateStackRequest, UpgradeApplicationRequest,
+    RemoveStackRequest, Stack, StackActionRequest, UpdateApplicationRequest, UpdateStackRequest,
+    UpgradeApplicationRequest,
 };
 use crate::config::config_dir;
 use crate::constants::{AUTH_TOKEN_FILE, GRPC_SOCKET};
@@ -76,6 +77,20 @@ impl RpcClient {
     ) -> anyhow::Result<OperationResponse> {
         let request = self.request(input);
         Ok(self.inner.create_application(request).await?.into_inner())
+    }
+
+    /// 按参数局部修改已有应用。
+    pub async fn update_application(
+        &mut self,
+        input: UpdateApplicationRequest,
+    ) -> anyhow::Result<OperationResponse> {
+        let request = self.request(input);
+        Ok(self
+            .inner
+            .update_application(request)
+            .await
+            .map_err(rpc_error)?
+            .into_inner())
     }
 
     /// 设置应用服务的镜像版本并立即更新。

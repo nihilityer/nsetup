@@ -1,11 +1,15 @@
 //! 基础设施与应用生成命令执行。
 
-use crate::cli::generated::{AddArgs, AppCmd, InfraCmd, MiddlewareArg, NetworkArg};
+use crate::cli::generated::{
+    AddArgs, AppCmd, AppParams, EditArgs, EnvironmentArg, InfraCmd, LabelArg, MiddlewareArg,
+    MountArg, NamedVolumeArg, NetworkArg, PortMappingArg,
+};
 use crate::rpc::RpcClient;
 use crate::rpc::proto::{
     ApplicationMiddleware, ApplicationNetworkMode, ApplicationRoute, ApplicationVolume,
-    CreateApplicationRequest, CreateStaticSiteRequest, EnvironmentVariable,
+    CreateApplicationRequest, CreateStaticSiteRequest, EnvironmentVariable, HealthcheckSpec,
     InitializeInfrastructureRequest, NamedVolume, PortProtocol, PublishedPort, StaticAsset,
+    UpdateApplicationRequest,
 };
 use anyhow::Context;
 use std::path::Path;
@@ -49,6 +53,12 @@ pub(super) async fn run_app(action: AppCmd) -> anyhow::Result<()> {
                 image,
                 version,
                 service,
+                params,
+                join,
+                start,
+                force,
+            } = *arguments;
+            let AppParams {
                 command,
                 container_port,
                 hosts,
@@ -64,40 +74,19 @@ pub(super) async fn run_app(action: AppCmd) -> anyhow::Result<()> {
                 middleware,
                 labels,
                 named_volumes,
-                start,
-                force,
-            } = *arguments;
-            let mut published_ports = tcp_ports
-                .into_iter()
-                .map(|port| PublishedPort {
-                    host_port: u32::from(port.host),
-                    container_port: u32::from(port.container),
-                    protocol: PortProtocol::Tcp.into(),
-                })
-                .collect::<Vec<_>>();
-            published_ports.extend(udp_ports.into_iter().map(|port| PublishedPort {
-                host_port: u32::from(port.host),
-                container_port: u32::from(port.container),
-                protocol: PortProtocol::Udp.into(),
-            }));
-            let mut mapped_volumes = volumes
-                .into_iter()
-                .map(|volume| ApplicationVolume {
-                    host_path: volume.host,
-                    container_path: volume.container,
-                    read_only: false,
-                })
-                .collect::<Vec<_>>();
-            mapped_volumes.extend(
-                read_only_volumes
-                    .into_iter()
-                    .map(|volume| ApplicationVolume {
-                        host_path: volume.host,
-                        container_path: volume.container,
-                        read_only: true,
-                    }),
-            );
-            let (network_mode, external_network) = network_input(network, external_network)?;
+                healthcheck_cmd,
+                healthcheck_interval,
+                healthcheck_timeout,
+                healthcheck_start_period,
+                healthcheck_retries,
+            } = params;
+            let container_port = container_port.unwrap_or(80);
+            let service = match (join, service) {
+                (true, None) => anyhow::bail!("追加服务时必须指定 --service"),
+                (_, service) => service.unwrap_or_else(|| String::from("app")),
+            };
+            let (network_mode, external_network) =
+                network_input(network.unwrap_or(NetworkArg::Bridge), external_network)?;
             let input = CreateApplicationRequest {
                 name,
                 service,
@@ -118,57 +107,29 @@ pub(super) async fn run_app(action: AppCmd) -> anyhow::Result<()> {
                         container_port: u32::from(route.container_port),
                     }))
                     .collect(),
-                published_ports,
-                volumes: mapped_volumes,
-                environment: environment
-                    .into_iter()
-                    .map(|variable| EnvironmentVariable {
-                        key: variable.key,
-                        value: variable.value,
-                    })
-                    .collect(),
+                published_ports: published_ports(tcp_ports, udp_ports),
+                volumes: application_volumes(volumes, read_only_volumes),
+                environment: application_environment(environment),
                 network_mode: network_mode.into(),
                 external_network,
                 middlewares: middleware.into_iter().map(middleware_input).collect(),
-                labels: labels
-                    .into_iter()
-                    .map(|label| format!("{}={}", label.key, label.value))
-                    .collect(),
-                named_volumes: named_volumes
-                    .into_iter()
-                    .map(|volume| NamedVolume {
-                        name: volume.name,
-                        container_path: volume.container,
-                    })
-                    .collect(),
+                labels: application_labels(labels),
+                named_volumes: application_named_volumes(named_volumes),
+                healthcheck: healthcheck_input(
+                    &healthcheck_cmd,
+                    &healthcheck_interval,
+                    &healthcheck_timeout,
+                    &healthcheck_start_period,
+                    healthcheck_retries,
+                )?,
+                join,
                 start,
                 force,
             };
             let mut client = RpcClient::connect(None, None).await?;
             tracing::info!("{}", client.create_application(input).await?.message);
         }
-        AppCmd::Edit {
-            name,
-            compose,
-            env_file,
-            start,
-        } => {
-            let compose_yaml = std::fs::read_to_string(&compose)
-                .with_context(|| format!("无法读取 Compose 文件 {}", compose.display()))?;
-            let env_content = env_file
-                .as_deref()
-                .map(std::fs::read_to_string)
-                .transpose()
-                .context("无法读取环境变量文件")?;
-            let mut client = RpcClient::connect(None, None).await?;
-            tracing::info!(
-                "{}",
-                client
-                    .update(name, compose_yaml, env_content, start)
-                    .await?
-                    .message
-            );
-        }
+        AppCmd::Edit(arguments) => run_edit(*arguments).await?,
         AppCmd::AddStatic {
             name,
             source,
@@ -192,6 +153,251 @@ pub(super) async fn run_app(action: AppCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// 执行参数化应用修改；未提供的参数保持原样。
+async fn run_edit(arguments: EditArgs) -> anyhow::Result<()> {
+    let EditArgs {
+        name,
+        compose,
+        env_file,
+        service,
+        image,
+        version,
+        params,
+        start,
+        no_healthcheck,
+    } = arguments;
+    if let Some(compose) = compose {
+        let compose_yaml = std::fs::read_to_string(&compose)
+            .with_context(|| format!("无法读取 Compose 文件 {}", compose.display()))?;
+        let env_content = env_file
+            .as_deref()
+            .map(std::fs::read_to_string)
+            .transpose()
+            .context("无法读取环境变量文件")?;
+        let mut client = RpcClient::connect(None, None).await?;
+        tracing::info!(
+            "{}",
+            client
+                .update(name, compose_yaml, env_content, start)
+                .await?
+                .message
+        );
+        return Ok(());
+    }
+    if !edit_has_changes(
+        &params,
+        service.is_some(),
+        image.is_some(),
+        version.is_some(),
+        no_healthcheck,
+    ) {
+        anyhow::bail!("未提供任何修改参数或 --compose");
+    }
+    let AppParams {
+        command,
+        container_port,
+        hosts,
+        routes,
+        path_prefix,
+        tcp_ports,
+        udp_ports,
+        volumes,
+        read_only_volumes,
+        environment,
+        network,
+        external_network,
+        middleware,
+        labels,
+        named_volumes,
+        healthcheck_cmd,
+        healthcheck_interval,
+        healthcheck_timeout,
+        healthcheck_start_period,
+        healthcheck_retries,
+    } = params;
+    let (network_mode, external_network) = match (network, external_network) {
+        (Some(network), external) => {
+            let (mode, name) = network_input(network, external)?;
+            (Some(mode), (!name.is_empty()).then_some(name))
+        }
+        (None, Some(_)) => anyhow::bail!("--external-network 只能与 --network external 一起使用"),
+        (None, None) => (None, None),
+    };
+    let healthcheck = healthcheck_input(
+        &healthcheck_cmd,
+        &healthcheck_interval,
+        &healthcheck_timeout,
+        &healthcheck_start_period,
+        healthcheck_retries,
+    )?;
+    if no_healthcheck && healthcheck.is_some() {
+        anyhow::bail!("--no-healthcheck 不能与健康检查参数同时使用");
+    }
+    let input = UpdateApplicationRequest {
+        name,
+        service,
+        image,
+        version,
+        command,
+        container_port: container_port.map(u32::from),
+        routes: routes
+            .into_iter()
+            .map(|route| ApplicationRoute {
+                host: route.host,
+                path_prefix: String::new(),
+                container_port: u32::from(route.container_port),
+            })
+            .collect(),
+        published_ports: published_ports(tcp_ports, udp_ports),
+        volumes: application_volumes(volumes, read_only_volumes),
+        environment: application_environment(environment),
+        network_mode: network_mode.map(Into::into),
+        external_network,
+        middlewares: middleware.into_iter().map(middleware_input).collect(),
+        labels: application_labels(labels),
+        named_volumes: application_named_volumes(named_volumes),
+        path_prefix,
+        hosts,
+        healthcheck,
+        remove_healthcheck: no_healthcheck,
+        start,
+    };
+    let mut client = RpcClient::connect(None, None).await?;
+    tracing::info!("{}", client.update_application(input).await?.message);
+    Ok(())
+}
+
+/// 判断参数化编辑是否提供了任何修改。
+const fn edit_has_changes(
+    params: &AppParams,
+    service: bool,
+    image: bool,
+    version: bool,
+    no_healthcheck: bool,
+) -> bool {
+    service
+        || image
+        || version
+        || no_healthcheck
+        || !params.command.is_empty()
+        || params.container_port.is_some()
+        || !params.hosts.is_empty()
+        || !params.routes.is_empty()
+        || params.path_prefix.is_some()
+        || !params.tcp_ports.is_empty()
+        || !params.udp_ports.is_empty()
+        || !params.volumes.is_empty()
+        || !params.read_only_volumes.is_empty()
+        || !params.environment.is_empty()
+        || params.network.is_some()
+        || params.external_network.is_some()
+        || !params.middleware.is_empty()
+        || !params.labels.is_empty()
+        || !params.named_volumes.is_empty()
+        || params.healthcheck_cmd.is_some()
+        || params.healthcheck_interval.is_some()
+        || params.healthcheck_timeout.is_some()
+        || params.healthcheck_start_period.is_some()
+        || params.healthcheck_retries.is_some()
+}
+
+/// 组装宿主机端口映射列表。
+fn published_ports(tcp: Vec<PortMappingArg>, udp: Vec<PortMappingArg>) -> Vec<PublishedPort> {
+    let mut ports = tcp
+        .into_iter()
+        .map(|port| PublishedPort {
+            host_port: u32::from(port.host),
+            container_port: u32::from(port.container),
+            protocol: PortProtocol::Tcp.into(),
+        })
+        .collect::<Vec<_>>();
+    ports.extend(udp.into_iter().map(|port| PublishedPort {
+        host_port: u32::from(port.host),
+        container_port: u32::from(port.container),
+        protocol: PortProtocol::Udp.into(),
+    }));
+    ports
+}
+
+/// 组装应用卷挂载列表。
+fn application_volumes(volumes: Vec<MountArg>, read_only: Vec<MountArg>) -> Vec<ApplicationVolume> {
+    let mut mapped = volumes
+        .into_iter()
+        .map(|volume| ApplicationVolume {
+            host_path: volume.host,
+            container_path: volume.container,
+            read_only: false,
+        })
+        .collect::<Vec<_>>();
+    mapped.extend(read_only.into_iter().map(|volume| ApplicationVolume {
+        host_path: volume.host,
+        container_path: volume.container,
+        read_only: true,
+    }));
+    mapped
+}
+
+/// 组装环境变量列表。
+fn application_environment(environment: Vec<EnvironmentArg>) -> Vec<EnvironmentVariable> {
+    environment
+        .into_iter()
+        .map(|variable| EnvironmentVariable {
+            key: variable.key,
+            value: variable.value,
+        })
+        .collect()
+}
+
+/// 组装自定义标签列表。
+fn application_labels(labels: Vec<LabelArg>) -> Vec<String> {
+    labels
+        .into_iter()
+        .map(|label| format!("{}={}", label.key, label.value))
+        .collect()
+}
+
+/// 组装命名卷列表。
+fn application_named_volumes(named_volumes: Vec<NamedVolumeArg>) -> Vec<NamedVolume> {
+    named_volumes
+        .into_iter()
+        .map(|volume| NamedVolume {
+            name: volume.name,
+            container_path: volume.container,
+        })
+        .collect()
+}
+
+/// 组装健康检查参数；未提供命令时不启用健康检查。
+fn healthcheck_input(
+    cmd: &Option<String>,
+    interval: &Option<String>,
+    timeout: &Option<String>,
+    start_period: &Option<String>,
+    retries: Option<u32>,
+) -> anyhow::Result<Option<HealthcheckSpec>> {
+    let specified = cmd.is_some()
+        || interval.is_some()
+        || timeout.is_some()
+        || start_period.is_some()
+        || retries.is_some();
+    if !specified {
+        return Ok(None);
+    }
+    let command = cmd
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("指定健康检查参数时必须提供 --healthcheck-cmd"))?;
+    if command.trim().is_empty() || command.contains(['\0', '\n', '\r']) {
+        anyhow::bail!("健康检查命令不能为空或包含控制字符");
+    }
+    Ok(Some(HealthcheckSpec {
+        command: command.clone(),
+        interval: interval.clone().unwrap_or_default(),
+        timeout: timeout.clone().unwrap_or_default(),
+        start_period: start_period.clone(),
+        retries: retries.unwrap_or_default(),
+    }))
 }
 
 /// 将 CLI 网络枚举转换为协议枚举。

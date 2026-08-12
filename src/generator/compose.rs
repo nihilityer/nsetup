@@ -84,6 +84,9 @@ pub struct Healthcheck {
     pub interval: String,
     /// 单次检查超时。
     pub timeout: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// 启动宽限期。
+    pub start_period: Option<String>,
     /// 失败重试次数。
     pub retries: u32,
 }

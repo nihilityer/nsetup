@@ -150,14 +150,56 @@ nsetup app add-static docs \
   --start
 ```
 
-复杂的多服务项目使用完整 Compose 文件创建或修改，不受单服务生成器限制：
+需要多个服务的应用先用普通 `app add` 创建项目，再通过 `--join` 追加服务；
+后续用 `app edit --service` 分别修改、用 `nsetup upgrade` 分别升级。也可以
+直接使用完整 Compose 文件创建或修改，不受单服务生成器限制：
 
 ```bash
+nsetup app add netbird --join --service netbird-server --image ... --version ...
 nsetup deploy media --compose ./compose.yaml --env-file ./.env --start
 nsetup app edit media --compose ./compose.yaml --env-file ./.env --start
 ```
 
-## 高级参数：自定义标签与命名卷
+## 参数化修改已有应用
+
+`app edit` 与 `app add` 使用同一套参数；不指定 `--compose` 时，daemon 会解析
+项目现有的 Compose 文件，只修改传入的参数，其余内容保持不变。多服务项目用
+`--service` 选择要修改的服务：
+
+```bash
+# 升级镜像版本
+nsetup app edit whoami --version v1.12
+
+# 合并环境变量并替换发布端口
+nsetup app edit api --service api --env LOG_LEVEL=debug --publish 12781:8081
+
+# 重建路由（--host/--route/--path-prefix 会整体重建该服务的 Traefik 路由标签）
+nsetup app edit netbird --host netbird --container-port 8080
+
+# 更新健康检查或移除健康检查
+nsetup app edit api --healthcheck-cmd "curl -fsS http://localhost:8080/health" \
+  --healthcheck-interval 30s --healthcheck-timeout 3s --healthcheck-retries 5
+nsetup app edit api --no-healthcheck
+```
+
+修改语义：`--env` 合并进现有环境变量（同名覆盖）；`--publish`/`--publish-udp`
+整体替换端口映射；`--volume`/`--named-volume`/`--label` 追加（同名标签覆盖）；
+`--host`/`--route`/`--path-prefix` 重建路由标签；镜像只传 `--version` 时保留
+当前仓库，只传 `--image` 时保留当前标签。
+
+向已有项目追加服务使用 `app add --join`（项目名不变，`--service` 命名新服务，
+`--force` 可替换同名服务）。追加服务的环境变量写入该服务自身的 `environment`，
+路由序号自动接续，避免多服务之间 Traefik 路由器重名：
+
+```bash
+nsetup app add netbird --join \
+  --service netbird-server \
+  --image netbirdio/netbird-server \
+  --version 0.76.3 \
+  --start
+```
+
+## 高级参数：自定义标签、命名卷与健康检查
 
 单服务生成器自动为每个路由创建 `Host(...)` 路由器，并追加你通过 `--label`
 传入的任意 Docker/Traefik 标签。需要自定义路由器（路径前缀、优先级、h2c
@@ -165,16 +207,70 @@ nsetup app edit media --compose ./compose.yaml --env-file ./.env --start
 标签之后生效。`--command` 每次传入一个命令参数，并允许以 `-` 开头的值
 （如 `--config`）；需要多个参数时重复指定。
 命名卷通过 `--named-volume NAME:CONTAINER` 声明，会写入 Compose 的
-`volumes` 段：
+`volumes` 段；健康检查通过 `--healthcheck-cmd` 启用（`CMD-SHELL` 形式），
+`--healthcheck-interval`、`--healthcheck-timeout`、`--healthcheck-start-period`
+和 `--healthcheck-retries` 可选，默认间隔与超时 30s、重试 3 次：
 
 ```bash
-nsetup app add netbird-server \
+nsetup app add api \
+  --image ghcr.io/example/api \
+  --version 1.0 \
+  --container-port 8080 \
+  --host api \
+  --healthcheck-cmd "curl -fsS http://localhost:8080/health || exit 1" \
+  --healthcheck-start-period 10s \
+  --start
+```
+
+```bash
+nsetup app add worker \
+  --image ghcr.io/example/worker \
+  --version 1.2 \
+  --command --config \
+  --command /etc/worker/config.yaml \
+  --publish-udp 9000:9000 \
+  --named-volume worker-data:/var/lib/worker \
+  --read-only-volume /etc/nsetup/worker-config.yaml:/etc/worker/config.yaml \
+  --label "traefik.http.routers.worker-grpc.rule=Host(\`worker.example.com\`) && (PathPrefix(\`/grpc\`))" \
+  --label "traefik.http.routers.worker-grpc.service=worker-h2c" \
+  --label "traefik.http.services.worker-h2c.loadbalancer.server.scheme=h2c" \
+  --start
+```
+
+### 示例：自托管 NetBird
+
+新版 NetBird 自托管部署（`netbirdio/netbird-server` 合并管理、信号、中继与
+内嵌 STUN 的单一容器）通过上面的参数即可表达为同一个项目下的两个服务。
+`config.yaml` 是服务端统一配置，替代旧版 `management.json` 与 `relay.env`，请参考
+[官方配置参考](https://docs.netbird.io/selfhosted/maintenance/configuration-files)
+编写后挂载进容器；`dashboard.env` 中的变量改用 `--env` 传给 Dashboard：
+
+```bash
+# 1. 编写 config.yaml（含 authSecret、加密密钥等），保存到 /etc/nsetup/
+# 2. 创建 netbird 项目并添加管理面板（自动创建 Host(netbird.example.com) 路由）
+nsetup app add netbird \
+  --image netbirdio/dashboard \
+  --version v2.90.10 \
+  --container-port 80 \
+  --host netbird \
+  --env NETBIRD_MGMT_API_ENDPOINT=https://netbird.example.com \
+  --env NETBIRD_MGMT_GRPC_API_ENDPOINT=https://netbird.example.com \
+  --env AUTH_AUDIENCE=netbird-dashboard \
+  --env AUTH_CLIENT_ID=netbird-dashboard \
+  --env AUTH_AUTHORITY=https://netbird.example.com/oauth2 \
+  --env "AUTH_SUPPORTED_SCOPES=openid profile email groups" \
+  --env AUTH_REDIRECT_URI=/nb-auth \
+  --env AUTH_SILENT_REDIRECT_URI=/nb-silent-auth \
+  --label "traefik.http.routers.netbird-0.priority=1" \
+  --start
+
+# 3. 向同一项目追加合并服务器（gRPC/后端双路由用 --label 声明）
+nsetup app add netbird --join \
+  --service netbird-server \
   --image netbirdio/netbird-server \
   --version 0.76.3 \
   --command --config \
   --command /etc/netbird/config.yaml \
-  --network external \
-  --external-network nihility-traefik \
   --publish-udp 3478:3478 \
   --named-volume netbird-data:/var/lib/netbird \
   --read-only-volume /etc/nsetup/netbird-config.yaml:/etc/netbird/config.yaml \
@@ -194,44 +290,15 @@ nsetup app add netbird-server \
   --label "traefik.http.services.netbird-server-h2c.loadbalancer.server.port=80" \
   --label "traefik.http.services.netbird-server-h2c.loadbalancer.server.scheme=h2c" \
   --start
-```
 
-### 示例：自托管 NetBird
-
-新版 NetBird 自托管部署（`netbirdio/netbird-server` 合并管理、信号、中继与
-内嵌 STUN 的单一容器）通过上面的参数即可完整表达。`config.yaml` 是服务端统一
-配置，替代旧版 `management.json` 与 `relay.env`，请参考
-[官方配置参考](https://docs.netbird.io/selfhosted/maintenance/configuration-files)
-编写后挂载进容器；`dashboard.env` 中的变量改用 `--env` 传给 Dashboard：
-
-```bash
-# 1. 编写 config.yaml（含 authSecret、加密密钥等），保存到 /etc/nsetup/
-# 2. 添加管理面板（自动创建 Host(netbird.example.com) 路由）
-nsetup app add netbird \
-  --image netbirdio/dashboard \
-  --version v2.90.10 \
-  --container-port 80 \
-  --host netbird \
-  --env NETBIRD_MGMT_API_ENDPOINT=https://netbird.example.com \
-  --env NETBIRD_MGMT_GRPC_API_ENDPOINT=https://netbird.example.com \
-  --env AUTH_AUDIENCE=netbird-dashboard \
-  --env AUTH_CLIENT_ID=netbird-dashboard \
-  --env AUTH_AUTHORITY=https://netbird.example.com/oauth2 \
-  --env "AUTH_SUPPORTED_SCOPES=openid profile email groups" \
-  --env AUTH_REDIRECT_URI=/nb-auth \
-  --env AUTH_SILENT_REDIRECT_URI=/nb-silent-auth \
-  --label "traefik.http.routers.netbird-0.priority=1" \
-  --start
-
-# 3. 添加合并服务器（上面的 netbird-server 示例）
 # 4. 确认 3478/udp 已对公网开放（STUN 无法通过 HTTP 反向代理转发）
 ```
 
-升级新版时分别升级两个应用；`config.yaml` 与数据卷会保留：
+升级新版时分别升级项目内的两个服务；`config.yaml` 与数据卷会保留：
 
 ```bash
-nsetup upgrade netbird-server --version 0.77.0
-nsetup upgrade netbird --version v2.91.0
+nsetup upgrade netbird --service netbird-server --version 0.77.0
+nsetup upgrade netbird --service app --version v2.91.0
 ```
 
 升级时分别指定应用、服务和版本。单服务应用可以省略 `--service`；多服务应用必须指定，
