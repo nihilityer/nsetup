@@ -1,6 +1,6 @@
 //! 基础设施与应用生成命令执行。
 
-use crate::cli::generated::{
+use crate::cli::generate::{
     AddArgs, AppCmd, AppParams, EditArgs, EnvironmentArg, InfraCmd, LabelArg, MiddlewareArg,
     MountArg, NamedVolumeArg, NetworkArg, PortMappingArg,
 };

@@ -9,9 +9,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// 单文件安装的可执行文件路径。
+/// 安装后的 nsetup 可执行文件路径。
 const INSTALL_BINARY: &str = "/usr/local/bin/nsetup";
-/// 单文件安装的 systemd unit 路径。
+/// 安装后的 systemd unit 路径。
 const INSTALL_UNIT: &str = "/etc/systemd/system/nsetup.service";
 /// 系统配置文件路径。
 const CONFIG_PATH: &str = "/etc/nsetup/config.toml";
@@ -20,7 +20,7 @@ const SYSTEM_GROUP: &str = "nihility";
 /// 系统文件的用户与组所有权。
 const SYSTEM_OWNERSHIP: &str = "root:nihility";
 /// 内嵌的 systemd unit。
-const SYSTEMD_UNIT: &str = include_str!("../packaging/systemd/nsetup.service");
+const SYSTEMD_UNIT: &str = include_str!("nsetup.service");
 
 /// 从当前可执行文件初始化系统服务。
 pub fn init(
@@ -53,8 +53,12 @@ pub fn init(
         0o640,
         force,
     )?;
-    let unit = render_unit(INSTALL_BINARY);
-    install_bytes(Path::new(INSTALL_UNIT), unit.as_bytes(), 0o644, force)?;
+    install_bytes(
+        Path::new(INSTALL_UNIT),
+        SYSTEMD_UNIT.as_bytes(),
+        0o644,
+        force,
+    )?;
     set_group_ownership(&config)?;
 
     run_status(
@@ -243,11 +247,6 @@ fn temporary_path(destination: &Path) -> anyhow::Result<PathBuf> {
         std::process::id(),
         rand::random::<u64>()
     )))
-}
-
-/// 将 unit 模板中的二进制路径替换为单文件安装路径。
-fn render_unit(binary: &str) -> String {
-    SYSTEMD_UNIT.replace("/usr/bin/nsetup", binary)
 }
 
 /// 执行不捕获输出的命令并检查退出状态。

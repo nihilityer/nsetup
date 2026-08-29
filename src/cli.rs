@@ -3,8 +3,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-pub mod generated;
-pub use generated::{AppCmd, InfraCmd};
+pub mod generate;
+pub use generate::{AppCmd, InfraCmd};
 
 /// Nihility 机器守护进程管理工具。
 ///

@@ -1,6 +1,6 @@
 //! systemd 服务控制命令。
 //!
-//! 服务可以由系统包或单文件初始化安装；本模块只调用 `systemctl`
+//! 服务由 `nsetup init` 安装；本模块只调用 `systemctl`
 //! 管理已经安装的服务。
 
 use crate::services::process;

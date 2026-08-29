@@ -13,7 +13,7 @@ mod constants;
 /// 基础设施与应用配置生成。
 mod generator;
 /// 单文件系统初始化。
-mod installer;
+mod init;
 /// Compose 项目编排逻辑。
 mod orchestrator;
 /// gRPC 服务。

@@ -2,7 +2,7 @@
 
 use crate::cli::{Cli, Commands, RpcCmd, ServiceCmd};
 use crate::config::Config;
-use crate::installer;
+use crate::init;
 use crate::orchestrator::StackAction;
 use crate::rpc::proto::{ContainerHealth, ContainerState, HealthResponse, PullProgress, Stack};
 use crate::rpc::{self, RpcClient};
@@ -18,11 +18,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             force,
             domain,
             stacks_root,
-        } => installer::init(force, domain, stacks_root),
+        } => init::init(force, domain, stacks_root),
         Commands::Daemon => rpc::serve(Config::load_or_default()?).await,
         Commands::Service { action } => run_service_action(action),
-        Commands::Infra { action } => generated::run_infra(action).await,
-        Commands::App { action } => generated::run_app(action).await,
+        Commands::Infra { action } => generate::run_infra(action).await,
+        Commands::App { action } => generate::run_app(action).await,
         Commands::Rpc {
             endpoint,
             token_file,
@@ -79,7 +79,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-mod generated;
+mod generate;
 
 /// 使用显式端点执行底层 RPC 命令。
 async fn run_rpc(
