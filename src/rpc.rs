@@ -12,6 +12,11 @@ pub use transport::serve;
 pub const MAX_RPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 /// 由 protobuf 生成的 gRPC 类型。
+#[allow(
+    clippy::missing_docs_in_private_items,
+    clippy::doc_markdown,
+    clippy::missing_const_for_fn
+)]
 pub mod proto {
     tonic::include_proto!("nsetup.v1");
 }
