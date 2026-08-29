@@ -13,10 +13,6 @@ use std::process::Command;
 const INSTALL_BINARY: &str = "/usr/local/bin/nsetup";
 /// 单文件安装的 systemd unit 路径。
 const INSTALL_UNIT: &str = "/etc/systemd/system/nsetup.service";
-/// 软件包安装的可执行文件路径。
-const PACKAGE_BINARY: &str = "/usr/bin/nsetup";
-/// 软件包安装的 systemd unit 路径。
-const PACKAGE_UNIT: &str = "/lib/systemd/system/nsetup.service";
 /// 系统配置文件路径。
 const CONFIG_PATH: &str = "/etc/nsetup/config.toml";
 /// 拥有本机管理权限的系统组。
@@ -33,7 +29,6 @@ pub fn init(
     stacks_root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     ensure_root()?;
-    ensure_standalone_install()?;
     ensure_command(&["systemctl", "--version"], "检查 systemd")?;
     ensure_command(&["docker", "compose", "version"], "检查 Docker Compose")?;
     preflight(force)?;
@@ -123,16 +118,6 @@ fn parse_effective_uid(status: &str) -> Option<u32> {
         .find_map(|line| line.strip_prefix("Uid:"))
         .and_then(|uids| uids.split_whitespace().nth(1))
         .and_then(|uid| uid.parse().ok())
-}
-
-/// 拒绝覆盖由系统包管理器安装的同名服务。
-fn ensure_standalone_install() -> anyhow::Result<()> {
-    if Path::new(PACKAGE_BINARY).exists() || Path::new(PACKAGE_UNIT).exists() {
-        anyhow::bail!(
-            "检测到 Debian/RPM 风格的 nsetup 安装；请继续使用包管理器升级，不能执行单文件初始化"
-        );
-    }
-    Ok(())
 }
 
 /// 检查初始化依赖的外部命令。
@@ -260,7 +245,7 @@ fn temporary_path(destination: &Path) -> anyhow::Result<PathBuf> {
     )))
 }
 
-/// 将包模板中的二进制路径替换为单文件安装路径。
+/// 将 unit 模板中的二进制路径替换为单文件安装路径。
 fn render_unit(binary: &str) -> String {
     SYSTEMD_UNIT.replace("/usr/bin/nsetup", binary)
 }

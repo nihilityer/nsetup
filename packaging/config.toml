@@ -1,9 +1,0 @@
-[paths]
-stacks_root = "/var/lib/nsetup/stacks"
-data_root = "/var/lib/nsetup/data"
-
-[home]
-domain = "example.com"
-
-[grpc]
-listen = "unix:///run/nsetup/nsetup.sock"

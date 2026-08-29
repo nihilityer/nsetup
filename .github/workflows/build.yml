@@ -44,23 +44,11 @@ jobs:
       - name: Build release
         run: cargo build --release --target x86_64-unknown-linux-musl
 
-      - name: Build Debian package
-        run: |
-          cargo install cargo-deb --locked
-          cargo deb
-
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: nsetup-linux-amd64
           path: target/x86_64-unknown-linux-musl/release/nsetup
-          if-no-files-found: error
-
-      - name: Upload Debian package
-        uses: actions/upload-artifact@v4
-        with:
-          name: nsetup-debian-amd64
-          path: target/debian/*.deb
           if-no-files-found: error
 
   release:
@@ -76,11 +64,6 @@ jobs:
         with:
           name: nsetup-linux-amd64
 
-      - name: Download Debian package
-        uses: actions/download-artifact@v4
-        with:
-          name: nsetup-debian-amd64
-
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -93,7 +76,6 @@ jobs:
             - `nsetup`：静态链接，可在任意 Linux x86_64 发行版上运行，包括 TrueNAS SCALE。
           files: |
             nsetup
-            *.deb
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -6,15 +6,13 @@
 
 ## Linux 目录布局
 
-两种安装方式均遵循 FHS 和 systemd 的目录约定：
+单文件安装遵循 FHS 和 systemd 的目录约定：
 
 | 内容                    | 路径                                   | 管理者            |
 |-----------------------|--------------------------------------|----------------|
-| 单文件安装的二进制             | `/usr/local/bin/nsetup`              | `nsetup init`  |
-| 单文件安装的 systemd unit   | `/etc/systemd/system/nsetup.service` | `nsetup init`  |
-| Debian 包二进制           | `/usr/bin/nsetup`                    | dpkg           |
-| Debian 包 systemd unit | `/lib/systemd/system/nsetup.service` | dpkg           |
-| 配置                    | `/etc/nsetup/config.toml`            | 管理员；升级时保留      |
+| 二进制                  | `/usr/local/bin/nsetup`              | `nsetup init`  |
+| systemd unit         | `/etc/systemd/system/nsetup.service` | `nsetup init`  |
+| 配置                    | `/etc/nsetup/config.toml`            | 管理员；`init --force` 时保留已有值 |
 | Compose 项目            | `/var/lib/nsetup/stacks`             | daemon         |
 | 容器数据默认根目录             | `/var/lib/nsetup/data`               | daemon         |
 | 本机 gRPC socket        | `/run/nsetup/nsetup.sock`            | systemd/daemon |
@@ -22,7 +20,7 @@
 
 运行目录随重启清理，配置和持久数据保存在系统目录，不写入 `~/.nsetup`。
 
-## 单文件初始化
+## 初始化安装
 
 下载或构建一个 `nsetup` 可执行文件后，以 root 身份初始化：
 
@@ -37,20 +35,8 @@ sudo usermod -aG nihility "$USER"
 该命令会把当前可执行文件安装到 `/usr/local/bin/nsetup`，创建 `nihility` 系统组、
 配置与状态目录，写入配置和 systemd unit，并立即启用服务。`--domain` 会成为基础设施
 及应用的默认主域名；`--stacks-root` 可将 Compose 项目放到不会随 `/var` 清理的持久化
-挂载点。目标文件已存在时默认停止；确认替换单文件安装及配置时使用
+挂载点。目标文件已存在时默认停止；确认替换安装及配置时使用
 `sudo ./nsetup init --force`，未重复指定的配置值会保留。
-
-单文件初始化会拒绝与 Debian/RPM 风格的安装共存。使用包管理器安装后，升级和卸载
-也必须继续通过包管理器完成。
-
-## 安装 Debian 包
-
-发布产物中的 `.deb` 会创建 `nihility` 系统组、安装并启动 Nihility 机器守护进程：
-
-```bash
-sudo apt install ./nsetup_0.1.0-1_amd64.deb
-sudo usermod -aG nihility "$USER"
-```
 
 重新登录以刷新组成员关系，然后直接使用 CLI：
 
@@ -64,8 +50,7 @@ nsetup logs assistant-api -f
 nsetup remove assistant-api --force
 ```
 
-`nsetup service status|start|stop|restart` 用于控制已安装的 unit。通过 Debian 包安装
-后，安装、升级和卸载必须继续使用 `apt`/`dpkg`。
+`nsetup service status|start|stop|restart` 用于控制已安装的 unit。
 
 ## 初始化基础设施
 
@@ -311,7 +296,7 @@ nsetup upgrade media --service api --version 2.4.0
 
 ## 配置
 
-包提供的默认配置为：
+`nsetup init` 写入的默认配置为：
 
 ```toml
 [paths]
@@ -355,16 +340,14 @@ nsetup rpc \
   health
 ```
 
-## 构建与打包
+## 构建
 
 ```bash
 cargo fmt --check
 cargo check
 cargo test
 cargo clippy --all-targets -- -D warnings
-cargo install cargo-deb --locked
-cargo deb
 ```
 
-Debian 包输出到 `target/debian/`。打包输入位于 `packaging/`，包维护脚本负责创建
-系统组、状态目录以及启用服务；配置文件被声明为 conffile，升级不会静默覆盖修改。
+发布产物为 musl 静态链接的单可执行文件 `nsetup`，在目标机器上执行
+`sudo ./nsetup init` 完成系统安装。

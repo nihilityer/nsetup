@@ -34,18 +34,6 @@ prettyplease = "0.3"
 syn = { version = "3", features = ["full", "visit-mut"] }
 tonic-prost-build = "0.14"
 
-[package.metadata.deb]
-maintainer = "nihilityer <nihilityer@users.noreply.github.com>"
-maintainer-scripts = "packaging/debian"
-assets = [
-    ["target/release/nsetup", "usr/bin/nsetup", "755"],
-    ["packaging/systemd/nsetup.service", "lib/systemd/system/nsetup.service", "644"],
-    ["packaging/config.toml", "etc/nsetup/config.toml", "600"],
-]
-conf-files = ["/etc/nsetup/config.toml"]
-depends = "docker.io | docker-ce, docker-compose-plugin"
-extended-description = "Nihility 机器守护进程以 root systemd 服务运行。nsetup CLI 通过本机 Unix domain socket 上的 gRPC API 管理 Docker Compose 项目。"
-
 [lints.rust]
 # 所有公开类型、函数、模块必须有文档注释
 missing_docs = "deny"
