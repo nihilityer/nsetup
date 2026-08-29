@@ -13,7 +13,7 @@ pub use types::{
 };
 
 use crate::config::{Config, set_mode};
-use crate::constants::{COMPOSE_FILE, ENV_FILE};
+use crate::constants::{APP_CONFIG_FILE, COMPOSE_FILE, ENV_FILE};
 use crate::services::docker;
 use anyhow::Context;
 use container::parse_container_status;
@@ -74,6 +74,27 @@ pub fn get_stack(config: &Config, name: &str) -> anyhow::Result<StackInfo> {
     })
 }
 
+/// 读取应用保存的 nsetup 原生简化配置。
+pub fn export_application_config(config: &Config, name: &str) -> anyhow::Result<String> {
+    let project_directory = stack_dir(config, name)?;
+    ensure_regular_stack_dir(&project_directory)?;
+    let path = project_directory.join(APP_CONFIG_FILE);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            InvalidInput(format!(
+                "项目 {name} 不是由简化配置创建，或创建后已被其他命令修改"
+            ))
+            .into()
+        } else {
+            anyhow::Error::from(error)
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(InvalidInput(format!("项目 {name} 的简化配置不是普通文件")).into());
+    }
+    fs::read_to_string(&path).with_context(|| format!("无法读取应用简化配置: {}", path.display()))
+}
+
 /// 创建或更新 Compose 项目，并可选择立即启动
 pub fn deploy_stack(
     config: &Config,
@@ -118,6 +139,12 @@ pub fn deploy_stack(
             })?;
         }
         return Err(InvalidInput(format!("Compose 配置验证失败，已恢复原文件: {error}")).into());
+    }
+    let app_config_path = project_directory.join(APP_CONFIG_FILE);
+    if app_config_path.exists() {
+        fs::remove_file(&app_config_path).with_context(|| {
+            format!("无法使旧的应用简化配置失效: {}", app_config_path.display())
+        })?;
     }
     if start {
         docker::compose_up(&project_directory)?;

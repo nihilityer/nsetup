@@ -2,7 +2,8 @@
 
 use super::proto::orchestrator_client::OrchestratorClient;
 use super::proto::{
-    CreateApplicationRequest, CreateStaticSiteRequest, DeployStackRequest, GetLogsRequest,
+    ApplicationConfigResponse, ApplyApplicationConfigRequest, CreateApplicationRequest,
+    CreateStaticSiteRequest, DeployStackRequest, ExportApplicationConfigRequest, GetLogsRequest,
     GetStackRequest, HealthRequest, HealthResponse, InitializeInfrastructureRequest,
     ListStacksRequest, ListStacksResponse, LogLine, OperationResponse, PullProgress,
     RemoveStackRequest, Stack, StackActionRequest, UpdateApplicationRequest, UpdateStackRequest,
@@ -77,6 +78,40 @@ impl RpcClient {
     ) -> anyhow::Result<OperationResponse> {
         let request = self.request(input);
         Ok(self.inner.create_application(request).await?.into_inner())
+    }
+
+    /// 从 nsetup 原生简化配置部署应用。
+    pub async fn apply_application_config(
+        &mut self,
+        config_toml: String,
+        start: bool,
+        force: bool,
+    ) -> anyhow::Result<OperationResponse> {
+        let request = self.request(ApplyApplicationConfigRequest {
+            config_toml,
+            start,
+            force,
+        });
+        Ok(self
+            .inner
+            .apply_application_config(request)
+            .await
+            .map_err(rpc_error)?
+            .into_inner())
+    }
+
+    /// 导出应用保存的 nsetup 原生简化配置。
+    pub async fn export_application_config(
+        &mut self,
+        name: String,
+    ) -> anyhow::Result<ApplicationConfigResponse> {
+        let request = self.request(ExportApplicationConfigRequest { name });
+        Ok(self
+            .inner
+            .export_application_config(request)
+            .await
+            .map_err(rpc_error)?
+            .into_inner())
     }
 
     /// 按参数局部修改已有应用。

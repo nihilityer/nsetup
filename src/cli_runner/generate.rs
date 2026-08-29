@@ -47,6 +47,39 @@ pub(super) async fn run_infra(action: InfraCmd) -> anyhow::Result<()> {
 /// 执行应用生成命令。
 pub(super) async fn run_app(action: AppCmd) -> anyhow::Result<()> {
     match action {
+        AppCmd::Apply {
+            config,
+            start,
+            force,
+        } => {
+            let config_toml = std::fs::read_to_string(&config)
+                .with_context(|| format!("无法读取应用简化配置: {}", config.display()))?;
+            let mut client = RpcClient::connect(None, None).await?;
+            tracing::info!(
+                "{}",
+                client
+                    .apply_application_config(config_toml, start, force)
+                    .await?
+                    .message
+            );
+        }
+        AppCmd::Export {
+            name,
+            output,
+            force,
+        } => {
+            if output.exists() && !force {
+                anyhow::bail!(
+                    "输出文件已存在: {}；确认覆盖请使用 --force",
+                    output.display()
+                );
+            }
+            let mut client = RpcClient::connect(None, None).await?;
+            let exported = client.export_application_config(name).await?;
+            crate::orchestrator::write_atomic(&output, exported.config_toml.as_bytes(), 0o600)
+                .with_context(|| format!("无法写入导出配置: {}", output.display()))?;
+            tracing::info!("应用简化配置已导出到 {}", output.display());
+        }
         AppCmd::Add(arguments) => {
             let AddArgs {
                 name,

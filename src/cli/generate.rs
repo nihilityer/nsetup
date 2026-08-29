@@ -39,6 +39,30 @@ pub enum InfraCmd {
 /// 应用生成子命令。
 #[derive(Debug, Subcommand)]
 pub enum AppCmd {
+    /// 导入 nsetup 原生简化配置并创建或覆盖应用。
+    #[command(name = "import", visible_alias = "apply")]
+    Apply {
+        /// TOML 配置文件。
+        #[arg(long)]
+        config: PathBuf,
+        /// 部署后立即启动。
+        #[arg(long)]
+        start: bool,
+        /// 覆盖已有项目。
+        #[arg(long)]
+        force: bool,
+    },
+    /// 导出由原生简化配置管理的应用。
+    Export {
+        /// Compose 项目名。
+        name: String,
+        /// 导出的 TOML 文件。
+        #[arg(short, long)]
+        output: PathBuf,
+        /// 覆盖已有输出文件。
+        #[arg(long)]
+        force: bool,
+    },
     /// 从镜像生成常规单服务应用。
     Add(Box<AddArgs>),
     /// 修改现有应用；可用参数局部修改，或用 --compose 整体替换。

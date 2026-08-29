@@ -6,12 +6,14 @@ use super::conversion::{
 };
 use super::proto::orchestrator_server::Orchestrator;
 use super::proto::{
-    CreateApplicationRequest, CreateStaticSiteRequest, DeployStackRequest, GetLogsRequest,
+    ApplicationConfigResponse, ApplyApplicationConfigRequest, CreateApplicationRequest,
+    CreateStaticSiteRequest, DeployStackRequest, ExportApplicationConfigRequest, GetLogsRequest,
     GetStackRequest, HealthRequest, HealthResponse, InitializeInfrastructureRequest,
     ListStacksRequest, ListStacksResponse, LogLine, OperationResponse, PullProgress,
     RemoveStackRequest, Stack, StackActionRequest, UpdateApplicationRequest, UpdateStackRequest,
     UpgradeApplicationRequest,
 };
+use crate::app_config;
 use crate::config::{Config, check_docker};
 use crate::generator::{self, Route};
 use crate::orchestrator::{self};
@@ -162,6 +164,48 @@ impl Orchestrator for OrchestratorService {
         })
         .await?;
         Ok(operation_response(format!("应用 {name} 已生成")))
+    }
+
+    async fn apply_application_config(
+        &self,
+        request: Request<ApplyApplicationConfigRequest>,
+    ) -> Result<Response<OperationResponse>, Status> {
+        let config = self.config.clone();
+        let input = request.into_inner();
+        let generated = self
+            .mutate(move || {
+                let generated = app_config::generate(&input.config_toml, &config.home.domain)
+                    .map_err(invalid_generation)?;
+                orchestrator::ensure_no_conflicts(
+                    &config,
+                    &generated.stack.name,
+                    &generated.routes,
+                    &generated.published_ports,
+                )?;
+                orchestrator::deploy_generated_stack(
+                    &config,
+                    &generated.stack,
+                    input.force,
+                    input.start,
+                )?;
+                Ok(generated.stack.name)
+            })
+            .await?;
+        Ok(operation_response(format!(
+            "应用 {generated} 已从简化配置部署"
+        )))
+    }
+
+    async fn export_application_config(
+        &self,
+        request: Request<ExportApplicationConfigRequest>,
+    ) -> Result<Response<ApplicationConfigResponse>, Status> {
+        let config = self.config.clone();
+        let name = request.into_inner().name;
+        let config_toml = self
+            .blocking(move || orchestrator::export_application_config(&config, &name))
+            .await?;
+        Ok(Response::new(ApplicationConfigResponse { config_toml }))
     }
 
     async fn update_application(

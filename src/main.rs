@@ -2,6 +2,8 @@
 //!
 //! 提供 Docker Compose 项目管理 CLI、gRPC 接口和 systemd 服务控制能力。
 
+/// 应用原生简化配置。
+mod app_config;
 /// 命令行参数定义。
 mod cli;
 /// CLI 命令执行。

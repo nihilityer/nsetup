@@ -49,7 +49,52 @@ nsetup infra init \
 
 镜像必须使用明确版本，省略标签或使用 `latest` 会被拒绝。
 
-从镜像创建单服务应用：
+推荐使用 nsetup 原生 TOML 配置，无需编写或维护 Compose 文件：
+
+```toml
+format = 1
+name = "api"
+image = "ghcr.io/example/api:1.0"
+port = 8080
+publish = ["12780:8080/tcp"]
+volumes = ["/var/lib/example:/var/lib/example"]
+named_volumes = ["api-cache:/var/cache/api"]
+
+[environment]
+LOG_LEVEL = "info"
+
+[traefik]
+hosts = ["api"]
+middlewares = ["gzip"]
+protocol = "http"
+sticky_cookie = true
+pass_host_header = true
+priority = 100
+
+[healthcheck]
+command = "curl -fsS http://localhost:8080/health"
+interval = "30s"
+timeout = "3s"
+retries = 3
+```
+
+读取配置并部署，或导出当前保存的简化配置：
+
+```bash
+nsetup app import --config ./api.toml --start
+nsetup app export api --output ./api.toml --force
+```
+
+`traefik.hosts` 接受完整域名或短子域名；`middlewares` 支持 `gzip`、
+`forwarded-headers`、`internal-only`；`protocol` 支持 `http`、`https`、`h2c`。
+还可以用 `[[traefik.routes]]` 为不同域名指定独立的 `port` 和 `path_prefix`。
+`sticky_cookie`、`pass_host_header` 和 `priority` 会生成对应的常用 Traefik labels，
+其余高级场景仍可通过顶层 `labels` 数组补充。
+
+简化配置由 daemon 以 `0600` 权限保存。若应用随后被 `app edit`、`upgrade` 或原始
+Compose 部署修改，旧配置会失效；此时导出会拒绝返回可能过期的内容。
+
+也可以直接通过命令参数创建单服务应用：
 
 ```bash
 nsetup app add whoami \

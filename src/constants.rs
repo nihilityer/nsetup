@@ -5,6 +5,9 @@
 pub const COMPOSE_FILE: &str = "compose.yaml";
 /// 环境变量文件名
 pub const ENV_FILE: &str = ".env";
+
+/// daemon 为原生简化应用保存的配置文件名。
+pub const APP_CONFIG_FILE: &str = "nsetup.toml";
 // ── nsetup 系统路径 ──
 /// 系统配置目录
 pub const SYSTEM_CONFIG_DIR: &str = "/etc/nsetup";
