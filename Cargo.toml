@@ -81,7 +81,7 @@ let_underscore_must_use = "deny"
 missing_docs_in_private_items = "deny"
 
 # --- 文档完整性（强制） ---
-# unsafe 函数必须在文档中包含 # Safety 说明
+# 不安全函数必须在文档中包含安全性说明
 missing_safety_doc = "deny"
 
 # --- 文档质量（警告） ---

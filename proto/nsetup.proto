@@ -2,349 +2,316 @@ syntax = "proto3";
 
 package nsetup.v1;
 
-import "stack.proto";
-
-// 提供由 Nihility 机器守护进程执行的 Docker Compose 项目编排能力。
+// 管理本机 Docker Compose 项目的守护进程接口。
 //
-// 本机客户端默认通过 Unix domain socket 连接；只有显式启用 TCP 监听时
-// 才需要在 authorization 元数据中携带 Bearer 令牌。
+// 本机默认通过 Unix socket 调用；TCP 监听必须使用 Bearer token 认证。
 service Orchestrator {
-  // 返回守护进程、Docker 和项目存储目录的健康信息。
-  rpc Health(HealthRequest) returns (HealthResponse);
-
-  // 生成并部署 Traefik 基础设施。
-  rpc InitializeInfrastructure(InitializeInfrastructureRequest) returns (OperationResponse);
-
-  // 根据类型化参数生成并部署单服务应用。
-  rpc CreateApplication(CreateApplicationRequest) returns (OperationResponse);
-
-  // 读取 nsetup 原生简化配置并生成应用。
-  rpc ApplyApplicationConfig(ApplyApplicationConfigRequest) returns (OperationResponse);
-
-  // 导出应用保存的 nsetup 原生简化配置。
-  rpc ExportApplicationConfig(ExportApplicationConfigRequest) returns (ApplicationConfigResponse);
-
-  // 解析现有 Compose 项目并按传入参数局部修改应用。
-  rpc UpdateApplication(UpdateApplicationRequest) returns (OperationResponse);
-
-  // 设置 Compose 服务的镜像版本，拉取镜像并重新创建该服务。
-  rpc UpgradeApplication(UpgradeApplicationRequest) returns (OperationResponse);
-
-  // 根据本地静态文件生成并部署 Nginx 静态站点。
-  rpc CreateStaticSite(CreateStaticSiteRequest) returns (OperationResponse);
-
-  // 列出守护进程管理的全部 Compose 项目及其容器状态。
-  rpc ListStacks(ListStacksRequest) returns (ListStacksResponse);
-
-  // 按项目名查询单个 Compose 项目及其容器状态。
-  rpc GetStack(GetStackRequest) returns (Stack);
-
-  // 创建或更新 Compose 项目，并可选择在部署后立即启动。
-  rpc DeployStack(DeployStackRequest) returns (OperationResponse);
-
-  // 修改已有 Compose 项目，未提供环境文件时保留原内容。
-  rpc UpdateStack(UpdateStackRequest) returns (OperationResponse);
-
-  // 停止项目并删除其 Compose 配置，可选择同时删除命名卷。
-  rpc RemoveStack(RemoveStackRequest) returns (OperationResponse);
-
-  // 启动指定 Compose 项目。
-  rpc StartStack(StackActionRequest) returns (OperationResponse);
-
-  // 停止指定 Compose 项目，但保留容器和项目配置。
-  rpc StopStack(StackActionRequest) returns (OperationResponse);
-
-  // 重启指定 Compose 项目。
-  rpc RestartStack(StackActionRequest) returns (OperationResponse);
-
-  // 拉取指定 Compose 项目引用的镜像，并持续返回 Docker 报告的进度。
-  rpc PullStack(StackActionRequest) returns (stream PullProgress);
-
-  // 构建指定 Compose 项目中声明了 build 的镜像。
-  rpc BuildStack(StackActionRequest) returns (OperationResponse);
-
-  // 按行返回指定 Compose 项目的日志，可选择持续跟随。
-  rpc GetLogs(GetLogsRequest) returns (stream LogLine);
+  // 返回 daemon、Docker、项目目录与主域名状态。
+  rpc Status(StatusRequest) returns (StatusResponse);
+  // 从 nsetup TOML 声明生成或整体替换项目。
+  rpc Apply(ApplyRequest) returns (OperationResponse);
+  // 导入受支持字段子集内的 Compose 项目。
+  rpc ImportCompose(ImportComposeRequest) returns (OperationResponse);
+  // 从当前 Compose 与环境文件反解可重建的 TOML。
+  rpc Export(ExportRequest) returns (ExportResponse);
+  // 对当前项目中的一个服务执行类型化局部修改。
+  rpc Edit(EditRequest) returns (OperationResponse);
+  // 列出所有受管项目及其当前容器状态。
+  rpc List(ListRequest) returns (ListResponse);
+  // 返回一个受管项目及其当前容器状态。
+  rpc Get(GetRequest) returns (Stack);
+  // 停止容器并删除项目配置，但保留 bind mount 数据。
+  rpc Remove(RemoveRequest) returns (OperationResponse);
+  // 启动一个项目。
+  rpc Start(ActionRequest) returns (OperationResponse);
+  // 停止一个项目但保留容器和配置。
+  rpc Stop(ActionRequest) returns (OperationResponse);
+  // 重启一个项目。
+  rpc Restart(ActionRequest) returns (OperationResponse);
+  // 拉取项目镜像并流式返回进度。
+  rpc Pull(ActionRequest) returns (stream PullProgress);
+  // 构建项目中声明的镜像。
+  rpc Build(ActionRequest) returns (OperationResponse);
+  // 返回项目日志，并可持续跟随新增日志。
+  rpc Logs(LogsRequest) returns (stream LogLine);
 }
 
-// 健康检查请求；当前不需要请求参数。
-message HealthRequest {}
+// 状态查询不需要参数。
+message StatusRequest {}
 
-// 守护进程健康信息。
-message HealthResponse {
-  // 当前守护进程的软件版本。
+// daemon 与其运行环境的状态。
+message StatusResponse {
+  // 当前 daemon 软件版本。
   string version = 1;
-
-  // 守护进程是否能够访问 Docker daemon。
+  // daemon 是否能够连接配置的 Docker socket。
   bool docker_available = 2;
-
-  // 守护进程使用的 Compose 项目根目录绝对路径。
-  string compose_root = 3;
-
-  // 基础设施和应用短子域名使用的主域名。
+  // Compose 项目根目录的绝对路径。
+  string stacks_root = 3;
+  // 短主机名使用的主域名。
   string domain = 4;
 }
 
-// 应用原生简化配置部署请求。
-message ApplyApplicationConfigRequest {
-  // 完整的 nsetup TOML 应用配置。
-  string config_toml = 1;
-  // 是否部署后立即启动应用。
-  bool start = 2;
-  // 是否覆盖已有项目。
-  bool force = 3;
-}
-
-// 应用原生简化配置导出请求。
-message ExportApplicationConfigRequest {
-  // Compose 项目名。
-  string name = 1;
-}
-
-// 应用原生简化配置导出响应。
-message ApplicationConfigResponse {
-  // 规范化后的完整 TOML 配置。
-  string config_toml = 1;
-}
-
-// Docker Compose 拉取镜像时报告的单个进度事件。
-message PullProgress {
-  // Docker 进度节点标识，通常对应镜像或镜像层。
-  string id = 1;
-  // Docker 报告的节点状态。
-  string status = 2;
-  // Docker 报告的操作说明。
-  string text = 3;
-  // 当前已处理的字节数；Docker 未提供时为 0。
-  uint64 current = 4;
-  // 需要处理的总字节数；Docker 未提供时为 0。
-  uint64 total = 5;
-}
-
-// 初始化共享基础设施的请求。
-message InitializeInfrastructureRequest {
-  // Nihility 服务使用的主域名。
-  string domain = 1;
-  // ACME 证书通知邮箱。
-  string acme_email = 2;
-  // Cloudflare DNS API 令牌。
-  string cloudflare_token = 3;
-  // Traefik 镜像版本。
-  string traefik_version = 4;
-  reserved 5 to 9;
-  // 是否生成后立即启动基础设施。
-  bool start = 10;
-  // 是否覆盖已有的基础设施配置。
-  bool force = 11;
-  // Traefik HTTP 入口映射到宿主机的端口；未指定时为 80。
-  uint32 http_port = 12;
-  // Traefik HTTPS 和 HTTP/3 入口映射到宿主机的端口；未指定时为 443。
-  uint32 https_port = 13;
-}
-
-// 创建常规单服务应用的请求。
-message CreateApplicationRequest {
-  // Compose 项目名。
-  string name = 1;
-  // Compose 服务名。
-  string service = 2;
-  // 不含标签的容器镜像名。
-  string image = 3;
-  // 覆盖镜像默认命令的参数列表。
-  repeated string command = 4;
-  // 提供给 Traefik 的容器端口。
-  uint32 container_port = 5;
-  // 应用的 HTTP 路由。
-  repeated ApplicationRoute routes = 6;
-  // 发布到宿主机的端口。
-  repeated PublishedPort published_ports = 7;
-  // 应用数据卷。
-  repeated ApplicationVolume volumes = 8;
-  // 容器环境变量。
-  repeated EnvironmentVariable environment = 9;
-  // 容器网络模式。
-  ApplicationNetworkMode network_mode = 10;
-  // 使用外部网络时的网络名。
-  string external_network = 11;
-  // 路由引用的 Traefik 中间件。
-  repeated ApplicationMiddleware middlewares = 12;
-  reserved 13;
-  // 是否生成后立即启动应用。
-  bool start = 14;
-  // 是否覆盖已有项目配置。
-  bool force = 15;
-  // 容器镜像版本标签。
-  string version = 16;
-  // 附加到容器的自定义 Docker 标签，格式为 KEY=VALUE；覆盖自动生成的同名标签。
-  repeated string labels = 17;
-  // 应用命名卷。
-  repeated NamedVolume named_volumes = 18;
-  // 容器健康检查。
-  optional HealthcheckSpec healthcheck = 19;
-  // 追加到已有项目的服务；name 仍为项目名，service 为新增服务名。
-  bool join = 20;
-}
-
-// 按参数局部修改已有应用的请求；未提供的字段保持原样。
-message UpdateApplicationRequest {
-  // 已存在的 Compose 项目名。
-  string name = 1;
-  // 要修改的 Compose 服务名；项目只有一个服务时可以省略。
-  optional string service = 2;
-  // 新的镜像仓库名；省略时保留当前仓库。
-  optional string image = 3;
-  // 新的镜像版本标签；省略时保留当前标签。
-  optional string version = 4;
-  // 覆盖镜像默认命令的参数列表；省略时保留原命令。
-  repeated string command = 5;
-  // 路由默认容器端口；省略时保留原端口。
-  optional uint32 container_port = 6;
-  // 重建后的 HTTP 路由；与 hosts 一起替换现有路由。
-  repeated ApplicationRoute routes = 7;
-  // 替换后的宿主机端口映射。
-  repeated PublishedPort published_ports = 8;
-  // 追加到现有卷挂载之后的卷。
-  repeated ApplicationVolume volumes = 9;
-  // 合并到现有环境变量中的键值。
-  repeated EnvironmentVariable environment = 10;
-  // 新的容器网络模式；省略时保留原网络。
-  optional ApplicationNetworkMode network_mode = 11;
-  // external 网络模式使用的 Docker 网络名。
-  optional string external_network = 12;
-  // 替换路由中间件；省略时保留现有中间件。
-  repeated ApplicationMiddleware middlewares = 13;
-  // 按标签键替换的自定义 Docker 标签。
-  repeated string labels = 14;
-  // 追加到现有命名卷之后的命名卷。
-  repeated NamedVolume named_volumes = 15;
-  // 应用于全部路由的 URL 路径前缀。
-  optional string path_prefix = 16;
-  // 重建路由时使用的短子域名或完整域名。
-  repeated string hosts = 17;
-  // 新的健康检查；提供时替换现有健康检查。
-  optional HealthcheckSpec healthcheck = 18;
-  // 移除现有健康检查。
-  bool remove_healthcheck = 19;
-  // 是否在修改成功后执行 compose up。
-  bool start = 20;
-}
-
-// 容器健康检查参数。
-message HealthcheckSpec {
-  // 健康检查命令（CMD-SHELL 形式）。
-  string command = 1;
-  // 检查间隔，如 30s；为空时使用默认值。
-  string interval = 2;
-  // 单次检查超时，如 3s；为空时使用默认值。
-  string timeout = 3;
-  // 启动宽限期，如 10s。
-  optional string start_period = 4;
-  // 失败重试次数；为 0 时使用默认值。
-  uint32 retries = 5;
-}
-
-// 创建静态站点的请求。
-message CreateStaticSiteRequest {
-  // Compose 项目名。
-  string name = 1;
-  // 站点完整域名。
-  string host = 2;
-  // 需要写入站点目录的文件。
-  repeated StaticAsset assets = 3;
-  // 路由引用的 Traefik 中间件。
-  repeated ApplicationMiddleware middlewares = 4;
-  // Nginx 镜像版本。
-  string nginx_version = 5;
-  // 是否生成后立即启动站点。
-  bool start = 6;
-  // 是否覆盖已有项目配置。
-  bool force = 7;
-}
-
-// 应用的 HTTP 路由。
-message ApplicationRoute {
-  // 完整域名。
-  string host = 1;
-  // 可选的 URL 路径前缀。
-  string path_prefix = 2;
-  // 此路由连接的容器端口；未指定时使用应用默认容器端口。
-  uint32 container_port = 3;
-}
-
-// 宿主机端口映射。
-message PublishedPort {
-  // 宿主机端口。
-  uint32 host_port = 1;
-  // 容器端口。
-  uint32 container_port = 2;
-  // 传输层协议。
-  PortProtocol protocol = 3;
-}
-
-// 应用数据卷挂载。
-message ApplicationVolume {
-  // 宿主机路径。
-  string host_path = 1;
-  // 容器路径。
-  string container_path = 2;
-  // 是否只读挂载。
-  bool read_only = 3;
-}
-
-// 应用命名卷。
-message NamedVolume {
-  // 命名卷名。
-  string name = 1;
-  // 容器路径。
-  string container_path = 2;
-}
-
-// 容器环境变量。
-message EnvironmentVariable {
-  // 环境变量名。
-  string key = 1;
-  // 环境变量值。
-  string value = 2;
-}
-
-// 静态站点文件。
-message StaticAsset {
-  // 相对于站点根目录的安全路径。
+// static 模板附带的单个站点文件。
+message Asset {
+  // 相对于站点根目录的安全文件路径。
   string path = 1;
   // 文件原始内容。
   bytes content = 2;
 }
 
-// 应用容器网络模式。
-enum ApplicationNetworkMode {
-  // 未指定时使用 Compose 默认桥接网络。
-  APPLICATION_NETWORK_MODE_UNSPECIFIED = 0;
-  // 使用 Compose 默认桥接网络。
-  APPLICATION_NETWORK_MODE_BRIDGE = 1;
-  // 使用宿主机网络。
-  APPLICATION_NETWORK_MODE_HOST = 2;
-  // 加入指定的外部 Docker 网络。
-  APPLICATION_NETWORK_MODE_EXTERNAL = 3;
+// TOML 声明式配置的应用请求。
+message ApplyRequest {
+  // 完整的 nsetup TOML 配置。
+  string config_toml = 1;
+  // static 模板需要写入站点目录的文件。
+  repeated Asset assets = 2;
+  // 写入成功后是否立即执行 compose up。
+  bool start = 3;
+  // 是否允许整体替换已存在的同名项目。
+  bool force = 4;
 }
 
-// 发布端口使用的协议。
+// Compose 项目导入请求。
+message ImportComposeRequest {
+  // 目标项目名。
+  string name = 1;
+  // 完整 Compose YAML；只允许 IR 覆盖的字段子集。
+  string compose_yaml = 2;
+  // 可选的 .env 内容；省略时已有项目沿用当前内容。
+  optional string env_file = 3;
+  // 导入成功后是否立即执行 compose up。
+  bool start = 4;
+}
+
+// TOML 导出请求。
+message ExportRequest {
+  // 要导出的项目名。
+  string name = 1;
+}
+
+// TOML 导出结果。
+message ExportResponse {
+  // 从当前项目真实状态反解的规范化 TOML。
+  string config_toml = 1;
+}
+
+// 一个完整的 Traefik HTTP 路由。
+message Route {
+  // 此路由匹配的完整 DNS 主机名。
+  repeated string hosts = 1;
+  // 可选 URL 路径前缀。
+  optional string path_prefix = 2;
+  // Traefik 连接的容器端口。
+  uint32 container_port = 3;
+  // 此路由引用的内置中间件。
+  repeated Middleware middlewares = 4;
+  // Traefik 连接后端时使用的协议。
+  RouteProtocol protocol = 5;
+  // 是否启用负载均衡 sticky cookie。
+  bool sticky_cookie = 6;
+  // 是否把原始 Host 请求头传给后端；省略时使用 Traefik 默认值。
+  optional bool pass_host_header = 7;
+  // 可选路由优先级。
+  optional uint32 priority = 8;
+}
+
+// 一个完整的宿主机端口映射。
+message PublishedPort {
+  // 可选的宿主机监听 IP。
+  optional string host_ip = 1;
+  // 宿主机监听端口。
+  uint32 host_port = 2;
+  // 容器目标端口。
+  uint32 container_port = 3;
+  // 端口使用的传输协议。
+  PortProtocol protocol = 4;
+}
+
+// 一个 bind mount。
+message Volume {
+  // 白名单内的宿主机绝对路径。
+  string host_path = 1;
+  // 容器内绝对路径。
+  string container_path = 2;
+  // 是否以只读方式挂载。
+  bool read_only = 3;
+}
+
+// 容器健康检查。
+message Healthcheck {
+  // CMD-SHELL 形式的检查命令。
+  string command = 1;
+  // 可选检查间隔，如 30s。
+  optional string interval = 2;
+  // 可选单次检查超时，如 3s。
+  optional string timeout = 3;
+  // 可选启动宽限期，如 10s。
+  optional string start_period = 4;
+  // 可选失败重试次数。
+  optional uint32 retries = 5;
+}
+
+// 服务局部修改请求；未提供的字段保持不变。
+message EditRequest {
+  // 已存在的项目名。
+  string name = 1;
+  // 要修改的服务；单服务项目可省略。
+  optional string service = 2;
+  // 新镜像仓库，不含标签。
+  optional string image = 3;
+  // 新镜像版本标签。
+  optional string version = 4;
+  // 新命令参数；非空时整体替换。
+  repeated string command = 5;
+  // 应用于保留路由的默认容器端口。
+  optional uint32 container_port = 6;
+  // 新路由；非空时整体替换现有路由。
+  repeated Route routes = 7;
+  // 新端口映射；非空时整体替换现有映射。
+  repeated PublishedPort published_ports = 8;
+  // 追加到现有挂载的 bind mount。
+  repeated Volume volumes = 9;
+  // 按键合并的容器环境变量。
+  map<string, string> environment = 10;
+  // 可选的新网络模式。
+  optional NetworkMode network_mode = 11;
+  // external 网络模式使用的 Docker 网络名。
+  optional string external_network = 12;
+  // 应用于全部保留路由的新中间件列表。
+  repeated Middleware middlewares = 13;
+  // 按键替换的自定义 Docker 标签。
+  repeated string labels = 14;
+  // 新健康检查；提供时替换现有健康检查。
+  optional Healthcheck healthcheck = 15;
+  // 是否移除现有健康检查。
+  bool remove_healthcheck = 16;
+  // 修改成功后是否启动目标服务。
+  bool start = 17;
+}
+
+// 项目列表请求不需要参数。
+message ListRequest {}
+
+// 一个受管项目的状态快照。
+message Stack {
+  // 项目名。
+  string name = 1;
+  // Compose 服务名列表。
+  repeated string services = 2;
+  // 当前规范化 Compose YAML。
+  string compose_yaml = 3;
+  // 当前 .env 键值。
+  map<string, string> environment = 4;
+  // docker compose ps 返回的状态 JSON 或错误说明。
+  string status = 5;
+}
+
+// 项目列表响应。
+message ListResponse {
+  // 按项目名排序的状态快照。
+  repeated Stack stacks = 1;
+}
+
+// 单项目查询请求。
+message GetRequest {
+  // 项目名。
+  string name = 1;
+}
+
+// 项目删除请求。
+message RemoveRequest {
+  // 项目名。
+  string name = 1;
+  // 客户端已经取得用户确认。
+  bool force = 2;
+}
+
+// 通用项目生命周期请求。
+message ActionRequest {
+  // 项目名。
+  string name = 1;
+}
+
+// Docker 镜像拉取进度事件。
+message PullProgress {
+  // Docker 进度节点标识。
+  string id = 1;
+  // 节点状态。
+  string status = 2;
+  // 人类可读的进度说明。
+  string text = 3;
+  // 已处理字节数；未知时为 0。
+  uint64 current = 4;
+  // 总字节数；未知时为 0。
+  uint64 total = 5;
+}
+
+// 项目日志请求。
+message LogsRequest {
+  // 项目名。
+  string name = 1;
+  // 返回的历史日志行数上限。
+  uint32 tail = 2;
+  // 是否持续跟随新增日志。
+  bool follow = 3;
+}
+
+// 一行 Compose 日志。
+message LogLine {
+  // 不含终止换行符的日志文本。
+  string line = 1;
+}
+
+// 成功的修改类操作结果。
+message OperationResponse {
+  // 可直接显示给操作者的结果说明。
+  string message = 1;
+}
+
+// 发布端口使用的传输协议。
 enum PortProtocol {
-  // 未指定时使用 TCP。
+  // 未指定时按 TCP 处理。
   PORT_PROTOCOL_UNSPECIFIED = 0;
-  // TCP 协议。
+  // TCP。
   PORT_PROTOCOL_TCP = 1;
-  // UDP 协议。
+  // UDP。
   PORT_PROTOCOL_UDP = 2;
 }
 
-// 可供普通应用引用的 Traefik 中间件。
-enum ApplicationMiddleware {
+// Traefik 访问容器后端时使用的协议。
+enum RouteProtocol {
+  // 未指定时按 HTTP 处理。
+  ROUTE_PROTOCOL_UNSPECIFIED = 0;
+  // HTTP/1.1 或自动协商的普通 HTTP。
+  ROUTE_PROTOCOL_HTTP = 1;
+  // TLS 加密的 HTTPS。
+  ROUTE_PROTOCOL_HTTPS = 2;
+  // 明文 HTTP/2。
+  ROUTE_PROTOCOL_H2C = 3;
+}
+
+// 服务的网络模式。
+enum NetworkMode {
+  // 未指定，不修改当前网络模式。
+  NETWORK_MODE_UNSPECIFIED = 0;
+  // Compose bridge 网络。
+  NETWORK_MODE_BRIDGE = 1;
+  // 宿主机网络。
+  NETWORK_MODE_HOST = 2;
+  // 指定的外部 Docker 网络。
+  NETWORK_MODE_EXTERNAL = 3;
+}
+
+// nsetup 内置并由 Traefik 模板提供的中间件。
+enum Middleware {
   // 未指定中间件。
-  APPLICATION_MIDDLEWARE_UNSPECIFIED = 0;
-  // `GZip` 响应压缩。
-  APPLICATION_MIDDLEWARE_GZIP = 1;
-  // 注入 HTTPS 转发请求头。
-  APPLICATION_MIDDLEWARE_FORWARDED_HEADERS = 2;
-  // 仅允许内网地址访问。
-  APPLICATION_MIDDLEWARE_INTERNAL_ONLY = 3;
+  MIDDLEWARE_UNSPECIFIED = 0;
+  // 响应压缩。
+  MIDDLEWARE_GZIP = 1;
+  // 注入受信任的转发请求头。
+  MIDDLEWARE_FORWARDED_HEADERS = 2;
+  // 仅允许内网来源地址。
+  MIDDLEWARE_INTERNAL_ONLY = 3;
+  // TLS 安全响应头。
+  MIDDLEWARE_TLS = 4;
 }

@@ -1,23 +1,42 @@
-//! 全局文件名与系统路径常量。
+//! CLI 与 daemon 两种角色共享的文件系统和协议常量。
 
-// ── 文件名 ──
-/// Docker Compose 文件名
-pub const COMPOSE_FILE: &str = "compose.yaml";
-/// 环境变量文件名
-pub const ENV_FILE: &str = ".env";
+use std::path::PathBuf;
 
-/// daemon 为原生简化应用保存的配置文件名。
-pub const APP_CONFIG_FILE: &str = "nsetup.toml";
-// ── nsetup 系统路径 ──
-/// 系统配置目录
-pub const SYSTEM_CONFIG_DIR: &str = "/etc/nsetup";
-/// 系统持久状态目录
-pub const SYSTEM_STATE_DIR: &str = "/var/lib/nsetup";
-/// 本机 gRPC Unix domain socket
-pub const GRPC_SOCKET: &str = "/run/nsetup/nsetup.sock";
-/// Compose 项目目录名
-pub const STACKS_DIR: &str = "stacks";
-/// 全局配置文件名
+/// 系统配置目录。
+pub const CONFIG_DIR: &str = "/etc/nsetup";
+/// daemon 主配置文件名。
 pub const CONFIG_FILE: &str = "config.toml";
-/// gRPC 认证令牌文件名
+/// TCP 认证令牌文件名。
 pub const AUTH_TOKEN_FILE: &str = "auth.token";
+/// 默认本机 gRPC socket。
+pub const GRPC_SOCKET: &str = "/run/nsetup/nsetup.sock";
+/// 二进制安装路径。
+pub const BINARY_PATH: &str = "/usr/local/bin/nsetup";
+/// systemd unit 安装路径。
+pub const UNIT_PATH: &str = "/etc/systemd/system/nsetup.service";
+/// Compose 状态文件名。
+pub const COMPOSE_FILE: &str = "compose.yaml";
+/// Compose 环境变量文件名。
+pub const ENV_FILE: &str = ".env";
+/// 管理员 Unix 用户组。
+pub const ADMIN_GROUP: &str = "nihility";
+/// 声明式配置允许的最大字节数。
+pub const MAX_CONFIG_SIZE: usize = 1024 * 1024;
+/// RPC 消息允许的最大字节数。
+pub const MAX_RPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+/// Traefik 发现的服务共用的 Docker 网络。
+pub const PROXY_NETWORK: &str = "nsetup-proxy";
+
+/// 返回当前配置文件路径。
+#[must_use]
+pub fn config_path() -> PathBuf {
+    std::env::var_os("NSETUP_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(CONFIG_DIR).join(CONFIG_FILE))
+}
+
+/// 返回系统认证令牌路径。
+#[must_use]
+pub fn auth_token_path() -> PathBuf {
+    PathBuf::from(CONFIG_DIR).join(AUTH_TOKEN_FILE)
+}

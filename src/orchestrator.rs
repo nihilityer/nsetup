@@ -1,461 +1,896 @@
-//! Compose 项目的持久化与编排逻辑。
-
-mod container;
-mod deploy;
-mod edit;
-mod types;
-
-pub use deploy::{deploy_generated_stack, ensure_no_conflicts};
-pub use edit::{ApplicationEdit, add_service, update_application};
-pub use types::{
-    ContainerHealth, ContainerInfo, ContainerState, InvalidInput, StackAction, StackInfo,
-    StackNotFound,
-};
+//! 项目编排、校验、编辑与单一部署收口。
 
 use crate::config::{Config, set_mode};
-use crate::constants::{APP_CONFIG_FILE, COMPOSE_FILE, ENV_FILE};
-use crate::services::docker;
+use crate::constants::{COMPOSE_FILE, ENV_FILE, PROXY_NETWORK};
+use crate::docker::{self, PullProgress};
+use crate::spec::{
+    BindMount, Document, Healthcheck, Network, PublishedPort, Route, Service, StackSpec,
+    validate_name,
+};
+use crate::template::{self, GeneratedFile, TemplateKind};
 use anyhow::Context;
-use container::parse_container_status;
-use serde_yaml::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-/// 列出所有由守护进程管理的 Compose 项目
-pub fn list_stacks(config: &Config) -> anyhow::Result<Vec<StackInfo>> {
-    ensure_stacks_root(config)?;
-    let mut names = Vec::new();
-    for entry in fs::read_dir(&config.paths.apps_root).with_context(|| {
-        format!(
-            "无法读取 Compose 项目目录: {}",
-            config.paths.apps_root.display()
-        )
-    })? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if !file_type.is_dir() || file_type.is_symlink() {
-            continue;
-        }
-        let path = entry.path();
-        if !path.join(COMPOSE_FILE).is_file() || !path.join(ENV_FILE).is_file() {
-            continue;
-        }
-        if let Some(name) = entry.file_name().to_str()
-            && validate_stack_name(name).is_ok()
-        {
-            names.push(name.to_string());
-        }
-    }
-    names.sort();
-    names.iter().map(|name| get_stack(config, name)).collect()
+/// daemon 侧有状态项目管理器。
+#[derive(Debug, Clone)]
+pub struct Orchestrator {
+    /// 已校验的 daemon 配置。
+    config: Config,
 }
 
-/// 读取单个 Compose 项目的信息
-pub fn get_stack(config: &Config, name: &str) -> anyhow::Result<StackInfo> {
-    let project_directory = stack_dir(config, name)?;
-    ensure_regular_stack_dir(&project_directory)?;
-    let compose_file = project_directory.join(COMPOSE_FILE);
-    let env_file = project_directory.join(ENV_FILE);
-    if !compose_file.is_file() || !env_file.is_file() {
-        return Err(StackNotFound(format!("项目 {name} 缺少 {COMPOSE_FILE} 或 {ENV_FILE}")).into());
-    }
-
-    let containers = docker::compose_ps_json(&project_directory)
-        .map(|output| parse_container_status(&output))
-        .unwrap_or_default();
-    Ok(StackInfo {
-        name: name.to_string(),
-        project_directory,
-        compose_file,
-        env_file,
-        containers,
-    })
+/// 随应用请求上传的附属文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asset {
+    /// 站点相对路径。
+    pub path: PathBuf,
+    /// 文件原始字节。
+    pub content: Vec<u8>,
 }
 
-/// 读取应用保存的 nsetup 原生简化配置。
-pub fn export_application_config(config: &Config, name: &str) -> anyhow::Result<String> {
-    let project_directory = stack_dir(config, name)?;
-    ensure_regular_stack_dir(&project_directory)?;
-    let path = project_directory.join(APP_CONFIG_FILE);
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            InvalidInput(format!(
-                "项目 {name} 不是由简化配置创建，或创建后已被其他命令修改"
-            ))
-            .into()
+/// 服务局部修改。
+#[derive(Debug, Clone, Default)]
+pub struct Edit {
+    /// 可选服务选择器。
+    pub service: Option<String>,
+    /// 可选的新镜像仓库。
+    pub image: Option<String>,
+    /// 可选的新镜像版本。
+    pub version: Option<String>,
+    /// 可选的完整命令替换。
+    pub command: Option<Vec<String>>,
+    /// 可选的默认目标端口，应用于现有路由。
+    pub container_port: Option<u16>,
+    /// 可选的完整路由替换。
+    pub routes: Option<Vec<Route>>,
+    /// 可选的完整发布端口替换。
+    pub published_ports: Option<Vec<PublishedPort>>,
+    /// 追加到服务的 bind mount。
+    pub volumes: Vec<BindMount>,
+    /// 按键合并的环境变量。
+    pub environment: BTreeMap<String, String>,
+    /// 可选网络修改。
+    pub network: Option<NetworkEdit>,
+    /// 可选的中间件替换，应用于全部保留路由。
+    pub middlewares: Option<Vec<String>>,
+    /// 按键替换的自定义 label。
+    pub labels: Vec<String>,
+    /// 可选的新健康检查。
+    pub healthcheck: Option<Healthcheck>,
+    /// 是否移除当前健康检查。
+    pub remove_healthcheck: bool,
+    /// 是否启动编辑后的服务。
+    pub start: bool,
+}
+
+/// `edit` 使用的网络修改。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkEdit {
+    /// Compose bridge 网络；存在路由时同时加入代理网络。
+    Bridge,
+    /// 宿主机网络。
+    Host,
+    /// 指定名称的外部网络。
+    External(String),
+}
+
+/// `list` 和 `get` 返回的项目信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackInfo {
+    /// 项目名。
+    pub name: String,
+    /// 服务名列表。
+    pub services: Vec<String>,
+    /// 规范化 Compose YAML。
+    pub compose_yaml: String,
+    /// 项目 `.env` 键值。
+    pub environment: BTreeMap<String, String>,
+    /// 尽力获取的 Docker Compose 状态 JSON。
+    pub status: String,
+}
+
+impl Orchestrator {
+    /// 使用已校验配置创建管理器。
+    ///
+    /// # 错误
+    ///
+    /// 配置不满足约束时返回错误。
+    pub fn new(config: Config) -> anyhow::Result<Self> {
+        config.validate()?;
+        Ok(Self { config })
+    }
+
+    /// 返回管理器配置。
+    #[must_use]
+    pub const fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// 解析 TOML、展开模板并通过唯一收口部署。
+    ///
+    /// # 错误
+    ///
+    /// 任一校验失败时返回错误，且不替换项目状态。
+    pub fn apply(
+        &self,
+        config_toml: &str,
+        assets: Vec<Asset>,
+        force: bool,
+        start: bool,
+    ) -> anyhow::Result<String> {
+        let mut generated = template::apply(config_toml, &self.config)?;
+        if !assets.is_empty() && generated.kind != TemplateKind::Static {
+            anyhow::bail!("--assets 仅能与 static 模板一起使用");
+        }
+        if generated.kind == TemplateKind::Static && assets.is_empty() {
+            let target = self.project_dir(&generated.spec.name)?;
+            if !target.join("site").is_dir() {
+                anyhow::bail!("static 模板首次部署必须提供 --assets");
+            }
+        }
+        for asset in assets {
+            generated.files.push(GeneratedFile {
+                path: PathBuf::from("site").join(asset.path),
+                content: asset.content,
+                mode: 0o640,
+                replace: true,
+            });
+        }
+        self.deploy(&generated.spec, &generated.files, force)?;
+        if start {
+            docker::compose_up(&self.config, &self.project_dir(&generated.spec.name)?, None)?;
+        }
+        Ok(format!("项目 {} 已应用", generated.spec.name))
+    }
+
+    /// 将 Compose 文档导入受支持的 IR 并替换项目。
+    ///
+    /// # 错误
+    ///
+    /// 遇到不支持字段或部署校验失败时返回错误。
+    pub fn import_compose(
+        &self,
+        name: &str,
+        compose_yaml: &str,
+        env_file: Option<&str>,
+        start: bool,
+    ) -> anyhow::Result<String> {
+        let directory = self.project_dir(name)?;
+        let preserved = if env_file.is_none() && directory.is_dir() {
+            fs::read_to_string(directory.join(ENV_FILE)).unwrap_or_default()
         } else {
-            anyhow::Error::from(error)
-        }
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(InvalidInput(format!("项目 {name} 的简化配置不是普通文件")).into());
-    }
-    fs::read_to_string(&path).with_context(|| format!("无法读取应用简化配置: {}", path.display()))
-}
-
-/// 创建或更新 Compose 项目，并可选择立即启动
-pub fn deploy_stack(
-    config: &Config,
-    name: &str,
-    compose_yaml: &str,
-    env_file: &str,
-    start: bool,
-) -> anyhow::Result<()> {
-    validate_stack_name(name)?;
-    validate_compose(compose_yaml)?;
-    if env_file.contains('\0') {
-        return Err(InvalidInput(String::from("环境变量文件不能包含空字符")).into());
-    }
-    ensure_stacks_root(config)?;
-
-    let project_directory = stack_dir(config, name)?;
-    let created = !project_directory.exists();
-    if created {
-        fs::create_dir(&project_directory)
-            .with_context(|| format!("无法创建项目目录: {}", project_directory.display()))?;
-    } else {
-        ensure_regular_stack_dir(&project_directory)?;
-    }
-    set_mode(&project_directory, 0o750)?;
-
-    let compose_path = project_directory.join(COMPOSE_FILE);
-    let env_path = project_directory.join(ENV_FILE);
-    let old_compose = fs::read(&compose_path).ok();
-    let old_env = fs::read(&env_path).ok();
-
-    write_atomic(&compose_path, compose_yaml.as_bytes(), 0o640)?;
-    write_atomic(&env_path, env_file.as_bytes(), 0o600)?;
-
-    let validation =
-        docker::compose_config(&project_directory).and_then(|resolved| validate_compose(&resolved));
-    if let Err(error) = validation {
-        restore_file(&compose_path, old_compose.as_deref(), 0o640)?;
-        restore_file(&env_path, old_env.as_deref(), 0o600)?;
-        if created {
-            fs::remove_dir(&project_directory).with_context(|| {
-                format!("无法清理无效项目目录: {}", project_directory.display())
-            })?;
-        }
-        return Err(InvalidInput(format!("Compose 配置验证失败，已恢复原文件: {error}")).into());
-    }
-    let app_config_path = project_directory.join(APP_CONFIG_FILE);
-    if app_config_path.exists() {
-        fs::remove_file(&app_config_path).with_context(|| {
-            format!("无法使旧的应用简化配置失效: {}", app_config_path.display())
-        })?;
-    }
-    if start {
-        docker::compose_up(&project_directory)?;
-    }
-    Ok(())
-}
-
-/// 修改已存在的 Compose 项目，并在未提供环境文件时保留原内容。
-pub fn update_stack(
-    config: &Config,
-    name: &str,
-    compose_yaml: &str,
-    env_file: Option<&str>,
-    start: bool,
-) -> anyhow::Result<()> {
-    let project_directory = stack_dir(config, name)?;
-    ensure_regular_stack_dir(&project_directory)?;
-    let current_env = match env_file {
-        Some(content) => content.to_string(),
-        None => fs::read_to_string(project_directory.join(ENV_FILE))
-            .with_context(|| format!("项目 {name} 缺少现有环境变量文件"))?,
-    };
-    deploy_stack(config, name, compose_yaml, &current_env, start)
-}
-
-/// 修改 Compose 服务的镜像版本，拉取新镜像并重新创建该服务。
-pub fn upgrade_application(
-    config: &Config,
-    name: &str,
-    service: Option<&str>,
-    version: &str,
-) -> anyhow::Result<(String, String)> {
-    if !valid_image_version(version) {
-        return Err(InvalidInput(String::from(
-            "镜像版本不能使用 latest，且必须以字母、数字或下划线开头，只能包含字母、数字、点、下划线和连字符，且不超过 128 个字符",
-        ))
-        .into());
-    }
-    let project_directory = stack_dir(config, name)?;
-    ensure_regular_stack_dir(&project_directory)?;
-    let compose_path = project_directory.join(COMPOSE_FILE);
-    let env_path = project_directory.join(ENV_FILE);
-    let compose = fs::read_to_string(&compose_path)
-        .with_context(|| format!("无法读取 Compose 文件: {}", compose_path.display()))?;
-    let env_file = fs::read_to_string(&env_path)
-        .with_context(|| format!("无法读取环境变量文件: {}", env_path.display()))?;
-    let (compose, selected_service, image) = update_compose_image(&compose, service, version)?;
-    deploy_stack(config, name, &compose, &env_file, false)?;
-    docker::compose_pull_service(&project_directory, &selected_service)?;
-    docker::compose_up_service(&project_directory, &selected_service)?;
-    Ok((selected_service, image))
-}
-
-/// 判断字符串是否是有效的 Docker 镜像标签。
-#[must_use]
-pub fn valid_image_version(version: &str) -> bool {
-    let mut bytes = version.bytes();
-    let Some(first) = bytes.next() else {
-        return false;
-    };
-    !version.eq_ignore_ascii_case("latest")
-        && version.len() <= 128
-        && (first.is_ascii_alphanumeric() || first == b'_')
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
-/// 在 Compose 文档中选择服务并替换镜像标签。
-fn update_compose_image(
-    content: &str,
-    requested_service: Option<&str>,
-    version: &str,
-) -> anyhow::Result<(String, String, String)> {
-    let mut document: Value = serde_yaml::from_str(content)
-        .map_err(|error| InvalidInput(format!("Compose YAML 格式错误: {error}")))?;
-    let services = document
-        .as_mapping_mut()
-        .and_then(|mapping| mapping.get_mut(Value::String(String::from("services"))))
-        .and_then(Value::as_mapping_mut)
-        .ok_or_else(|| InvalidInput(String::from("Compose YAML 必须包含 services 对象")))?;
-    let selected = match requested_service {
-        Some(service) => {
-            validate_service_name(service)?;
-            service.to_string()
-        }
-        None if services.len() == 1 => services
-            .keys()
-            .next()
-            .and_then(Value::as_str)
-            .ok_or_else(|| InvalidInput(String::from("Compose 服务名必须是字符串")))?
-            .to_string(),
-        None => {
-            return Err(InvalidInput(String::from(
-                "该应用包含多个服务，请使用 --service 指定要升级的 Compose 服务",
-            ))
-            .into());
-        }
-    };
-    let definition = services
-        .get_mut(Value::String(selected.clone()))
-        .and_then(Value::as_mapping_mut)
-        .ok_or_else(|| InvalidInput(format!("Compose 服务不存在: {selected}")))?;
-    let image_value = definition
-        .get_mut(Value::String(String::from("image")))
-        .ok_or_else(|| InvalidInput(format!("Compose 服务 {selected} 没有声明 image")))?;
-    let current = image_value
-        .as_str()
-        .ok_or_else(|| InvalidInput(format!("Compose 服务 {selected} 的 image 必须是字符串")))?;
-    let repository = image_repository(current)?;
-    let image = format!("{repository}:{version}");
-    *image_value = Value::String(image.clone());
-    let content = serde_yaml::to_string(&document).context("无法序列化更新后的 Compose 配置")?;
-    Ok((content, selected, image))
-}
-
-/// 校验 Compose 服务名是否可安全传给 Docker 命令。
-fn validate_service_name(service: &str) -> anyhow::Result<()> {
-    let valid = !service.is_empty()
-        && service.len() <= 128
-        && service
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
-    if !valid {
-        return Err(InvalidInput(String::from(
-            "Compose 服务名只能包含字母、数字、点、下划线和连字符，且不超过 128 个字符",
-        ))
-        .into());
-    }
-    Ok(())
-}
-
-/// 从完整镜像引用中去掉标签或摘要并保留仓库端口。
-fn image_repository(image: &str) -> anyhow::Result<&str> {
-    let image = image.trim();
-    if image.is_empty() || image.contains(['\n', '\r', '\0', '$']) {
-        return Err(InvalidInput(String::from(
-            "image 必须是明确的镜像引用，不能包含环境变量或控制字符",
-        ))
-        .into());
-    }
-    let without_digest = image
-        .split_once('@')
-        .map_or(image, |(repository, _)| repository);
-    let last_slash = without_digest.rfind('/');
-    let repository = match without_digest.rfind(':') {
-        Some(colon) if last_slash.is_none_or(|slash| colon > slash) => &without_digest[..colon],
-        _ => without_digest,
-    };
-    if repository.is_empty() {
-        return Err(InvalidInput(String::from("image 缺少镜像仓库名")).into());
-    }
-    Ok(repository)
-}
-
-/// 停止并删除 Compose 项目配置
-pub fn remove_stack(config: &Config, name: &str, remove_volumes: bool) -> anyhow::Result<()> {
-    let project_directory = stack_dir(config, name)?;
-    ensure_regular_stack_dir(&project_directory)?;
-    docker::compose_down(&project_directory, remove_volumes)?;
-    fs::remove_dir_all(&project_directory)
-        .with_context(|| format!("无法删除项目目录: {}", project_directory.display()))
-}
-
-/// 获取经过校验的 Compose 项目目录
-pub fn stack_dir(config: &Config, name: &str) -> anyhow::Result<PathBuf> {
-    validate_stack_name(name)?;
-    Ok(config.paths.apps_root.join(name))
-}
-
-/// 校验项目名，避免路径穿越并满足 Docker Compose 项目名规则
-pub fn validate_stack_name(name: &str) -> anyhow::Result<()> {
-    let valid_length = !name.is_empty() && name.len() <= 63;
-    let valid_start = name.as_bytes().first().is_some_and(u8::is_ascii_lowercase);
-    let valid_chars = name.bytes().all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
-    });
-    if !valid_length || !valid_start || !valid_chars {
-        return Err(InvalidInput(String::from(
-            "项目名必须以小写字母开头，只能包含小写字母、数字、-、_，且不超过 63 个字符",
-        ))
-        .into());
-    }
-    Ok(())
-}
-
-/// 确保 Compose 根目录存在且不是符号链接
-fn ensure_stacks_root(config: &Config) -> anyhow::Result<()> {
-    if config.paths.apps_root.exists() {
-        let metadata = fs::symlink_metadata(&config.paths.apps_root)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            anyhow::bail!(
-                "Compose 项目根路径必须是普通目录: {}",
-                config.paths.apps_root.display()
-            );
-        }
-    } else {
-        fs::create_dir_all(&config.paths.apps_root).with_context(|| {
-            format!(
-                "无法创建 Compose 项目目录: {}",
-                config.paths.apps_root.display()
-            )
-        })?;
-    }
-    set_mode(&config.paths.apps_root, 0o750)
-}
-
-/// 确保项目路径是普通目录而不是符号链接
-fn ensure_regular_stack_dir(path: &Path) -> anyhow::Result<()> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        StackNotFound(format!("Compose 项目不存在 {}: {error}", path.display()))
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        anyhow::bail!("Compose 项目路径不是普通目录: {}", path.display());
-    }
-    Ok(())
-}
-
-/// 对 Compose YAML 做基础结构校验
-fn validate_compose(content: &str) -> anyhow::Result<()> {
-    let value: Value = serde_yaml::from_str(content)
-        .map_err(|error| InvalidInput(format!("Compose YAML 格式错误: {error}")))?;
-    let mapping = value
-        .as_mapping()
-        .ok_or_else(|| InvalidInput(String::from("Compose YAML 顶层必须是对象")))?;
-    let services = mapping
-        .get(Value::String(String::from("services")))
-        .and_then(Value::as_mapping)
-        .ok_or_else(|| InvalidInput(String::from("Compose YAML 必须包含 services 对象")))?;
-    if services.is_empty() {
-        return Err(InvalidInput(String::from("Compose YAML 的 services 不能为空")).into());
-    }
-    validate_pinned_images(services)?;
-    Ok(())
-}
-
-/// 要求 Compose 中声明的每个镜像都使用明确的非 `latest` 标签或摘要。
-fn validate_pinned_images(services: &serde_yaml::Mapping) -> anyhow::Result<()> {
-    let image_key = Value::String(String::from("image"));
-    for (service_name, definition) in services {
-        let name = service_name
-            .as_str()
-            .ok_or_else(|| InvalidInput(String::from("Compose 服务名必须是字符串")))?;
-        let Some(image) = definition
-            .as_mapping()
-            .and_then(|mapping| mapping.get(&image_key))
-        else {
-            continue;
+            String::new()
         };
-        let image = image
-            .as_str()
-            .ok_or_else(|| InvalidInput(format!("Compose 服务 {name} 的 image 必须是字符串")))?;
-        if !is_pinned_image(image) {
-            return Err(InvalidInput(format!(
-                "Compose 服务 {name} 必须为 image 指定明确版本，且不能使用 latest: {image}"
-            ))
-            .into());
+        let spec = StackSpec::parse(name, compose_yaml, env_file.unwrap_or(&preserved))?;
+        self.deploy(&spec, &[], true)?;
+        if start {
+            docker::compose_up(&self.config, &directory, None)?;
+        }
+        Ok(format!("项目 {name} 已导入"))
+    }
+
+    /// 将当前项目状态导出为规范化 TOML。
+    ///
+    /// # 错误
+    ///
+    /// 当前 Compose 状态无法由模板表示时返回错误。
+    pub fn export(&self, name: &str) -> anyhow::Result<String> {
+        let spec = self.load(name)?;
+        template::export(&spec, &self.config)
+    }
+
+    /// 应用服务局部修改，并按需启动该服务。
+    ///
+    /// # 错误
+    ///
+    /// 修改无效时在替换状态前返回错误。
+    pub fn edit(&self, name: &str, edit: Edit) -> anyhow::Result<String> {
+        let mut spec = self.load(name)?;
+        let service_name = select_service(&spec.document, edit.service.as_deref())?;
+        let mut service = spec
+            .document
+            .services
+            .remove(&service_name)
+            .ok_or_else(|| anyhow::anyhow!("服务不存在: {service_name}"))?;
+        if edit.image.is_some() || edit.version.is_some() {
+            service.set_image_version(edit.image.as_deref(), edit.version.as_deref())?;
+        }
+        if let Some(command) = edit.command {
+            service.command = command;
+        }
+        let mut routes = if let Some(routes) = edit.routes {
+            routes
+        } else {
+            service.routes()?
+        };
+        if let Some(port) = edit.container_port {
+            if port == 0 {
+                anyhow::bail!("容器端口不能为 0");
+            }
+            for route in &mut routes {
+                route.container_port = port;
+            }
+        }
+        if let Some(middlewares) = edit.middlewares {
+            validate_middlewares(&middlewares)?;
+            for route in &mut routes {
+                route.middlewares.clone_from(&middlewares);
+            }
+        }
+        if let Some(ports) = edit.published_ports {
+            service.ports = ports.iter().map(PublishedPort::compose_value).collect();
+        }
+        service
+            .volumes
+            .extend(edit.volumes.iter().map(BindMount::compose_value));
+        service.environment.extend(edit.environment);
+        replace_labels(&mut service.labels, &edit.labels)?;
+        if edit.remove_healthcheck && edit.healthcheck.is_some() {
+            anyhow::bail!("不能同时设置和移除 healthcheck");
+        }
+        if edit.remove_healthcheck {
+            service.healthcheck = None;
+        } else if edit.healthcheck.is_some() {
+            service.healthcheck = edit.healthcheck;
+        }
+        if let Some(network) = edit.network {
+            apply_network(
+                &mut spec.document,
+                &service_name,
+                &mut service,
+                network,
+                !routes.is_empty(),
+            )?;
+        } else if service.network_mode.as_deref() == Some("host") && !routes.is_empty() {
+            anyhow::bail!("host 网络模式不能使用 Traefik 容器路由");
+        }
+        if !routes.is_empty() && !service.networks.iter().any(|name| name == "proxy") {
+            add_proxy_network(&mut spec.document);
+            service.networks.push(String::from("proxy"));
+        }
+        service.set_routes(name, &service_name, &routes)?;
+        spec.document.services.insert(service_name.clone(), service);
+        clean_unused_networks(&mut spec.document);
+        spec.validate()?;
+        self.deploy(&spec, &[], true)?;
+        if edit.start {
+            docker::compose_up(&self.config, &self.project_dir(name)?, Some(&service_name))?;
+        }
+        Ok(format!("项目 {name} 的服务 {service_name} 已更新"))
+    }
+
+    /// 列出全部有效的受管项目。
+    ///
+    /// # 错误
+    ///
+    /// 无法枚举项目存储目录时返回错误。
+    pub fn list(&self) -> anyhow::Result<Vec<StackInfo>> {
+        if !self.config.stacks_root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.config.stacks_root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && !entry.file_name().to_string_lossy().starts_with('.')
+                && entry.path().join(COMPOSE_FILE).is_file()
+            {
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        names.sort();
+        names.into_iter().map(|name| self.get(&name)).collect()
+    }
+
+    /// 获取单个受管项目及其当前容器状态。
+    ///
+    /// # 错误
+    ///
+    /// 项目状态缺失或无效时返回错误。
+    pub fn get(&self, name: &str) -> anyhow::Result<StackInfo> {
+        let spec = self.load(name)?;
+        let directory = self.project_dir(name)?;
+        let status = docker::compose_ps(&self.config, &directory)
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        Ok(StackInfo {
+            name: spec.name.clone(),
+            services: spec.document.services.keys().cloned().collect(),
+            compose_yaml: spec.compose_yaml()?,
+            environment: spec.environment,
+            status,
+        })
+    }
+
+    /// 启动项目。
+    ///
+    /// # 错误
+    ///
+    /// 项目检查或 Docker 操作失败时返回错误。
+    pub fn start(&self, name: &str) -> anyhow::Result<String> {
+        docker::compose_up(&self.config, &self.existing_project_dir(name)?, None)?;
+        Ok(format!("项目 {name} 已启动"))
+    }
+
+    /// 停止项目。
+    ///
+    /// # 错误
+    ///
+    /// 项目检查或 Docker 操作失败时返回错误。
+    pub fn stop(&self, name: &str) -> anyhow::Result<String> {
+        docker::compose_stop(&self.config, &self.existing_project_dir(name)?)?;
+        Ok(format!("项目 {name} 已停止"))
+    }
+
+    /// 重启项目。
+    ///
+    /// # 错误
+    ///
+    /// 项目检查或 Docker 操作失败时返回错误。
+    pub fn restart(&self, name: &str) -> anyhow::Result<String> {
+        docker::compose_restart(&self.config, &self.existing_project_dir(name)?)?;
+        Ok(format!("项目 {name} 已重启"))
+    }
+
+    /// 构建项目镜像。
+    ///
+    /// # 错误
+    ///
+    /// 项目检查或 Docker 操作失败时返回错误。
+    pub fn build(&self, name: &str) -> anyhow::Result<String> {
+        docker::compose_build(&self.config, &self.existing_project_dir(name)?)?;
+        Ok(format!("项目 {name} 构建完成"))
+    }
+
+    /// 拉取项目镜像并报告进度。
+    ///
+    /// # 错误
+    ///
+    /// 项目检查或 Docker 操作失败时返回错误。
+    pub fn pull(&self, name: &str, report: impl FnMut(PullProgress) -> bool) -> anyhow::Result<()> {
+        docker::compose_pull(&self.config, &self.existing_project_dir(name)?, report)
+    }
+
+    /// 流式返回项目日志行。
+    ///
+    /// # 错误
+    ///
+    /// 项目检查或 Docker 操作失败时返回错误。
+    pub fn logs(
+        &self,
+        name: &str,
+        tail: u32,
+        follow: bool,
+        report: impl FnMut(String) -> bool,
+    ) -> anyhow::Result<()> {
+        docker::compose_logs(
+            &self.config,
+            &self.existing_project_dir(name)?,
+            tail,
+            follow,
+            report,
+        )
+    }
+
+    /// 停止容器并仅删除受管项目目录。
+    ///
+    /// # 错误
+    ///
+    /// 操作未确认或无法安全完成时返回错误。
+    pub fn remove(&self, name: &str, confirmed: bool) -> anyhow::Result<String> {
+        if !confirmed {
+            anyhow::bail!("删除项目需要确认");
+        }
+        let directory = self.existing_project_dir(name)?;
+        docker::compose_down(&self.config, &directory)?;
+        let trash = sibling_temporary(&directory, "removed")?;
+        fs::rename(&directory, &trash)
+            .with_context(|| format!("无法移动待删除项目: {}", directory.display()))?;
+        fs::remove_dir_all(&trash)
+            .with_context(|| format!("无法删除项目目录: {}", trash.display()))?;
+        Ok(format!("项目 {name} 已删除；bind mount 数据未删除"))
+    }
+
+    /// 执行全部检查、暂存全部文件并原子提交一个项目。
+    fn deploy(&self, spec: &StackSpec, files: &[GeneratedFile], force: bool) -> anyhow::Result<()> {
+        spec.validate()?;
+        self.validate_mounts(spec)?;
+        self.ensure_no_conflicts(spec)?;
+        validate_generated_files(files)?;
+        fs::create_dir_all(&self.config.stacks_root).with_context(|| {
+            format!("无法创建项目根目录: {}", self.config.stacks_root.display())
+        })?;
+        set_mode(&self.config.stacks_root, 0o750)?;
+        let target = self.project_dir(&spec.name)?;
+        if target.exists() && !force {
+            anyhow::bail!("项目 {} 已存在；确认覆盖请使用 --force", spec.name);
+        }
+        let stage = sibling_temporary(&target, "stage")?;
+        if stage.exists() {
+            anyhow::bail!("临时项目目录已存在: {}", stage.display());
+        }
+        fs::create_dir(&stage)?;
+        set_mode(&stage, 0o750)?;
+        let result = (|| -> anyhow::Result<()> {
+            if target.is_dir() {
+                copy_auxiliary(&target, &stage)?;
+            }
+            if files.iter().any(|file| file.path.starts_with("site")) {
+                let staged_site = stage.join("site");
+                if staged_site.exists() {
+                    fs::remove_dir_all(&staged_site).with_context(|| {
+                        format!("无法替换静态站点目录: {}", staged_site.display())
+                    })?;
+                }
+            }
+            write_project_file(
+                &stage.join(COMPOSE_FILE),
+                spec.compose_yaml()?.as_bytes(),
+                0o640,
+            )?;
+            write_project_file(&stage.join(ENV_FILE), spec.env_file().as_bytes(), 0o600)?;
+            for file in files {
+                write_attachment(&stage, file)?;
+            }
+            let _validated = docker::compose_config(&self.config, &stage)?;
+            self.commit_stage(&stage, &target)?;
+            Ok(())
+        })();
+        if result.is_err() && stage.exists() {
+            fs::remove_dir_all(&stage)
+                .with_context(|| format!("部署失败后无法清理临时目录: {}", stage.display()))?;
+        }
+        result
+    }
+
+    /// 将已校验的暂存目录替换到目标位置，并支持失败回滚。
+    fn commit_stage(&self, stage: &Path, target: &Path) -> anyhow::Result<()> {
+        let backup = sibling_temporary(target, "backup")?;
+        let had_target = target.exists();
+        if had_target {
+            fs::rename(target, &backup)
+                .with_context(|| format!("无法备份当前项目: {}", target.display()))?;
+        }
+        if let Err(error) = fs::rename(stage, target) {
+            if had_target {
+                fs::rename(&backup, target).context("无法恢复项目备份")?;
+            }
+            return Err(error).context("无法原子替换项目目录");
+        }
+        if let Err(error) = docker::compose_config(&self.config, target) {
+            let failed = sibling_temporary(target, "failed")?;
+            fs::rename(target, &failed).context("无法隔离验证失败的项目")?;
+            if had_target {
+                fs::rename(&backup, target).context("无法恢复项目备份")?;
+            }
+            fs::remove_dir_all(&failed).context("无法清理验证失败的项目")?;
+            return Err(error).context("Compose 验证失败，已恢复原项目");
+        }
+        if had_target {
+            fs::remove_dir_all(&backup)
+                .with_context(|| format!("无法清理项目备份: {}", backup.display()))?;
+        }
+        Ok(())
+    }
+
+    /// 解析 bind mount 源路径并执行由配置推导的白名单。
+    fn validate_mounts(&self, spec: &StackSpec) -> anyhow::Result<()> {
+        let roots: Vec<PathBuf> = self
+            .config
+            .data_roots
+            .iter()
+            .chain(std::iter::once(&self.config.stacks_root))
+            .map(|path| resolve_existing_prefix(path))
+            .collect::<anyhow::Result<_>>()?;
+        let docker_socket = resolve_existing_prefix(&self.config.docker_socket)?;
+        for (service_name, service) in &spec.document.services {
+            for value in &service.volumes {
+                let mount = BindMount::parse(value)?;
+                let source = resolve_existing_prefix(Path::new(&mount.host_path))?;
+                let allowed =
+                    source == docker_socket || roots.iter().any(|root| source.starts_with(root));
+                if !allowed {
+                    anyhow::bail!(
+                        "服务 {service_name} 的 bind mount 不在白名单内: {}",
+                        mount.host_path
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 拒绝全部受管项目之间重复的路由主机名或宿主机端口。
+    fn ensure_no_conflicts(&self, requested: &StackSpec) -> anyhow::Result<()> {
+        let requested_hosts = unique_hosts(requested)?;
+        let requested_ports = unique_ports(requested)?;
+        if !self.config.stacks_root.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&self.config.stacks_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir()
+                || entry.file_name() == requested.name.as_str()
+                || entry.file_name().to_string_lossy().starts_with('.')
+                || !entry.path().join(COMPOSE_FILE).is_file()
+            {
+                continue;
+            }
+            let existing = StackSpec::load(&entry.path())
+                .with_context(|| format!("无法检查现有项目冲突: {}", entry.path().display()))?;
+            for host in unique_hosts(&existing)? {
+                if requested_hosts.contains(&host) {
+                    anyhow::bail!("域名 {host} 已被项目 {} 使用", existing.name);
+                }
+            }
+            for port in unique_ports(&existing)? {
+                if requested_ports.contains(&port) {
+                    anyhow::bail!(
+                        "宿主机端口 {}/{} 已被项目 {} 使用",
+                        port.0,
+                        port.1.as_str(),
+                        existing.name
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 加载单个项目当前由 Compose 支撑的状态。
+    fn load(&self, name: &str) -> anyhow::Result<StackSpec> {
+        StackSpec::load(&self.existing_project_dir(name)?)
+    }
+
+    /// 在 `stacks_root` 下解析已校验的项目名。
+    fn project_dir(&self, name: &str) -> anyhow::Result<PathBuf> {
+        validate_name("项目名", name)?;
+        Ok(self.config.stacks_root.join(name))
+    }
+
+    /// 解析项目目录并要求该目录存在。
+    fn existing_project_dir(&self, name: &str) -> anyhow::Result<PathBuf> {
+        let directory = self.project_dir(name)?;
+        if !directory.is_dir() {
+            anyhow::bail!("项目不存在: {name}");
+        }
+        Ok(directory)
+    }
+}
+
+/// 收集路由主机名并拒绝同一项目内的重复值。
+fn unique_hosts(spec: &StackSpec) -> anyhow::Result<BTreeSet<String>> {
+    let hosts = spec.route_hosts()?;
+    let output: BTreeSet<String> = hosts.iter().cloned().collect();
+    if output.len() != hosts.len() {
+        anyhow::bail!("项目 {} 重复声明 Traefik host", spec.name);
+    }
+    Ok(output)
+}
+
+/// 收集宿主机端口并拒绝同一项目内的重复值。
+fn unique_ports(spec: &StackSpec) -> anyhow::Result<BTreeSet<(u16, crate::spec::PortProtocol)>> {
+    let ports = spec.host_ports()?;
+    let output: BTreeSet<_> = ports
+        .iter()
+        .map(|port| (port.host_port, port.protocol))
+        .collect();
+    if output.len() != ports.len() {
+        anyhow::bail!("项目 {} 重复发布宿主机端口", spec.name);
+    }
+    Ok(output)
+}
+
+/// 选择明确指定的服务，或选择文档中的唯一服务。
+fn select_service(document: &Document, requested: Option<&str>) -> anyhow::Result<String> {
+    if let Some(name) = requested {
+        validate_name("服务名", name)?;
+        if !document.services.contains_key(name) {
+            anyhow::bail!("服务不存在: {name}");
+        }
+        return Ok(name.to_string());
+    }
+    if document.services.len() != 1 {
+        anyhow::bail!("多服务项目必须使用 --service 指定服务");
+    }
+    document
+        .services
+        .keys()
+        .next()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("项目没有服务"))
+}
+
+/// 按键替换自定义 label，同时保护生成的元数据。
+fn replace_labels(target: &mut Vec<String>, replacements: &[String]) -> anyhow::Result<()> {
+    let mut map = labels_to_map(target)?;
+    for label in replacements {
+        let (key, value) = label
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("label 必须是 KEY=VALUE: {label}"))?;
+        if key.starts_with("traefik.http.routers.nsetup-")
+            || key.starts_with("traefik.http.services.nsetup-")
+            || key == "io.nsetup.template"
+        {
+            anyhow::bail!("不能直接修改 nsetup 生成标签: {key}");
+        }
+        map.insert(key.to_string(), value.to_string());
+    }
+    *target = map
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    Ok(())
+}
+
+/// 将列表形式的 label 解析为确定顺序的键值映射。
+fn labels_to_map(values: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut output = BTreeMap::new();
+    for value in values {
+        let (key, content) = value
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("label 必须是 KEY=VALUE: {value}"))?;
+        output.insert(key.to_string(), content.to_string());
+    }
+    Ok(output)
+}
+
+/// 对暂时从文档移出的服务应用一次逻辑网络修改。
+fn apply_network(
+    document: &mut Document,
+    service_name: &str,
+    service: &mut Service,
+    network: NetworkEdit,
+    has_routes: bool,
+) -> anyhow::Result<()> {
+    service.network_mode = None;
+    service.networks.clear();
+    match network {
+        NetworkEdit::Bridge if has_routes => {
+            add_proxy_network(document);
+            service.networks.push(String::from("proxy"));
+        }
+        NetworkEdit::Bridge => {}
+        NetworkEdit::Host if has_routes => {
+            anyhow::bail!("host 网络模式不能使用 Traefik 容器路由");
+        }
+        NetworkEdit::Host => service.network_mode = Some(String::from("host")),
+        NetworkEdit::External(name) => {
+            let key = format!("external-{service_name}");
+            document.networks.insert(
+                key.clone(),
+                Network {
+                    external: true,
+                    name: Some(name),
+                },
+            );
+            service.networks.push(key);
+            if has_routes {
+                add_proxy_network(document);
+                service.networks.push(String::from("proxy"));
+            }
         }
     }
     Ok(())
 }
 
-/// 判断镜像引用是否包含非 `latest` 标签或不可变摘要。
-fn is_pinned_image(image: &str) -> bool {
-    let image = image.trim();
-    if image.contains('$') {
-        return true;
-    }
-    if let Some((repository, digest)) = image.split_once('@') {
-        return !repository.is_empty() && !digest.is_empty() && digest.contains(':');
-    }
-    let last_slash = image.rfind('/');
-    let Some(colon) = image.rfind(':') else {
-        return false;
-    };
-    if last_slash.is_some_and(|slash| colon < slash) {
-        return false;
-    }
-    let tag = &image[colon + 1..];
-    !tag.is_empty() && !tag.eq_ignore_ascii_case("latest")
+/// 确保共享外部代理网络定义存在。
+fn add_proxy_network(document: &mut Document) {
+    document.networks.insert(
+        String::from("proxy"),
+        Network {
+            external: true,
+            name: Some(String::from(PROXY_NETWORK)),
+        },
+    );
 }
 
-/// 原子写入文件并设置最终权限
-pub fn write_atomic(path: &Path, content: &[u8], mode: u32) -> anyhow::Result<()> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("无效文件路径: {}", path.display()))?;
-    let nonce = rand::random::<u64>();
-    let temporary = path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{nonce:016x}",
-        std::process::id()
-    ));
+/// 编辑后移除没有任何服务引用的顶层网络。
+fn clean_unused_networks(document: &mut Document) {
+    let used: BTreeSet<String> = document
+        .services
+        .values()
+        .flat_map(|service| service.networks.iter().cloned())
+        .collect();
+    document.networks.retain(|name, _| used.contains(name));
+}
+
+/// 根据内置 Traefik 注册表检查中间件名称。
+fn validate_middlewares(values: &[String]) -> anyhow::Result<()> {
+    for value in values {
+        if !matches!(
+            value.as_str(),
+            "gzip" | "forwarded-headers" | "internal-only" | "tls"
+        ) {
+            anyhow::bail!("未知内置 Traefik middleware: {value}");
+        }
+    }
+    Ok(())
+}
+
+/// 对可能不存在的路径，解析其最长现有前缀中的符号链接。
+fn resolve_existing_prefix(path: &Path) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("路径必须是绝对路径: {}", path.display());
+    }
+    let normalized = lexical_normalize(path)?;
+    let mut existing = normalized.as_path();
+    let mut suffix = Vec::new();
+    while !existing.exists() {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("无法解析路径: {}", path.display()))?;
+        suffix.push(name.to_os_string());
+        existing = existing
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("无法解析路径: {}", path.display()))?;
+    }
+    let mut resolved = existing
+        .canonicalize()
+        .with_context(|| format!("无法解析路径: {}", existing.display()))?;
+    for component in suffix.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+/// 移除当前目录和父目录分量，同时禁止越出根目录。
+fn lexical_normalize(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut output = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => output.push(Path::new("/")),
+            Component::Normal(value) => output.push(value),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !output.pop() {
+                    anyhow::bail!("路径越出根目录: {}", path.display());
+                }
+            }
+            Component::Prefix(_) => anyhow::bail!("不支持的平台路径: {}", path.display()),
+        }
+    }
+    Ok(output)
+}
+
+/// 校验全部生成的附属文件路径并拒绝重复项。
+fn validate_generated_files(files: &[GeneratedFile]) -> anyhow::Result<()> {
+    let mut paths = BTreeSet::new();
+    for file in files {
+        validate_relative_path(&file.path)?;
+        if !paths.insert(file.path.clone()) {
+            anyhow::bail!("附属文件路径重复: {}", file.path.display());
+        }
+    }
+    Ok(())
+}
+
+/// 要求路径为非空相对路径，且仅包含普通分量。
+fn validate_relative_path(path: &Path) -> anyhow::Result<()> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("附属文件路径不安全: {}", path.display());
+    }
+    Ok(())
+}
+
+/// 不跟随符号链接，将不属于 IR 的项目文件复制到暂存目录。
+fn copy_auxiliary(source: &Path, target: &Path) -> anyhow::Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        if entry.file_name() == COMPOSE_FILE || entry.file_name() == ENV_FILE {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let destination = target.join(entry.file_name());
+        if entry.file_type()?.is_symlink() {
+            anyhow::bail!("项目附属路径不能是符号链接: {}", entry.path().display());
+        }
+        if metadata.is_dir() {
+            fs::create_dir(&destination)?;
+            set_mode(&destination, 0o750)?;
+            copy_auxiliary(&entry.path(), &destination)?;
+        } else if metadata.is_file() {
+            fs::copy(entry.path(), &destination)?;
+            set_mode(&destination, metadata.permissions().mode() & 0o777)?;
+        } else {
+            anyhow::bail!("项目附属路径类型不受支持: {}", entry.path().display());
+        }
+    }
+    Ok(())
+}
+
+/// 将一个已校验的模板附属文件写入暂存目录。
+fn write_attachment(root: &Path, file: &GeneratedFile) -> anyhow::Result<()> {
+    validate_relative_path(&file.path)?;
+    let destination = root.join(&file.path);
+    if !file.replace && destination.is_file() {
+        return Ok(());
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("附属文件缺少父目录"))?;
+    create_safe_directories(root, parent)?;
+    if let Ok(metadata) = fs::symlink_metadata(&destination)
+        && (!metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        anyhow::bail!("拒绝覆盖非普通文件: {}", destination.display());
+    }
+    write_project_file(&destination, &file.content, file.mode)
+}
+
+/// 创建附属文件目录链，同时拒绝符号链接。
+fn create_safe_directories(root: &Path, destination: &Path) -> anyhow::Result<()> {
+    let relative = destination
+        .strip_prefix(root)
+        .map_err(|_| anyhow::anyhow!("附属文件越出项目目录"))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                anyhow::bail!("附属目录不安全: {}", current.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)?;
+                set_mode(&current, 0o750)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+/// 写入并同步暂存文件，然后应用明确权限。
+fn write_project_file(path: &Path, content: &[u8], mode: u32) -> anyhow::Result<()> {
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true).mode(mode);
+    options.create(true).truncate(true).write(true).mode(mode);
     let mut file = options
-        .open(&temporary)
-        .with_context(|| format!("无法创建临时文件: {}", temporary.display()))?;
-    set_mode(&temporary, mode)?;
+        .open(path)
+        .with_context(|| format!("无法写入文件: {}", path.display()))?;
     file.write_all(content)?;
     file.sync_all()?;
-    set_mode(&temporary, mode)?;
-    fs::rename(&temporary, path).with_context(|| format!("无法替换文件: {}", path.display()))?;
     set_mode(path, mode)
 }
 
-/// 在部署校验失败时恢复原文件
-fn restore_file(path: &Path, content: Option<&[u8]>, mode: u32) -> anyhow::Result<()> {
-    if let Some(content) = content {
-        write_atomic(path, content, mode)
-    } else if path.exists() {
-        fs::remove_file(path).with_context(|| format!("无法清理文件: {}", path.display()))
-    } else {
+/// 生成不易冲突的隐藏同级路径。
+fn sibling_temporary(target: &Path, kind: &str) -> anyhow::Result<PathBuf> {
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("目标项目路径无效: {}", target.display()))?;
+    Ok(target.with_file_name(format!(
+        ".{name}.{kind}-{}-{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    )))
+}
+
+use std::os::unix::fs::PermissionsExt;
+
+#[cfg(test)]
+mod tests {
+    use super::{lexical_normalize, validate_relative_path};
+    use std::path::Path;
+
+    #[test]
+    fn rejects_asset_traversal() {
+        assert!(validate_relative_path(Path::new("../secret")).is_err());
+        assert!(validate_relative_path(Path::new("site/index.html")).is_ok());
+    }
+
+    #[test]
+    fn normalizes_parent_components() -> anyhow::Result<()> {
+        assert_eq!(
+            lexical_normalize(Path::new("/srv/data/one/../two"))?,
+            Path::new("/srv/data/two")
+        );
         Ok(())
     }
 }
