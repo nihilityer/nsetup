@@ -3,9 +3,10 @@
 use super::args::{Cli, Command};
 use super::edit::edit_request;
 use super::io::{
-    compact_status, read_assets, read_limited, write_line, write_new_file, write_operation,
+    compact_status, read_assets, read_limited, write_diagnostic, write_line, write_new_file,
     write_text,
 };
+use super::progress::PullProgressRenderer;
 use crate::constants::MAX_CONFIG_SIZE;
 use crate::install::{InstallOptions, install};
 use crate::rpc::proto;
@@ -77,7 +78,7 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
                 .map(read_assets)
                 .transpose()?
                 .unwrap_or_default();
-            let response = client
+            let stream = client
                 .apply(proto::ApplyRequest {
                     config_toml,
                     assets,
@@ -85,7 +86,7 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
                     force: args.force,
                 })
                 .await?;
-            write_line(&response.message)?;
+            write_operation_stream(stream).await?;
         }
         Command::Import(args) => {
             let compose_yaml = read_limited(&args.file, MAX_CONFIG_SIZE)?;
@@ -94,7 +95,7 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
                 .as_deref()
                 .map(|path| read_limited(path, MAX_CONFIG_SIZE))
                 .transpose()?;
-            let response = client
+            let stream = client
                 .import_compose(proto::ImportComposeRequest {
                     name: args.name,
                     compose_yaml,
@@ -102,7 +103,7 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
                     start: args.start,
                 })
                 .await?;
-            write_line(&response.message)?;
+            write_operation_stream(stream).await?;
         }
         Command::Export(args) => {
             let response = client.export(args.name).await?;
@@ -113,8 +114,8 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
             }
         }
         Command::Edit(args) => {
-            let response = client.edit(edit_request(*args)?).await?;
-            write_line(&response.message)?;
+            let stream = client.edit(edit_request(*args)?).await?;
+            write_operation_stream(stream).await?;
         }
         Command::List => {
             let response = client.list().await?;
@@ -141,45 +142,91 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
                 stack.compose_yaml
             ))?;
         }
-        Command::Start(args) => write_operation(client.action(args.name, Action::Start).await?)?,
-        Command::Stop(args) => write_operation(client.action(args.name, Action::Stop).await?)?,
+        Command::Start(args) => {
+            run_action(client, args.name, Action::Start).await?;
+        }
+        Command::Stop(args) => {
+            run_action(client, args.name, Action::Stop).await?;
+        }
         Command::Restart(args) => {
-            write_operation(client.action(args.name, Action::Restart).await?)?;
+            run_action(client, args.name, Action::Restart).await?;
         }
-        Command::Build(args) => write_operation(client.action(args.name, Action::Build).await?)?,
-        Command::Pull(args) => {
-            let mut stream = client.pull(args.name).await?;
-            while let Some(progress) = stream.next().await.transpose()? {
-                write_line(&format!(
-                    "{}\t{}\t{}\t{}/{}",
-                    progress.id, progress.status, progress.text, progress.current, progress.total
-                ))?;
-            }
+        Command::Build(args) => {
+            run_action(client, args.name, Action::Build).await?;
         }
+        Command::Pull(args) => run_pull(client, args.name).await?,
         Command::Logs(args) => {
             let mut stream = client.logs(args.name, args.tail, args.follow).await?;
             while let Some(line) = stream.next().await.transpose()? {
                 write_line(&line.line)?;
             }
         }
-        Command::Remove(args) => {
-            let confirmed = args.force
-                || Confirm::new()
-                    .with_prompt(format!(
-                        "停止并删除项目 {}？bind mount 数据会保留",
-                        args.name
-                    ))
-                    .default(false)
-                    .interact()?;
-            if confirmed {
-                write_operation(client.remove(args.name).await?)?;
-            } else {
-                write_line("已取消")?;
-            }
-        }
+        Command::Remove(args) => run_remove(client, args.name, args.force).await?,
         Command::Init(_) | Command::Template(_) | Command::Daemon => {
             anyhow::bail!("本地命令被错误地发送到 daemon 分发器");
         }
+    }
+    Ok(())
+}
+
+/// 执行一个流式生命周期操作。
+async fn run_action(client: &mut RpcClient, name: String, action: Action) -> anyhow::Result<()> {
+    let stream = client.action(name, action).await?;
+    write_operation_stream(stream).await
+}
+
+/// 拉取镜像并选择适合当前 stdout 的进度渲染。
+async fn run_pull(client: &mut RpcClient, name: String) -> anyhow::Result<()> {
+    let mut stream = client.pull(name).await?;
+    let mut renderer = PullProgressRenderer::new();
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(progress) => renderer.render(&progress)?,
+            Err(error) => {
+                renderer.finish(false)?;
+                return Err(error.into());
+            }
+        }
+    }
+    renderer.finish(true)
+}
+
+/// 完成确认后流式删除项目。
+async fn run_remove(client: &mut RpcClient, name: String, force: bool) -> anyhow::Result<()> {
+    let confirmed = force
+        || Confirm::new()
+            .with_prompt(format!("停止并删除项目 {name}？bind mount 数据会保留"))
+            .default(false)
+            .interact()?;
+    if confirmed {
+        let stream = client.remove(name).await?;
+        write_operation_stream(stream).await
+    } else {
+        write_line("已取消")
+    }
+}
+
+/// 显示流式变更阶段，并仅把最终结果写入 stdout。
+async fn write_operation_stream(
+    mut stream: tonic::Streaming<proto::OperationProgress>,
+) -> anyhow::Result<()> {
+    let mut completed = false;
+    while let Some(progress) = stream.next().await.transpose()? {
+        match proto::OperationStage::try_from(progress.stage)? {
+            proto::OperationStage::Unspecified => {
+                anyhow::bail!("daemon 返回了未指定的操作阶段");
+            }
+            proto::OperationStage::Queued | proto::OperationStage::Running => {
+                write_diagnostic(&progress.message)?;
+            }
+            proto::OperationStage::Completed => {
+                write_line(&progress.message)?;
+                completed = true;
+            }
+        }
+    }
+    if !completed {
+        anyhow::bail!("daemon 未返回操作完成阶段");
     }
     Ok(())
 }

@@ -76,10 +76,16 @@ pub(super) fn export_traefik(spec: &StackSpec, config: &Config) -> anyhow::Resul
         .and_then(|route| route.hosts.first())
         .cloned()
         .unwrap_or_else(|| format!("traefik.{}", config.domain));
-    let domain = dashboard_host
-        .strip_prefix("traefik.")
-        .unwrap_or(&dashboard_host)
-        .to_string();
+    let domain = spec
+        .environment
+        .get(super::traefik::DOMAIN_KEY)
+        .cloned()
+        .unwrap_or_else(|| {
+            dashboard_host
+                .strip_prefix("traefik.")
+                .unwrap_or(&dashboard_host)
+                .to_string()
+        });
     let ports: Vec<PublishedPort> = service
         .ports
         .iter()

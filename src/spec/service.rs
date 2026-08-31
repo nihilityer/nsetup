@@ -151,8 +151,12 @@ impl Service {
                 rule.push_str(&format!(" && PathPrefix(`{path}`)"));
             }
             labels.insert(format!("{router}.rule"), rule);
-            labels.insert(format!("{router}.entrypoints"), String::from("websecure"));
+            labels.insert(format!("{router}.entrypoints"), String::from("https"));
             labels.insert(format!("{router}.tls"), String::from("true"));
+            labels.insert(
+                format!("{router}.tls.certresolver"),
+                String::from("cloudflare"),
+            );
             labels.insert(format!("{router}.service"), name.clone());
             if !route.middlewares.is_empty() {
                 labels.insert(

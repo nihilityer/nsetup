@@ -62,7 +62,7 @@ impl RpcClient {
     pub async fn apply(
         &mut self,
         request: proto::ApplyRequest,
-    ) -> anyhow::Result<proto::OperationResponse> {
+    ) -> anyhow::Result<tonic::Streaming<proto::OperationProgress>> {
         let request = self.request(request);
         Ok(self.inner.apply(request).await?.into_inner())
     }
@@ -75,7 +75,7 @@ impl RpcClient {
     pub async fn import_compose(
         &mut self,
         request: proto::ImportComposeRequest,
-    ) -> anyhow::Result<proto::OperationResponse> {
+    ) -> anyhow::Result<tonic::Streaming<proto::OperationProgress>> {
         let request = self.request(request);
         Ok(self.inner.import_compose(request).await?.into_inner())
     }
@@ -98,7 +98,7 @@ impl RpcClient {
     pub async fn edit(
         &mut self,
         edit: proto::EditRequest,
-    ) -> anyhow::Result<proto::OperationResponse> {
+    ) -> anyhow::Result<tonic::Streaming<proto::OperationProgress>> {
         let request = self.request(edit);
         Ok(self.inner.edit(request).await?.into_inner())
     }
@@ -128,12 +128,15 @@ impl RpcClient {
     /// # 错误
     ///
     /// RPC 或传输失败时返回错误。
-    pub async fn remove(&mut self, name: String) -> anyhow::Result<proto::OperationResponse> {
+    pub async fn remove(
+        &mut self,
+        name: String,
+    ) -> anyhow::Result<tonic::Streaming<proto::OperationProgress>> {
         let request = self.request(proto::RemoveRequest { name, force: true });
         Ok(self.inner.remove(request).await?.into_inner())
     }
 
-    /// 调用非流式生命周期 RPC。
+    /// 调用流式生命周期 RPC。
     ///
     /// # 错误
     ///
@@ -142,7 +145,7 @@ impl RpcClient {
         &mut self,
         name: String,
         action: Action,
-    ) -> anyhow::Result<proto::OperationResponse> {
+    ) -> anyhow::Result<tonic::Streaming<proto::OperationProgress>> {
         let request = self.request(proto::ActionRequest { name });
         let response = match action {
             Action::Start => self.inner.start(request).await?,

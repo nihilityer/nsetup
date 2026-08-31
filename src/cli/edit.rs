@@ -139,6 +139,7 @@ const fn protocol_value(value: ProtocolArg) -> i32 {
 /// 将 CLI 中间件选项转换为 protobuf 数值。
 const fn middleware_value(value: MiddlewareArg) -> i32 {
     match value {
+        MiddlewareArg::Authelia => proto::Middleware::Authelia as i32,
         MiddlewareArg::Gzip => proto::Middleware::Gzip as i32,
         MiddlewareArg::ForwardedHeaders => proto::Middleware::ForwardedHeaders as i32,
         MiddlewareArg::InternalOnly => proto::Middleware::InternalOnly as i32,

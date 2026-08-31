@@ -31,6 +31,7 @@ TOML 是唯一的声明式配置格式。先输出带注释的配置骨架：
 
 ```bash
 nsetup template app > app.toml
+nsetup template authelia > authelia.toml
 nsetup template traefik > traefik.toml
 nsetup template static > static.toml
 ```
@@ -67,16 +68,50 @@ nsetup up -f app.toml --start
 镜像必须拆分为 `image` 与明确的 `version`，省略版本或使用 `latest` 会被拒绝。
 短主机名会拼接全局主域名；例如 `media` 生成 `media.example.com`。
 
-Traefik 与静态站点使用相同入口：
+基础设施与静态站点使用相同入口。先部署 Traefik，再部署 Authelia：
 
 ```bash
-chmod 600 traefik.toml       # 文件中含 Cloudflare token
+chmod 600 traefik.toml authelia.toml
 nsetup up -f traefik.toml --start
+nsetup up -f authelia.toml --start
 nsetup up -f static.toml --assets ./dist --start
 ```
 
+### Authelia：基础认证设施
+
+Authelia 模板使用文件用户库、文件型密钥和 SQLite，运行状态持久化到第一个
+`data_root` 下的 `authelia/`。先交互生成密码哈希，再替换模板中的占位值：
+
+```bash
+docker run --rm --pull=never -it authelia/authelia:4.39.20 \
+  authelia crypto hash generate argon2
+openssl rand -hex 32   # 三个密钥分别运行一次
+```
+
+> **重点：登录用户名由 `[users.<用户名>]` 的表名决定。** 模板中的
+> `[users.admin]` 表示登录用户名是 `admin`；`display_name` 只是显示名称，`email`
+> 也不是默认登录别名。要改成 `nihilityer`，应把表名改为 `[users.nihilityer]`，
+> 不是只修改 `display_name`。
+
+修改用户名或密码哈希后重新应用并重启；文件用户库关闭了自动监视，当前模板也关闭
+网页改密与“忘记密码”流程：
+
+```bash
+nsetup up -f authelia.toml --force
+nsetup restart authelia
+```
+
+需要认证的应用只需在路由中加入 `authelia`；认证门户自身不会套用认证中间件：
+
+```toml
+[services.web.traefik]
+hosts = ["admin"]
+middlewares = ["authelia", "tls"]
+```
+
 整体更新已有项目需要 `--force`。静态站点再次上传 `--assets` 时会整体替换站点文件；
-Traefik 的 `acme.json` 会在更新时保留。
+Traefik 的 `acme.json` 与 Authelia 的 SQLite 状态会在更新时保留。导出的基础设施
+TOML 含密钥，`-o` 创建的文件权限为 `0600`。
 
 ## 导入、编辑与导出
 
@@ -107,6 +142,10 @@ nsetup logs media --follow
 nsetup rm media
 ```
 
+`pull` 在交互式终端中原地刷新单行进度条；重定向或管道中仍输出稳定的制表符分隔事件。
+`up`、`import`、`edit`、`start`、`stop`、`restart`、`build`、`rm` 会立即显示排队和
+执行阶段，最终结果仍单独写入 stdout。`logs --follow` 不占用变更锁，退出客户端后
+daemon 会终止对应的 Compose 日志进程。
 删除项目不会删除 bind mount 指向的数据。`rm --force` 仅跳过交互确认。
 
 ## 配置与安全

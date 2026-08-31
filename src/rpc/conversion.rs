@@ -4,16 +4,11 @@ use super::proto;
 use crate::orchestrator::{Edit, NetworkEdit, StackInfo};
 use crate::spec::{BindMount, Healthcheck, PortProtocol, PublishedPort, Route, RouteProtocol};
 use anyhow::Context;
-use tonic::{Response, Status};
+use tonic::Status;
 
 /// 将用户输入错误或操作错误转换为 RPC 状态。
 pub(super) fn status_from_error(error: &anyhow::Error) -> Status {
     Status::invalid_argument(format!("{error:#}"))
-}
-
-/// 将成功消息包装为 Tonic 响应。
-pub(super) fn operation_response(message: String) -> Response<proto::OperationResponse> {
-    Response::new(proto::OperationResponse { message })
 }
 
 /// 将管理器项目信息转换为线路表示。
@@ -171,6 +166,7 @@ fn middleware_names(values: &[i32]) -> anyhow::Result<Vec<String>> {
         .iter()
         .map(|value| match proto::Middleware::try_from(*value)? {
             proto::Middleware::Unspecified => anyhow::bail!("middleware 不能为 unspecified"),
+            proto::Middleware::Authelia => Ok(String::from("authelia")),
             proto::Middleware::Gzip => Ok(String::from("gzip")),
             proto::Middleware::ForwardedHeaders => Ok(String::from("forwarded-headers")),
             proto::Middleware::InternalOnly => Ok(String::from("internal-only")),

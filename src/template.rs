@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// Authelia 基础认证设施模板。
+mod authelia;
 /// TOML 声明到 IR 的模板生成。
 mod generate;
 /// IR 到 TOML 声明的模板反解。
@@ -16,10 +18,12 @@ mod skeleton;
 /// `template` 模块单元测试。
 #[cfg(test)]
 mod tests;
+/// Traefik 基础设施模板及 main 分支兼容默认值。
+mod traefik;
 
-use generate::{generate_app, generate_static, generate_traefik};
+use generate::{generate_app, generate_static};
 use reverse::{detect_kind, export_app, export_static, export_traefik};
-use skeleton::{APP_SKELETON, STATIC_SKELETON, TRAEFIK_SKELETON};
+use skeleton::{APP_SKELETON, AUTHELIA_SKELETON, STATIC_SKELETON, TRAEFIK_SKELETON};
 
 /// 当前面向用户的配置格式版本。
 pub const FORMAT_VERSION: u32 = 1;
@@ -53,6 +57,8 @@ pub struct TemplateOutput {
 pub enum TemplateKind {
     /// 通用容器应用。
     App,
+    /// Authelia 基础认证设施。
+    Authelia,
     /// Traefik 反向代理。
     Traefik,
     /// Nginx 静态站点。
@@ -68,9 +74,10 @@ impl TemplateKind {
     pub fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
             "app" => Ok(Self::App),
+            "authelia" => Ok(Self::Authelia),
             "traefik" => Ok(Self::Traefik),
             "static" => Ok(Self::Static),
-            _ => anyhow::bail!("未知模板 {value}；可用值: app, traefik, static"),
+            _ => anyhow::bail!("未知模板 {value}；可用值: app, authelia, traefik, static"),
         }
     }
 
@@ -79,6 +86,7 @@ impl TemplateKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::App => "app",
+            Self::Authelia => "authelia",
             Self::Traefik => "traefik",
             Self::Static => "static",
         }
@@ -322,7 +330,11 @@ pub fn apply(input: &str, config: &Config) -> anyhow::Result<TemplateOutput> {
     )?;
     match kind {
         TemplateKind::App => generate_app(toml::from_str(input)?, config),
-        TemplateKind::Traefik => generate_traefik(toml::from_str(input)?, config),
+        TemplateKind::Authelia => {
+            let input = toml::from_str(input)?;
+            authelia::generate(&input, config)
+        }
+        TemplateKind::Traefik => traefik::generate(toml::from_str(input)?, config),
         TemplateKind::Static => generate_static(toml::from_str(input)?, config),
     }
 }
@@ -336,6 +348,7 @@ pub fn export(spec: &StackSpec, config: &Config) -> anyhow::Result<String> {
     let kind = detect_kind(spec)?;
     let mut output = match kind {
         TemplateKind::App => toml::to_string_pretty(&export_app(spec)?)?,
+        TemplateKind::Authelia => toml::to_string_pretty(&authelia::export(spec)?)?,
         TemplateKind::Traefik => toml::to_string_pretty(&export_traefik(spec, config)?)?,
         TemplateKind::Static => toml::to_string_pretty(&export_static(spec)?)?,
     };
@@ -350,6 +363,7 @@ pub fn export(spec: &StackSpec, config: &Config) -> anyhow::Result<String> {
 pub const fn skeleton(kind: TemplateKind) -> &'static str {
     match kind {
         TemplateKind::App => APP_SKELETON,
+        TemplateKind::Authelia => AUTHELIA_SKELETON,
         TemplateKind::Traefik => TRAEFIK_SKELETON,
         TemplateKind::Static => STATIC_SKELETON,
     }

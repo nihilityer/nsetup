@@ -217,16 +217,21 @@ pub(super) fn parse_env_file(input: &str) -> anyhow::Result<BTreeMap<String, Str
     Ok(output)
 }
 
-/// 使用转义双引号，以确定顺序序列化项目变量。
+/// 以确定顺序序列化项目变量，并保护字面量 `$` 不被 Compose 插值。
 pub(super) fn serialize_env_file(environment: &BTreeMap<String, String>) -> String {
     let mut output = String::new();
     for (key, value) in environment {
-        let escaped = value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r");
-        output.push_str(&format!("{key}=\"{escaped}\"\n"));
+        if value.contains('$') && !value.contains(['\n', '\r']) {
+            let escaped = value.replace('\'', "\\'");
+            output.push_str(&format!("{key}='{escaped}'\n"));
+        } else {
+            let escaped = value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r");
+            output.push_str(&format!("{key}=\"{escaped}\"\n"));
+        }
     }
     output
 }
@@ -261,7 +266,17 @@ fn unquote_env(value: &str) -> anyhow::Result<String> {
         if !value.ends_with('\'') || value.len() < 2 {
             anyhow::bail!(".env 单引号未闭合");
         }
-        Ok(value[1..value.len() - 1].to_string())
+        let mut output = String::new();
+        let mut characters = value[1..value.len() - 1].chars().peekable();
+        while let Some(character) = characters.next() {
+            if character == '\\' && characters.peek() == Some(&'\'') {
+                let _quote = characters.next();
+                output.push('\'');
+            } else {
+                output.push(character);
+            }
+        }
+        Ok(output)
     } else {
         Ok(value.trim().to_string())
     }

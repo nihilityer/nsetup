@@ -138,7 +138,7 @@ pub struct InitArgs {
 /// `template` 接受的参数。
 #[derive(Debug, Args)]
 pub struct TemplateArgs {
-    /// 模板名称；可选值为 `app`、`traefik`、`static`，默认为 `app`。
+    /// 模板名称；可选值为 `app`、`authelia`、`traefik`、`static`，默认为 `app`。
     #[arg(default_value = "app", hide_default_value = true)]
     pub name: String,
 }
@@ -242,7 +242,7 @@ pub struct EditArgs {
     /// 应用于新路由的 URL 路径前缀。
     #[arg(long)]
     pub path_prefix: Option<String>,
-    /// 新路由中间件；可重复指定，支持 `gzip`、`forwarded-headers`、`internal-only`、`tls`。
+    /// 新路由中间件；可重复指定，支持 `authelia`、`gzip`、`forwarded-headers`、`internal-only`、`tls`。
     #[arg(long = "middleware", hide_possible_values = true)]
     pub middlewares: Vec<MiddlewareArg>,
     /// 新路由使用的后端协议；支持 `http`、`https`、`h2c`，默认为 `http`。
@@ -328,6 +328,8 @@ pub enum ProtocolArg {
 /// CLI 中间件选项。
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum MiddlewareArg {
+    /// 通过 Authelia `ForwardAuth` 执行统一认证。
+    Authelia,
     /// 响应压缩。
     Gzip,
     /// 转发请求头。

@@ -1,6 +1,6 @@
 //! gRPC 服务方法与阻塞编排操作调度。
 
-use super::conversion::{edit_from_proto, operation_response, stack_to_proto, status_from_error};
+use super::conversion::{edit_from_proto, stack_to_proto, status_from_error};
 use super::proto;
 use crate::config::Config;
 use crate::orchestrator::{Asset, Orchestrator};
@@ -36,23 +36,111 @@ impl RpcService {
         })
     }
 
-    /// 持有全局锁时执行一次阻塞式管理器操作。
-    async fn blocking<T, F>(&self, operation: F) -> Result<T, Status>
+    /// 不占用变更锁执行只读管理器操作。
+    async fn reading<T, F>(&self, operation: F) -> Result<T, Status>
     where
         T: Send + 'static,
         F: FnOnce(Arc<Orchestrator>) -> anyhow::Result<T> + Send + 'static,
     {
-        let _guard = self.lock.lock().await;
         let manager = Arc::clone(&self.manager);
         tokio::task::spawn_blocking(move || operation(manager))
             .await
-            .map_err(|error| Status::internal(format!("后台任务失败: {error}")))?
+            .map_err(|error| Status::internal(format!("后台查询失败: {error}")))?
             .map_err(|error| status_from_error(&error))
+    }
+
+    /// 创建依次报告排队、执行与完成阶段的变更操作流。
+    fn operation_stream<F>(
+        &self,
+        running: String,
+        operation: F,
+    ) -> RpcStream<proto::OperationProgress>
+    where
+        F: FnOnce(Arc<Orchestrator>) -> anyhow::Result<String> + Send + 'static,
+    {
+        let manager = Arc::clone(&self.manager);
+        let lock = Arc::clone(&self.lock);
+        let (sender, receiver) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let _guard = match lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    if send_operation_progress(
+                        &sender,
+                        proto::OperationStage::Queued,
+                        "等待其他变更操作完成",
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    lock.lock().await
+                }
+            };
+            if send_operation_progress(&sender, proto::OperationStage::Running, &running)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut task = tokio::task::spawn_blocking(move || operation(manager));
+            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+            heartbeat.tick().await;
+            let mut elapsed = 0_u64;
+            let result = loop {
+                tokio::select! {
+                    result = &mut task => break result,
+                    _ = heartbeat.tick() => {
+                        elapsed += 5;
+                        let message = format!("{running}（已执行 {elapsed} 秒）");
+                        let _send_result = send_operation_progress(
+                            &sender,
+                            proto::OperationStage::Running,
+                            &message,
+                        ).await;
+                    }
+                }
+            };
+            match result {
+                Ok(Ok(message)) => {
+                    let _send_result = send_operation_progress(
+                        &sender,
+                        proto::OperationStage::Completed,
+                        &message,
+                    )
+                    .await;
+                }
+                Ok(Err(error)) => {
+                    let _send_result = sender.send(Err(status_from_error(&error))).await;
+                }
+                Err(error) => {
+                    let _send_result = sender
+                        .send(Err(Status::internal(format!("后台任务失败: {error}"))))
+                        .await;
+                }
+            }
+        });
+        Box::pin(ReceiverStream::new(receiver))
     }
 }
 
 /// 拉取镜像与日志 RPC 使用的流类型。
 type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+/// 向仍连接的客户端发送一个修改操作阶段。
+async fn send_operation_progress(
+    sender: &mpsc::Sender<Result<proto::OperationProgress, Status>>,
+    stage: proto::OperationStage,
+    message: &str,
+) -> Result<(), mpsc::error::SendError<Result<proto::OperationProgress, Status>>> {
+    sender
+        .send(Ok(proto::OperationProgress {
+            stage: stage as i32,
+            message: message.to_string(),
+        }))
+        .await
+}
 
 #[tonic::async_trait]
 impl OrchestratorRpc for RpcService {
@@ -61,7 +149,7 @@ impl OrchestratorRpc for RpcService {
         _request: Request<proto::StatusRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let status = self
-            .blocking(|manager| {
+            .reading(|manager| {
                 let config = manager.config();
                 Ok(proto::StatusResponse {
                     version: env!("CARGO_PKG_VERSION").to_string(),
@@ -74,13 +162,16 @@ impl OrchestratorRpc for RpcService {
         Ok(Response::new(status))
     }
 
+    type ApplyStream = RpcStream<proto::OperationProgress>;
+
     async fn apply(
         &self,
         request: Request<proto::ApplyRequest>,
-    ) -> Result<Response<proto::OperationResponse>, Status> {
+    ) -> Result<Response<Self::ApplyStream>, Status> {
         let request = request.into_inner();
-        let result = self
-            .blocking(move |manager| {
+        Ok(Response::new(self.operation_stream(
+            String::from("正在校验并应用项目配置"),
+            move |manager| {
                 manager.apply(
                     &request.config_toml,
                     request
@@ -94,27 +185,28 @@ impl OrchestratorRpc for RpcService {
                     request.force,
                     request.start,
                 )
-            })
-            .await?;
-        Ok(operation_response(result))
+            },
+        )))
     }
+
+    type ImportComposeStream = RpcStream<proto::OperationProgress>;
 
     async fn import_compose(
         &self,
         request: Request<proto::ImportComposeRequest>,
-    ) -> Result<Response<proto::OperationResponse>, Status> {
+    ) -> Result<Response<Self::ImportComposeStream>, Status> {
         let request = request.into_inner();
-        let result = self
-            .blocking(move |manager| {
+        Ok(Response::new(self.operation_stream(
+            format!("正在导入项目 {}", request.name),
+            move |manager| {
                 manager.import_compose(
                     &request.name,
                     &request.compose_yaml,
                     request.env_file.as_deref(),
                     request.start,
                 )
-            })
-            .await?;
-        Ok(operation_response(result))
+            },
+        )))
     }
 
     async fn export(
@@ -122,28 +214,30 @@ impl OrchestratorRpc for RpcService {
         request: Request<proto::ExportRequest>,
     ) -> Result<Response<proto::ExportResponse>, Status> {
         let name = request.into_inner().name;
-        let config_toml = self.blocking(move |manager| manager.export(&name)).await?;
+        let config_toml = self.reading(move |manager| manager.export(&name)).await?;
         Ok(Response::new(proto::ExportResponse { config_toml }))
     }
+
+    type EditStream = RpcStream<proto::OperationProgress>;
 
     async fn edit(
         &self,
         request: Request<proto::EditRequest>,
-    ) -> Result<Response<proto::OperationResponse>, Status> {
+    ) -> Result<Response<Self::EditStream>, Status> {
         let request = request.into_inner();
         let name = request.name.clone();
         let edit = edit_from_proto(request).map_err(|error| status_from_error(&error))?;
-        let message = self
-            .blocking(move |manager| manager.edit(&name, edit))
-            .await?;
-        Ok(operation_response(message))
+        Ok(Response::new(self.operation_stream(
+            format!("正在修改项目 {name}"),
+            move |manager| manager.edit(&name, edit),
+        )))
     }
 
     async fn list(
         &self,
         _request: Request<proto::ListRequest>,
     ) -> Result<Response<proto::ListResponse>, Status> {
-        let stacks = self.blocking(move |manager| manager.list()).await?;
+        let stacks = self.reading(move |manager| manager.list()).await?;
         Ok(Response::new(proto::ListResponse {
             stacks: stacks.into_iter().map(stack_to_proto).collect(),
         }))
@@ -154,46 +248,60 @@ impl OrchestratorRpc for RpcService {
         request: Request<proto::GetRequest>,
     ) -> Result<Response<proto::Stack>, Status> {
         let name = request.into_inner().name;
-        let stack = self.blocking(move |manager| manager.get(&name)).await?;
+        let stack = self.reading(move |manager| manager.get(&name)).await?;
         Ok(Response::new(stack_to_proto(stack)))
     }
+
+    type RemoveStream = RpcStream<proto::OperationProgress>;
 
     async fn remove(
         &self,
         request: Request<proto::RemoveRequest>,
-    ) -> Result<Response<proto::OperationResponse>, Status> {
+    ) -> Result<Response<Self::RemoveStream>, Status> {
         let request = request.into_inner();
-        let message = self
-            .blocking(move |manager| manager.remove(&request.name, request.force))
-            .await?;
-        Ok(operation_response(message))
+        Ok(Response::new(self.operation_stream(
+            format!("正在删除项目 {}", request.name),
+            move |manager| manager.remove(&request.name, request.force),
+        )))
     }
+
+    type StartStream = RpcStream<proto::OperationProgress>;
 
     async fn start(
         &self,
         request: Request<proto::ActionRequest>,
-    ) -> Result<Response<proto::OperationResponse>, Status> {
+    ) -> Result<Response<Self::StartStream>, Status> {
         let name = request.into_inner().name;
-        let message = self.blocking(move |manager| manager.start(&name)).await?;
-        Ok(operation_response(message))
+        Ok(Response::new(self.operation_stream(
+            format!("正在启动项目 {name}"),
+            move |manager| manager.start(&name),
+        )))
     }
+
+    type StopStream = RpcStream<proto::OperationProgress>;
 
     async fn stop(
         &self,
         request: Request<proto::ActionRequest>,
-    ) -> Result<Response<proto::OperationResponse>, Status> {
+    ) -> Result<Response<Self::StopStream>, Status> {
         let name = request.into_inner().name;
-        let message = self.blocking(move |manager| manager.stop(&name)).await?;
-        Ok(operation_response(message))
+        Ok(Response::new(self.operation_stream(
+            format!("正在停止项目 {name}"),
+            move |manager| manager.stop(&name),
+        )))
     }
+
+    type RestartStream = RpcStream<proto::OperationProgress>;
 
     async fn restart(
         &self,
         request: Request<proto::ActionRequest>,
-    ) -> Result<Response<proto::OperationResponse>, Status> {
+    ) -> Result<Response<Self::RestartStream>, Status> {
         let name = request.into_inner().name;
-        let message = self.blocking(move |manager| manager.restart(&name)).await?;
-        Ok(operation_response(message))
+        Ok(Response::new(self.operation_stream(
+            format!("正在重启项目 {name}"),
+            move |manager| manager.restart(&name),
+        )))
     }
 
     type PullStream = RpcStream<proto::PullProgress>;
@@ -210,17 +318,22 @@ impl OrchestratorRpc for RpcService {
         tokio::spawn(async move {
             let _guard = lock.lock().await;
             let result = tokio::task::spawn_blocking(move || {
-                manager.pull(&name, |progress| {
-                    sender
-                        .blocking_send(Ok(proto::PullProgress {
-                            id: progress.id,
-                            status: progress.status,
-                            text: progress.text,
-                            current: progress.current,
-                            total: progress.total,
-                        }))
-                        .is_ok()
-                })
+                let connection = sender.clone();
+                manager.pull(
+                    &name,
+                    |progress| {
+                        sender
+                            .blocking_send(Ok(proto::PullProgress {
+                                id: progress.id,
+                                status: progress.status,
+                                text: progress.text,
+                                current: progress.current,
+                                total: progress.total,
+                            }))
+                            .is_ok()
+                    },
+                    || !connection.is_closed(),
+                )
             })
             .await;
             match result {
@@ -238,13 +351,17 @@ impl OrchestratorRpc for RpcService {
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
+    type BuildStream = RpcStream<proto::OperationProgress>;
+
     async fn build(
         &self,
         request: Request<proto::ActionRequest>,
-    ) -> Result<Response<proto::OperationResponse>, Status> {
+    ) -> Result<Response<Self::BuildStream>, Status> {
         let name = request.into_inner().name;
-        let message = self.blocking(move |manager| manager.build(&name)).await?;
-        Ok(operation_response(message))
+        Ok(Response::new(self.operation_stream(
+            format!("正在构建项目 {name}"),
+            move |manager| manager.build(&name),
+        )))
     }
 
     type LogsStream = RpcStream<proto::LogLine>;
@@ -255,15 +372,18 @@ impl OrchestratorRpc for RpcService {
     ) -> Result<Response<Self::LogsStream>, Status> {
         let request = request.into_inner();
         let manager = Arc::clone(&self.manager);
-        let lock = Arc::clone(&self.lock);
         let (sender, receiver) = mpsc::channel(128);
         let error_sender = sender.clone();
         tokio::spawn(async move {
-            let _guard = lock.lock().await;
             let result = tokio::task::spawn_blocking(move || {
-                manager.logs(&request.name, request.tail, request.follow, |line| {
-                    sender.blocking_send(Ok(proto::LogLine { line })).is_ok()
-                })
+                let connection = sender.clone();
+                manager.logs(
+                    &request.name,
+                    request.tail,
+                    request.follow,
+                    |line| sender.blocking_send(Ok(proto::LogLine { line })).is_ok(),
+                    || !connection.is_closed(),
+                )
             })
             .await;
             match result {

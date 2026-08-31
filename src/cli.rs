@@ -6,6 +6,8 @@ mod args;
 mod edit;
 /// CLI 文件与标准输出操作。
 mod io;
+/// 镜像拉取进度的终端与管道渲染。
+mod progress;
 /// 本地及远程命令执行。
 mod runner;
 

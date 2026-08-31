@@ -207,7 +207,7 @@ fn validate_middlewares(values: &[String]) -> anyhow::Result<()> {
     for value in values {
         if !matches!(
             value.as_str(),
-            "gzip" | "forwarded-headers" | "internal-only" | "tls"
+            "authelia" | "gzip" | "forwarded-headers" | "internal-only" | "tls"
         ) {
             anyhow::bail!("未知内置 Traefik middleware: {value}");
         }

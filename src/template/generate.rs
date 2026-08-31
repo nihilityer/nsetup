@@ -1,8 +1,8 @@
 //! 将各类 TOML 声明展开为统一 IR 与附属文件。
 
 use super::{
-    AppConfig, AppNetwork, AppServiceConfig, FORMAT_VERSION, GeneratedFile, HealthcheckConfig,
-    StaticConfig, TemplateKind, TemplateOutput, TraefikConfig,
+    AppConfig, AppNetwork, AppServiceConfig, FORMAT_VERSION, HealthcheckConfig, StaticConfig,
+    TemplateKind, TemplateOutput,
 };
 use crate::config::Config;
 use crate::constants::PROXY_NETWORK;
@@ -11,7 +11,6 @@ use crate::spec::{
     validate_version,
 };
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 /// 将应用文档转换为 Compose IR。
 pub(super) fn generate_app(input: AppConfig, config: &Config) -> anyhow::Result<TemplateOutput> {
@@ -91,108 +90,6 @@ pub(super) fn generate_app(input: AppConfig, config: &Config) -> anyhow::Result<
         spec,
         files: Vec::new(),
         kind: TemplateKind::App,
-    })
-}
-
-/// 将 Traefik 文档转换为 IR 及其所属配置文件。
-pub(super) fn generate_traefik(
-    input: TraefikConfig,
-    config: &Config,
-) -> anyhow::Result<TemplateOutput> {
-    ensure_format(input.format)?;
-    ensure_template(&input.template, TemplateKind::Traefik)?;
-    crate::config::validate_domain(&input.domain)?;
-    validate_version(&input.version)?;
-    validate_email(&input.acme_email)?;
-    if input.cloudflare_token.trim().is_empty() {
-        anyhow::bail!("cloudflare_token 不能为空");
-    }
-    let name = String::from("traefik");
-    let directory = config.stacks_root.join(&name);
-    let mut document = Document::default();
-    add_proxy_network(&mut document, false);
-    let mut service = Service {
-        image: String::from("traefik:${TRAEFIK_VERSION}"),
-        container_name: Some(String::from("traefik")),
-        command: vec![String::from("--configFile=/etc/traefik/traefik.yml")],
-        restart: Some(String::from("unless-stopped")),
-        networks: vec![String::from("proxy")],
-        ports: vec![
-            format!("{}:80/tcp", input.http_port),
-            format!("{}:443/tcp", input.https_port),
-            format!("{}:443/udp", input.https_port),
-        ],
-        volumes: vec![
-            format!("{}:/var/run/docker.sock:ro", config.docker_socket.display()),
-            format!(
-                "{}/config/traefik.yml:/etc/traefik/traefik.yml:ro",
-                directory.display()
-            ),
-            format!(
-                "{}/config/dynamic.yml:/etc/traefik/dynamic.yml:ro",
-                directory.display()
-            ),
-            format!("{}/config/acme.json:/acme.json", directory.display()),
-        ],
-        environment: BTreeMap::from([
-            (
-                String::from("CF_DNS_API_TOKEN"),
-                String::from("${CF_DNS_API_TOKEN}"),
-            ),
-            (String::from("ACME_EMAIL"), String::from("${ACME_EMAIL}")),
-        ]),
-        labels: vec![String::from("io.nsetup.template=traefik")],
-        ..Service::default()
-    };
-    service.set_routes(
-        &name,
-        "traefik",
-        &[Route {
-            hosts: vec![format!("traefik.{}", input.domain)],
-            path_prefix: None,
-            container_port: 8080,
-            middlewares: vec![String::from("internal-only")],
-            protocol: RouteProtocol::Http,
-            sticky_cookie: false,
-            pass_host_header: None,
-            priority: None,
-        }],
-    )?;
-    document.services.insert(String::from("traefik"), service);
-    let spec = StackSpec {
-        name,
-        document,
-        environment: BTreeMap::from([
-            (String::from("TRAEFIK_VERSION"), input.version),
-            (String::from("ACME_EMAIL"), input.acme_email.clone()),
-            (String::from("CF_DNS_API_TOKEN"), input.cloudflare_token),
-        ]),
-    };
-    spec.validate()?;
-    let files = vec![
-        GeneratedFile {
-            path: PathBuf::from("config/traefik.yml"),
-            content: traefik_static_config(&input.acme_email).into_bytes(),
-            mode: 0o640,
-            replace: true,
-        },
-        GeneratedFile {
-            path: PathBuf::from("config/dynamic.yml"),
-            content: traefik_dynamic_config(&input.domain).into_bytes(),
-            mode: 0o640,
-            replace: true,
-        },
-        GeneratedFile {
-            path: PathBuf::from("config/acme.json"),
-            content: b"{}\n".to_vec(),
-            mode: 0o600,
-            replace: false,
-        },
-    ];
-    Ok(TemplateOutput {
-        spec,
-        files,
-        kind: TemplateKind::Traefik,
     })
 }
 
@@ -368,7 +265,7 @@ fn validate_middlewares(values: &[String]) -> anyhow::Result<()> {
     for value in values {
         if !matches!(
             value.as_str(),
-            "gzip" | "forwarded-headers" | "internal-only" | "tls"
+            "authelia" | "gzip" | "forwarded-headers" | "internal-only" | "tls"
         ) {
             anyhow::bail!("未知内置 Traefik middleware: {value}");
         }
@@ -393,91 +290,4 @@ fn expand_host(value: &str, domain: &str) -> anyhow::Result<String> {
     };
     crate::config::validate_domain(&output)?;
     Ok(output)
-}
-
-/// 对 ACME 邮箱地址执行保守的结构校验。
-fn validate_email(value: &str) -> anyhow::Result<()> {
-    if value.len() > 254 || value.chars().any(char::is_whitespace) {
-        anyhow::bail!("ACME 邮箱无效: {value}");
-    }
-    let (local, domain) = value
-        .rsplit_once('@')
-        .ok_or_else(|| anyhow::anyhow!("ACME 邮箱无效: {value}"))?;
-    if local.is_empty()
-        || !local
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
-    {
-        anyhow::bail!("ACME 邮箱无效: {value}");
-    }
-    crate::config::validate_domain(domain)
-}
-
-/// 返回 Traefik 守护进程静态配置。
-fn traefik_static_config(acme_email: &str) -> String {
-    r#"api:
-  dashboard: true
-entryPoints:
-  web:
-    address: ":80"
-    http:
-      redirections:
-        entryPoint:
-          to: websecure
-          scheme: https
-  websecure:
-    address: ":443"
-    http3: {}
-providers:
-  docker:
-    exposedByDefault: false
-    network: nsetup-proxy
-  file:
-    filename: /etc/traefik/dynamic.yml
-certificatesResolvers:
-  cloudflare:
-    acme:
-      email: "__ACME_EMAIL__"
-      storage: /acme.json
-      dnsChallenge:
-        provider: cloudflare
-"#
-    .replace("__ACME_EMAIL__", acme_email)
-}
-
-/// 为域名渲染共享中间件与证书默认配置。
-fn traefik_dynamic_config(domain: &str) -> String {
-    r#"http:
-  middlewares:
-    gzip:
-      compress: {}
-    forwarded-headers:
-      headers:
-        customRequestHeaders:
-          X-Forwarded-Proto: https
-    internal-only:
-      ipAllowList:
-        sourceRange:
-          - 10.0.0.0/8
-          - 172.16.0.0/12
-          - 192.168.0.0/16
-          - fc00::/7
-    tls:
-      headers:
-        stsSeconds: 31536000
-        stsIncludeSubdomains: true
-tls:
-  options:
-    default:
-      minVersion: VersionTLS12
-  stores:
-    default:
-      defaultGeneratedCert:
-        resolver: cloudflare
-        domain:
-          main: "__DOMAIN__"
-          sans:
-            - "*.__DOMAIN__"
-"#
-    .replace("__DOMAIN__", domain)
 }

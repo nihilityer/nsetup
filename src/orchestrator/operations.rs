@@ -188,8 +188,18 @@ impl Orchestrator {
     /// # 错误
     ///
     /// 项目检查或 Docker 操作失败时返回错误。
-    pub fn pull(&self, name: &str, report: impl FnMut(PullProgress) -> bool) -> anyhow::Result<()> {
-        docker::compose_pull(&self.config, &self.existing_project_dir(name)?, report)
+    pub fn pull(
+        &self,
+        name: &str,
+        report: impl FnMut(PullProgress) -> bool,
+        connected: impl FnMut() -> bool,
+    ) -> anyhow::Result<()> {
+        docker::compose_pull(
+            &self.config,
+            &self.existing_project_dir(name)?,
+            report,
+            connected,
+        )
     }
 
     /// 流式返回项目日志行。
@@ -203,6 +213,7 @@ impl Orchestrator {
         tail: u32,
         follow: bool,
         report: impl FnMut(String) -> bool,
+        connected: impl FnMut() -> bool,
     ) -> anyhow::Result<()> {
         docker::compose_logs(
             &self.config,
@@ -210,6 +221,7 @@ impl Orchestrator {
             tail,
             follow,
             report,
+            connected,
         )
     }
 

@@ -78,7 +78,7 @@ fn read_assets_at(
     Ok(())
 }
 
-/// 写入导出文件且不覆盖现有路径。
+/// 以仅所有者可读写权限写入导出文件且不覆盖现有路径。
 ///
 /// # 错误
 ///
@@ -87,22 +87,12 @@ pub(super) fn write_new_file(path: &Path, content: &[u8]) -> anyhow::Result<()> 
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .mode(0o640)
+        .mode(0o600)
         .open(path)
         .with_context(|| format!("无法创建输出文件（不会覆盖已有文件）: {}", path.display()))?;
     file.write_all(content)?;
     file.sync_all()?;
     Ok(())
-}
-
-/// 写入一行操作响应。
-///
-/// # 错误
-///
-/// 标准输出写入失败时返回错误。
-pub(super) fn write_operation(response: proto::OperationResponse) -> anyhow::Result<()> {
-    let proto::OperationResponse { message } = response;
-    write_line(&message)
 }
 
 /// 不使用 lint 禁止的打印宏，将文本写入标准输出。
@@ -130,7 +120,37 @@ pub(super) fn write_line(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 将非最终操作进度写入标准错误，不污染稳定 stdout 结果。
+pub(super) fn write_diagnostic(value: &str) -> anyhow::Result<()> {
+    let mut stderr = io::stderr().lock();
+    stderr.write_all(value.as_bytes())?;
+    stderr.write_all(b"\n")?;
+    stderr.flush()?;
+    Ok(())
+}
+
 /// 为列表输出生成紧凑的单行状态。
 pub(super) fn compact_status(value: &str) -> String {
     value.lines().next().unwrap_or("未知").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_new_file;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// 含密钥的导出文件始终只允许所有者读写。
+    #[test]
+    fn export_file_uses_private_permissions() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "nsetup-export-test-{}-{:016x}.toml",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        write_new_file(&path, b"format = 1\n")?;
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        std::fs::remove_file(&path)?;
+        assert_eq!(mode, 0o600);
+        Ok(())
+    }
 }

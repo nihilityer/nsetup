@@ -6,6 +6,8 @@ use anyhow::Context;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::Duration;
 
 /// 单个结构化或文本形式的镜像拉取进度事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +37,12 @@ pub fn available(config: &Config) -> bool {
 /// # 错误
 ///
 /// 校验失败时返回 Docker 诊断信息。
-pub fn compose_config(config: &Config, directory: &Path) -> anyhow::Result<String> {
-    run_compose(config, directory, &["config"])
+pub fn compose_config(
+    config: &Config,
+    directory: &Path,
+    project_name: &str,
+) -> anyhow::Result<String> {
+    run_compose_for_project(config, directory, project_name, &["config"])
 }
 
 /// 以后台模式启动整个项目或单个服务。
@@ -59,7 +65,7 @@ pub fn compose_up(config: &Config, directory: &Path, service: Option<&str>) -> a
 ///
 /// Docker Compose 执行失败时返回错误。
 pub fn compose_stop(config: &Config, directory: &Path) -> anyhow::Result<()> {
-    let _output = run_compose(config, directory, &["stop"])?;
+    let _output = run_compose(config, directory, &["stop", "--timeout", "30"])?;
     Ok(())
 }
 
@@ -69,7 +75,7 @@ pub fn compose_stop(config: &Config, directory: &Path) -> anyhow::Result<()> {
 ///
 /// Docker Compose 执行失败时返回错误。
 pub fn compose_restart(config: &Config, directory: &Path) -> anyhow::Result<()> {
-    let _output = run_compose(config, directory, &["restart"])?;
+    let _output = run_compose(config, directory, &["restart", "--timeout", "30"])?;
     Ok(())
 }
 
@@ -79,7 +85,7 @@ pub fn compose_restart(config: &Config, directory: &Path) -> anyhow::Result<()> 
 ///
 /// Docker Compose 执行失败时返回错误。
 pub fn compose_down(config: &Config, directory: &Path) -> anyhow::Result<()> {
-    let _output = run_compose(config, directory, &["down"])?;
+    let _output = run_compose(config, directory, &["down", "--timeout", "30"])?;
     Ok(())
 }
 
@@ -113,6 +119,7 @@ pub fn compose_pull(
     config: &Config,
     directory: &Path,
     mut report: impl FnMut(PullProgress) -> bool,
+    mut connected: impl FnMut() -> bool,
 ) -> anyhow::Result<()> {
     let mut command = compose_command(config, directory)?;
     let mut child = command
@@ -149,14 +156,23 @@ pub fn compose_pull(
             }
         });
         drop(sender);
-        for line in receiver {
-            let line = line?;
-            if !report(parse_pull_progress(&line)) {
+        loop {
+            if !connected() {
                 stopped = true;
-                if child.try_wait()?.is_none() {
-                    child.kill().context("无法终止 docker compose pull")?;
-                }
+                terminate_child(&mut child, "镜像拉取")?;
                 break;
+            }
+            match receiver.recv_timeout(Duration::from_millis(200)) {
+                Ok(line) => {
+                    let line = line?;
+                    if !report(parse_pull_progress(&line)) {
+                        stopped = true;
+                        terminate_child(&mut child, "镜像拉取")?;
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         anyhow::Ok(())
@@ -184,6 +200,7 @@ pub fn compose_logs(
     tail: u32,
     follow: bool,
     mut report: impl FnMut(String) -> bool,
+    mut connected: impl FnMut() -> bool,
 ) -> anyhow::Result<()> {
     let tail = tail.clamp(1, 10_000).to_string();
     let mut command = compose_command(config, directory)?;
@@ -224,13 +241,22 @@ pub fn compose_logs(
             }
         });
         drop(sender);
-        for line in receiver {
-            if !report(line?) {
+        loop {
+            if !connected() {
                 stopped = true;
-                if child.try_wait()?.is_none() {
-                    child.kill().context("无法终止 docker compose logs")?;
-                }
+                terminate_child(&mut child, "日志跟随")?;
                 break;
+            }
+            match receiver.recv_timeout(Duration::from_millis(200)) {
+                Ok(line) => {
+                    if !report(line?) {
+                        stopped = true;
+                        terminate_child(&mut child, "日志跟随")?;
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         anyhow::Ok(())
@@ -240,6 +266,16 @@ pub fn compose_logs(
         return Ok(());
     }
     anyhow::bail!("docker compose logs 失败，退出码 {:?}", status.code());
+}
+
+/// 在客户端断开后终止仍在运行的 Compose 子进程。
+fn terminate_child(child: &mut std::process::Child, operation: &str) -> anyhow::Result<()> {
+    if child.try_wait()?.is_none() {
+        child
+            .kill()
+            .with_context(|| format!("无法终止已断开连接的{operation}进程"))?;
+    }
+    Ok(())
 }
 
 /// 创建固定使用已配置 socket 的 Docker 命令。
@@ -254,15 +290,24 @@ fn docker_command(config: &Config) -> Command {
 
 /// 为单个受管目录创建参数完整的 Compose 命令。
 fn compose_command(config: &Config, directory: &Path) -> anyhow::Result<Command> {
+    let project = directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("项目目录名无效: {}", directory.display()))?;
+    compose_command_for_project(config, directory, project)
+}
+
+/// 为暂存目录创建使用真实受管项目名的 Compose 命令。
+fn compose_command_for_project(
+    config: &Config,
+    directory: &Path,
+    project_name: &str,
+) -> anyhow::Result<Command> {
     let compose = directory.join(COMPOSE_FILE);
     let env = directory.join(ENV_FILE);
     if !compose.is_file() || !env.is_file() {
         anyhow::bail!("项目状态不完整: {}", directory.display());
     }
-    let project = directory
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| anyhow::anyhow!("项目目录名无效: {}", directory.display()))?;
     let mut command = docker_command(config);
     command
         .current_dir(directory)
@@ -274,13 +319,28 @@ fn compose_command(config: &Config, directory: &Path) -> anyhow::Result<Command>
         .arg("--file")
         .arg(compose)
         .arg("--project-name")
-        .arg(project);
+        .arg(project_name);
     Ok(command)
 }
 
 /// 执行 Compose 子命令并返回以有损 UTF-8 解码的标准输出。
 fn run_compose(config: &Config, directory: &Path, args: &[&str]) -> anyhow::Result<String> {
     let output = compose_command(config, directory)?
+        .args(args)
+        .output()
+        .with_context(|| format!("无法执行 Docker Compose: {}", directory.display()))?;
+    ensure_success(&output, &format!("docker compose {}", args.join(" ")))?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// 使用显式项目名执行暂存目录中的 Compose 子命令。
+fn run_compose_for_project(
+    config: &Config,
+    directory: &Path,
+    project_name: &str,
+    args: &[&str],
+) -> anyhow::Result<String> {
+    let output = compose_command_for_project(config, directory, project_name)?
         .args(args)
         .output()
         .with_context(|| format!("无法执行 Docker Compose: {}", directory.display()))?;
@@ -339,5 +399,45 @@ fn parse_pull_progress(line: &str) -> PullProgress {
             .get("total")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose_command_for_project;
+    use crate::config::Config;
+
+    /// 隐藏暂存目录必须使用真实项目名，不能把非法目录名交给 Compose。
+    #[test]
+    fn staged_compose_uses_managed_project_name() -> anyhow::Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            ".traefik.stage-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&directory)?;
+        std::fs::write(
+            directory.join(crate::constants::COMPOSE_FILE),
+            "services:\n  traefik:\n    image: traefik:v3.8.0\n",
+        )?;
+        std::fs::write(directory.join(crate::constants::ENV_FILE), "")?;
+
+        let result = (|| -> anyhow::Result<()> {
+            let command = compose_command_for_project(&Config::default(), &directory, "traefik")?;
+            let args: Vec<String> = command
+                .get_args()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            let index = args
+                .iter()
+                .position(|value| value == "--project-name")
+                .ok_or_else(|| anyhow::anyhow!("Compose 命令缺少 --project-name"))?;
+            assert_eq!(args.get(index + 1).map(String::as_str), Some("traefik"));
+            Ok(())
+        })();
+        let cleanup = std::fs::remove_dir_all(&directory);
+        result?;
+        cleanup?;
+        Ok(())
     }
 }

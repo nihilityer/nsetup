@@ -9,29 +9,29 @@ service Orchestrator {
   // 返回 daemon、Docker、项目目录与主域名状态。
   rpc Status(StatusRequest) returns (StatusResponse);
   // 从 nsetup TOML 声明生成或整体替换项目。
-  rpc Apply(ApplyRequest) returns (OperationResponse);
+  rpc Apply(ApplyRequest) returns (stream OperationProgress);
   // 导入受支持字段子集内的 Compose 项目。
-  rpc ImportCompose(ImportComposeRequest) returns (OperationResponse);
+  rpc ImportCompose(ImportComposeRequest) returns (stream OperationProgress);
   // 从当前 Compose 与环境文件反解可重建的 TOML。
   rpc Export(ExportRequest) returns (ExportResponse);
   // 对当前项目中的一个服务执行类型化局部修改。
-  rpc Edit(EditRequest) returns (OperationResponse);
+  rpc Edit(EditRequest) returns (stream OperationProgress);
   // 列出所有受管项目及其当前容器状态。
   rpc List(ListRequest) returns (ListResponse);
   // 返回一个受管项目及其当前容器状态。
   rpc Get(GetRequest) returns (Stack);
   // 停止容器并删除项目配置，但保留 bind mount 数据。
-  rpc Remove(RemoveRequest) returns (OperationResponse);
+  rpc Remove(RemoveRequest) returns (stream OperationProgress);
   // 启动一个项目。
-  rpc Start(ActionRequest) returns (OperationResponse);
+  rpc Start(ActionRequest) returns (stream OperationProgress);
   // 停止一个项目但保留容器和配置。
-  rpc Stop(ActionRequest) returns (OperationResponse);
+  rpc Stop(ActionRequest) returns (stream OperationProgress);
   // 重启一个项目。
-  rpc Restart(ActionRequest) returns (OperationResponse);
+  rpc Restart(ActionRequest) returns (stream OperationProgress);
   // 拉取项目镜像并流式返回进度。
   rpc Pull(ActionRequest) returns (stream PullProgress);
   // 构建项目中声明的镜像。
-  rpc Build(ActionRequest) returns (OperationResponse);
+  rpc Build(ActionRequest) returns (stream OperationProgress);
   // 返回项目日志，并可持续跟随新增日志。
   rpc Logs(LogsRequest) returns (stream LogLine);
 }
@@ -262,10 +262,24 @@ message LogLine {
   string line = 1;
 }
 
-// 成功的修改类操作结果。
-message OperationResponse {
-  // 可直接显示给操作者的结果说明。
-  string message = 1;
+// 修改类操作的阶段事件。
+message OperationProgress {
+  // 当前操作阶段。
+  OperationStage stage = 1;
+  // 可直接显示给操作者的阶段说明。
+  string message = 2;
+}
+
+// 修改类操作的执行阶段。
+enum OperationStage {
+  // 未指定阶段属于协议错误。
+  OPERATION_STAGE_UNSPECIFIED = 0;
+  // 请求已接受，正在等待串行变更锁。
+  OPERATION_STAGE_QUEUED = 1;
+  // 已取得变更锁，正在执行实际操作。
+  OPERATION_STAGE_RUNNING = 2;
+  // 操作成功完成，消息是稳定的最终结果。
+  OPERATION_STAGE_COMPLETED = 3;
 }
 
 // 发布端口使用的传输协议。
@@ -314,4 +328,6 @@ enum Middleware {
   MIDDLEWARE_INTERNAL_ONLY = 3;
   // TLS 安全响应头。
   MIDDLEWARE_TLS = 4;
+  // 通过 Authelia ForwardAuth 执行统一认证。
+  MIDDLEWARE_AUTHELIA = 5;
 }

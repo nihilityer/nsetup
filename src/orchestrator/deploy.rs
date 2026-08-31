@@ -62,8 +62,8 @@ impl Orchestrator {
             for file in files {
                 write_attachment(&stage, file)?;
             }
-            let _validated = docker::compose_config(&self.config, &stage)?;
-            self.commit_stage(&stage, &target)?;
+            let _validated = docker::compose_config(&self.config, &stage, &spec.name)?;
+            self.commit_stage(&stage, &target, &spec.name)?;
             Ok(())
         })();
         if result.is_err() && stage.exists() {
@@ -74,7 +74,7 @@ impl Orchestrator {
     }
 
     /// 将已校验的暂存目录替换到目标位置，并支持失败回滚。
-    fn commit_stage(&self, stage: &Path, target: &Path) -> anyhow::Result<()> {
+    fn commit_stage(&self, stage: &Path, target: &Path, project_name: &str) -> anyhow::Result<()> {
         let backup = sibling_temporary(target, "backup")?;
         let had_target = target.exists();
         if had_target {
@@ -87,7 +87,7 @@ impl Orchestrator {
             }
             return Err(error).context("无法原子替换项目目录");
         }
-        if let Err(error) = docker::compose_config(&self.config, target) {
+        if let Err(error) = docker::compose_config(&self.config, target, project_name) {
             let failed = sibling_temporary(target, "failed")?;
             fs::rename(target, &failed).context("无法隔离验证失败的项目")?;
             if had_target {
