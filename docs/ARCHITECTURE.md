@@ -313,14 +313,32 @@ bind mount 白名单 = `data_roots` ∪ `stacks_root` ∪ `docker_socket`（精�
 
 | 模块 | 职责 |
 | --- | --- |
-| `cli` | clap 命令定义与分发；客户端构建 TOML；全局 `--endpoint/--token-file` |
+| `cli` | CLI 稳定入口，重新导出参数模型和命令执行器 |
+| `cli/args` | clap 参数、子命令以及中文帮助模板 |
+| `cli/runner` | 本地命令和远程 RPC 命令分发 |
+| `cli/edit` | 编辑参数到类型化 protobuf 请求的转换 |
+| `cli/io` | 配置、静态资源、导出文件与 stdout 操作 |
 | `config` | 配置文件模型、加载、白名单推导 |
 | `install` | init：自安装与 systemd unit 管理 |
-| `spec` | IR：compose YAML 双向模型 + StackSpec（加载/再生成/语义视图） |
-| `template` | 模板注册表（app/traefik/static）+ TOML ↔ IR 双向转换 |
-| `orchestrator` | deploy 写盘收口（白名单/规范化/原子写/验证回滚）、编辑、冲突检测、生命周期 |
+| `spec` | IR 公共数据模型与稳定入口；具体职责拆入 `spec/project`、`spec/service`、`spec/value` |
+| `spec/project` | 项目级 compose YAML、`.env` 加载、校验与规范化序列化 |
+| `spec/service` | 服务镜像版本与 Traefik label 语义视图的双向转换 |
+| `spec/value` | 路由、端口、bind mount、健康检查、镜像与名称值对象校验 |
+| `template` | 模板公共 TOML 模型、注册表与稳定入口 |
+| `template/generate` | app/traefik/static TOML → IR，并生成模板附属文件 |
+| `template/reverse` | 当前 IR → 规范化 TOML，恢复模板参数与服务语义 |
+| `template/skeleton` | CLI 输出的带注释 TOML 配置骨架 |
+| `orchestrator` | 编排器及其请求、响应公共模型 |
+| `orchestrator/operations` | 应用、导入、查询和项目生命周期操作 |
+| `orchestrator/edit` | 服务局部编辑、标签合并和网络语义修改 |
+| `orchestrator/deploy` | deploy 写盘收口、冲突检查和受管目录解析 |
+| `orchestrator/storage` | 安全路径、附属文件复制、原子文件写入和回滚辅助 |
 | `docker` | `docker compose` 子进程封装（统一使用配置的 `docker_socket`） |
-| `rpc` | gRPC 服务端（全局互斥 + spawn_blocking）、客户端、UDS/TCP 传输；仅 `Edit` 需要类型转换 |
+| `rpc` | 生成协议模块及 RPC 稳定入口 |
+| `rpc/service` | gRPC 服务方法、全局互斥和阻塞编排调度 |
+| `rpc/client` | Unix socket 与认证 TCP 客户端 |
+| `rpc/transport` | UDS/TCP 监听、Bearer 认证和关闭信号 |
+| `rpc/conversion` | protobuf 线路表示与领域模型之间的转换和校验 |
 
 ## 设计约束
 
