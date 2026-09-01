@@ -3,6 +3,78 @@
 use super::{TemplateKind, apply, export};
 use crate::config::Config;
 
+/// 通用应用骨架本身可直接应用，且不会启用注释中的有副作用选项。
+#[test]
+fn app_skeleton_is_valid_with_optional_defaults_disabled() -> anyhow::Result<()> {
+    let generated = apply(super::skeleton::APP_SKELETON, &Config::default())?;
+    assert_eq!(generated.kind, TemplateKind::App);
+    let service = &generated.spec.document.services["web"];
+    assert!(service.container_name.is_none());
+    assert!(service.ports.is_empty());
+    assert!(service.volumes.is_empty());
+    assert!(service.environment.is_empty());
+    assert!(service.command.is_empty());
+    assert!(service.restart.is_none());
+    assert!(service.env_file.is_empty());
+    assert!(service.healthcheck.is_none());
+    assert!(service.logging.is_none());
+    let routes = service.routes("media", "web")?;
+    assert_eq!(routes.len(), 1);
+    assert!(routes[0].middlewares.is_empty());
+    assert!(!routes[0].sticky_cookie);
+    assert!(routes[0].pass_host_header.is_none());
+    assert!(routes[0].priority.is_none());
+    Ok(())
+}
+
+/// 骨架展示应用模型的全部字段和详细路由字段。
+#[test]
+fn app_skeleton_documents_all_fields() {
+    for example in [
+        "format = 1",
+        "# template = \"app\"",
+        "name = \"media\"",
+        "[services.web]",
+        "image = \"ghcr.io/example/media\"",
+        "version = \"1.0\"",
+        "# container_name = \"media\"",
+        "port = 8080",
+        "# publish =",
+        "# volumes =",
+        "# environment =",
+        "# command =",
+        "# restart =",
+        "# env_file =",
+        "# network =",
+        "# external_network =",
+        "# labels =",
+        "# [services.web.healthcheck]",
+        "# command = \"wget",
+        "# interval =",
+        "# timeout =",
+        "# start_period =",
+        "# retries =",
+        "# [services.web.logging]",
+        "# driver =",
+        "# options =",
+        "[services.web.traefik]",
+        "hosts = [\"media\"]",
+        "# path_prefix =",
+        "# middlewares =",
+        "# protocol =",
+        "# sticky_cookie =",
+        "# pass_host_header =",
+        "# priority =",
+        "# [services.web.traefik.routes.api]",
+        "# port = 9090",
+    ] {
+        assert!(
+            super::skeleton::APP_SKELETON.contains(example),
+            "应用骨架缺少字段示例: {example}"
+        );
+    }
+}
+
 #[test]
 fn app_template_round_trip() -> anyhow::Result<()> {
     let input = r#"
@@ -42,9 +114,71 @@ middlewares = ["authelia", "tls"]
     let generated = apply(input, &Config::default())?;
     let labels = &generated.spec.document.services["web"].labels;
     assert!(labels.iter().any(|label| {
-        label == "traefik.http.routers.nsetup-protected-web-1.middlewares=authelia@file,tls@file"
+        label
+            == "traefik.http.routers.nsetup-protected-web-default.middlewares=authelia@file,tls@file"
     }));
     Ok(())
+}
+
+/// 多个子路由按名称绑定域名和端口，生成标签与导出都不依赖声明顺序。
+#[test]
+fn named_routes_keep_host_port_mapping() -> anyhow::Result<()> {
+    let input = r#"
+format = 1
+name = "storage"
+[services.gateway]
+image = "example/storage"
+version = "1.2"
+
+[services.gateway.traefik.routes.api]
+hosts = ["s3"]
+port = 9000
+
+[services.gateway.traefik.routes.console]
+hosts = ["s3c"]
+port = 9001
+"#;
+    let config = Config::default();
+    let generated = apply(input, &config)?;
+    let service = &generated.spec.document.services["gateway"];
+    let routes = service.routes("storage", "gateway")?;
+    assert_eq!(routes[0].name, "api");
+    assert_eq!(routes[0].hosts, ["s3.example.com"]);
+    assert_eq!(routes[0].container_port, 9000);
+    assert_eq!(routes[1].name, "console");
+    assert_eq!(routes[1].hosts, ["s3c.example.com"]);
+    assert_eq!(routes[1].container_port, 9001);
+    assert!(service.labels.iter().any(|label| {
+        label == "traefik.http.services.nsetup-storage-gateway-api.loadbalancer.server.port=9000"
+    }));
+    assert!(service.labels.iter().any(|label| {
+        label
+            == "traefik.http.services.nsetup-storage-gateway-console.loadbalancer.server.port=9001"
+    }));
+
+    let exported = export(&generated.spec, &config)?;
+    assert!(exported.contains("[services.gateway.traefik.routes.api]"));
+    assert!(exported.contains("[services.gateway.traefik.routes.console]"));
+    assert!(!exported.contains("[[services.gateway.traefik.routes]]"));
+    assert_eq!(generated, apply(&exported, &config)?);
+    Ok(())
+}
+
+/// 顺序数组路由已被具名映射替代，不再隐式生成数字身份。
+#[test]
+fn legacy_positional_routes_are_rejected() {
+    let input = r#"
+format = 1
+name = "storage"
+[services.gateway]
+image = "example/storage"
+version = "1.2"
+
+[[services.gateway.traefik.routes]]
+hosts = ["s3"]
+port = 9000
+"#;
+    assert!(apply(input, &Config::default()).is_err());
 }
 
 /// Authelia 的声明、Compose 状态、用户库和文件型密钥可稳定重建。

@@ -177,6 +177,7 @@ pub(super) fn generate(input: &AutheliaConfig, config: &Config) -> anyhow::Resul
         "authelia",
         "authelia",
         &[Route {
+            name: String::from("default"),
             hosts: vec![host],
             path_prefix: None,
             container_port: 9091,
@@ -232,7 +233,7 @@ pub(super) fn export(spec: &StackSpec) -> anyhow::Result<AutheliaConfig> {
         .get("authelia")
         .ok_or_else(|| anyhow::anyhow!("authelia 模板缺少服务 authelia"))?;
     let host = service
-        .routes()?
+        .routes(&spec.name, "authelia")?
         .into_iter()
         .next()
         .and_then(|route| route.hosts.into_iter().next())

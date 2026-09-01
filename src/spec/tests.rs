@@ -21,6 +21,7 @@ fn routes_round_trip_through_labels() -> anyhow::Result<()> {
         ..Service::default()
     };
     let expected = Route {
+        name: String::from("default"),
         hosts: vec![String::from("app.example.com")],
         path_prefix: Some(String::from("/api")),
         container_port: 8080,
@@ -32,15 +33,12 @@ fn routes_round_trip_through_labels() -> anyhow::Result<()> {
     };
     service.set_routes("demo", "web", std::slice::from_ref(&expected))?;
     assert!(service.labels.iter().any(|label| {
-        label == "traefik.http.routers.nsetup-demo-web-1.tls.certresolver=cloudflare"
+        label == "traefik.http.routers.nsetup-demo-web-default.tls.certresolver=cloudflare"
     }));
-    assert!(
-        service
-            .labels
-            .iter()
-            .any(|label| { label == "traefik.http.routers.nsetup-demo-web-1.entrypoints=https" })
-    );
-    assert_eq!(service.routes()?, vec![expected]);
+    assert!(service.labels.iter().any(|label| {
+        label == "traefik.http.routers.nsetup-demo-web-default.entrypoints=https"
+    }));
+    assert_eq!(service.routes("demo", "web")?, vec![expected]);
     let spec = StackSpec {
         name: String::from("demo"),
         document: Document {

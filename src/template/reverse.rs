@@ -15,7 +15,7 @@ pub(super) fn export_app(spec: &StackSpec) -> anyhow::Result<AppConfig> {
     let mut services = BTreeMap::new();
     for (name, source) in &spec.document.services {
         let (image, version) = source.image_version()?;
-        let routes = source.routes()?;
+        let routes = source.routes(&spec.name, name)?;
         let port = routes
             .first()
             .map(|route| route.container_port)
@@ -70,7 +70,7 @@ pub(super) fn export_app(spec: &StackSpec) -> anyhow::Result<AppConfig> {
 /// 从当前 IR 与 `.env` 字段重建 Traefik 模板。
 pub(super) fn export_traefik(spec: &StackSpec, config: &Config) -> anyhow::Result<TraefikConfig> {
     let service = only_named_service(spec, "traefik")?;
-    let routes = service.routes()?;
+    let routes = service.routes(&spec.name, "traefik")?;
     let dashboard_host = routes
         .first()
         .and_then(|route| route.hosts.first())
@@ -115,7 +115,7 @@ pub(super) fn export_traefik(spec: &StackSpec, config: &Config) -> anyhow::Resul
 pub(super) fn export_static(spec: &StackSpec) -> anyhow::Result<StaticConfig> {
     let service = only_named_service(spec, "web")?;
     let route = service
-        .routes()?
+        .routes(&spec.name, "web")?
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("static 项目缺少 Traefik 路由"))?;
@@ -139,7 +139,7 @@ fn routes_to_config(routes: &[Route]) -> Option<TraefikRoutesConfig> {
     if routes.is_empty() {
         return None;
     }
-    if routes.len() == 1 {
+    if routes.len() == 1 && routes[0].name == "default" {
         let route = &routes[0];
         return Some(TraefikRoutesConfig {
             hosts: route.hosts.clone(),
@@ -149,21 +149,26 @@ fn routes_to_config(routes: &[Route]) -> Option<TraefikRoutesConfig> {
             sticky_cookie: route.sticky_cookie,
             pass_host_header: route.pass_host_header,
             priority: route.priority,
-            routes: Vec::new(),
+            routes: BTreeMap::new(),
         });
     }
     Some(TraefikRoutesConfig {
         routes: routes
             .iter()
-            .map(|route| TraefikRouteConfig {
-                hosts: route.hosts.clone(),
-                path_prefix: route.path_prefix.clone(),
-                port: Some(route.container_port),
-                middlewares: route.middlewares.clone(),
-                protocol: route.protocol.into(),
-                sticky_cookie: route.sticky_cookie,
-                pass_host_header: route.pass_host_header,
-                priority: route.priority,
+            .map(|route| {
+                (
+                    route.name.clone(),
+                    TraefikRouteConfig {
+                        hosts: route.hosts.clone(),
+                        path_prefix: route.path_prefix.clone(),
+                        port: Some(route.container_port),
+                        middlewares: route.middlewares.clone(),
+                        protocol: route.protocol.into(),
+                        sticky_cookie: route.sticky_cookie,
+                        pass_host_header: route.pass_host_header,
+                        priority: route.priority,
+                    },
+                )
             })
             .collect(),
         ..TraefikRoutesConfig::default()

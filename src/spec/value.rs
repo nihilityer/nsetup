@@ -12,6 +12,7 @@ impl Route {
     ///
     /// 缺少主机名，或 DNS 名称、路径、端口无效时返回错误。
     pub fn validate(&self) -> anyhow::Result<()> {
+        validate_name("Traefik 路由名", &self.name)?;
         if self.hosts.is_empty() {
             anyhow::bail!("Traefik 路由至少需要一个 host");
         }

@@ -218,9 +218,9 @@ pub struct TraefikRoutesConfig {
     /// 可选路由优先级。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u32>,
-    /// 展开的路由条目。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub routes: Vec<TraefikRouteConfig>,
+    /// 以稳定路由名为键的展开路由。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub routes: BTreeMap<String, TraefikRouteConfig>,
 }
 
 /// 单个展开的应用路由。

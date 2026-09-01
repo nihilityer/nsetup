@@ -122,6 +122,7 @@ pub(super) fn generate_static(
         &input.name,
         "web",
         &[Route {
+            name: String::from("default"),
             hosts: vec![host],
             path_prefix: None,
             container_port: 80,
@@ -158,6 +159,7 @@ fn app_routes(service: &AppServiceConfig, config: &Config) -> anyhow::Result<Vec
             .port
             .ok_or_else(|| anyhow::anyhow!("traefik.hosts 需要服务 port"))?;
         output.push(Route {
+            name: String::from("default"),
             hosts: expand_hosts(&traefik.hosts, &config.domain)?,
             path_prefix: traefik.path_prefix.clone(),
             container_port: port,
@@ -168,13 +170,14 @@ fn app_routes(service: &AppServiceConfig, config: &Config) -> anyhow::Result<Vec
             priority: traefik.priority,
         });
     }
-    for route in &traefik.routes {
+    for (route_name, route) in &traefik.routes {
         validate_middlewares(&route.middlewares)?;
         let port = route
             .port
             .or(service.port)
             .ok_or_else(|| anyhow::anyhow!("Traefik route 需要 route.port 或服务 port"))?;
         output.push(Route {
+            name: route_name.clone(),
             hosts: expand_hosts(&route.hosts, &config.domain)?,
             path_prefix: route.path_prefix.clone(),
             container_port: port,

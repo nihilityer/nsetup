@@ -127,6 +127,8 @@ pub struct Logging {
 /// 从 label 派生的 Traefik 语义路由。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
+    /// 在 TOML、Compose router 和 backend 中保持稳定的路由名。
+    pub name: String,
     /// 此路由器处理的 DNS 主机名。
     pub hosts: Vec<String>,
     /// 可选 URL 路径前缀。

@@ -104,6 +104,7 @@ pub(super) fn edit_from_proto(request: proto::EditRequest) -> anyhow::Result<Edi
 /// 协议、中间件值或端口无效时返回错误。
 fn route_from_proto(route: proto::Route) -> anyhow::Result<Route> {
     Ok(Route {
+        name: route.name,
         hosts: route.hosts,
         path_prefix: route.path_prefix,
         container_port: u16::try_from(route.container_port).context("路由端口超出范围")?,

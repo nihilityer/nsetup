@@ -51,19 +51,24 @@ impl Service {
     /// # 错误
     ///
     /// 生成的 label 含无效值时返回错误。
-    pub fn routes(&self) -> anyhow::Result<Vec<Route>> {
+    pub fn routes(&self, stack_name: &str, service_name: &str) -> anyhow::Result<Vec<Route>> {
         let labels = label_map(&self.labels)?;
+        let generated_prefix = format!("nsetup-{stack_name}-{service_name}-");
         let mut routers = BTreeSet::new();
         for key in labels.keys() {
             if let Some(rest) = key.strip_prefix("traefik.http.routers.")
                 && let Some(router) = rest.strip_suffix(".rule")
-                && router.starts_with("nsetup-")
+                && router.starts_with(&generated_prefix)
             {
                 routers.insert(router.to_string());
             }
         }
         let mut routes = Vec::new();
         for router in routers {
+            let name = router
+                .strip_prefix(&generated_prefix)
+                .ok_or_else(|| anyhow::anyhow!("路由 {router} 不属于服务 {service_name}"))?
+                .to_string();
             let prefix = format!("traefik.http.routers.{router}");
             let rule = labels
                 .get(&format!("{prefix}.rule"))
@@ -103,6 +108,7 @@ impl Service {
                 .map(|value| value.parse::<u32>().context("Traefik priority 无效"))
                 .transpose()?;
             routes.push(Route {
+                name,
                 hosts,
                 path_prefix,
                 container_port,
@@ -133,9 +139,13 @@ impl Service {
         if !routes.is_empty() {
             labels.insert(String::from("traefik.enable"), String::from("true"));
         }
-        for (index, route) in routes.iter().enumerate() {
+        let mut route_names = BTreeSet::new();
+        for route in routes {
             route.validate()?;
-            let name = format!("{generated_prefix}{}", index + 1);
+            if !route_names.insert(route.name.as_str()) {
+                anyhow::bail!("Traefik 路由名重复: {}", route.name);
+            }
+            let name = format!("{generated_prefix}{}", route.name);
             let router = format!("traefik.http.routers.{name}");
             let backend = format!("traefik.http.services.{name}.loadbalancer");
             let mut rule = format!(

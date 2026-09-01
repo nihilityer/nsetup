@@ -29,7 +29,7 @@ impl Orchestrator {
         let mut routes = if let Some(routes) = edit.routes {
             routes
         } else {
-            service.routes()?
+            service.routes(name, &service_name)?
         };
         if let Some(port) = edit.container_port {
             if port == 0 {

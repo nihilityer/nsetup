@@ -29,6 +29,7 @@ pub(super) fn edit_request(args: EditArgs) -> anyhow::Result<proto::EditRequest>
         Vec::new()
     } else {
         vec![proto::Route {
+            name: String::from("default"),
             hosts: args.hosts,
             path_prefix: args.path_prefix,
             container_port: u32::from(

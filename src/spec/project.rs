@@ -107,7 +107,7 @@ impl StackSpec {
             {
                 anyhow::bail!("服务 {name} 的 logging.driver 不能为空");
             }
-            for route in service.routes()? {
+            for route in service.routes(&self.name, name)? {
                 route.validate()?;
             }
         }

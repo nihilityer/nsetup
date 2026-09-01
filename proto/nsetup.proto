@@ -113,6 +113,8 @@ message Route {
   optional bool pass_host_header = 7;
   // 可选路由优先级。
   optional uint32 priority = 8;
+  // 在 TOML、Traefik router 和 backend 中保持稳定的路由名。
+  string name = 9;
 }
 
 // 一个完整的宿主机端口映射。

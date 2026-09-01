@@ -36,6 +36,9 @@ nsetup template traefik > traefik.toml
 nsetup template static > static.toml
 ```
 
+`app` 骨架逐字段说明当前支持的配置；仅保留常用的最小路由为有效配置，端口发布、
+挂载、固定容器名、重启策略、健康检查、日志和高级路由等可选项均以注释示例展示。
+
 普通容器应用支持一个项目内的多个服务：
 
 ```toml
@@ -58,6 +61,21 @@ middlewares = ["gzip", "internal-only"]
 image = "ghcr.io/example/worker"
 version = "1.2"
 ```
+
+同一容器暴露多个子路由时使用具名表，让名称、域名和端口保持显式绑定；路由名也会
+进入 Traefik router/backend 名称，不依赖声明顺序：
+
+```toml
+[services.web.traefik.routes.api]
+hosts = ["s3"]
+port = 9000
+
+[services.web.traefik.routes.console]
+hosts = ["s3-console"]
+port = 9001
+```
+
+旧的 `[[services.*.traefik.routes]]` 顺序数组不再支持。
 
 应用配置并启动：
 

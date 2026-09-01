@@ -85,6 +85,9 @@ TOML 是唯一的声明式配置格式，用 `template` 字段选择内置模板
 
 ### app 模板（缺省）：容器应用，支持单服务或多服务
 
+`nsetup template app` 输出逐字段注释骨架：必填项与常用最小路由保持启用，具有宿主机
+副作用或通常可沿用默认行为的字段以注释示例展示；取消注释前应按实际应用修改。
+
 ```toml
 format = 1
 name = "media"
@@ -117,6 +120,23 @@ priority = 100
 image = "ghcr.io/example/worker"
 version = "1.2"
 ```
+
+多个子路由必须使用具名映射，而不是顺序数组：
+
+```toml
+[services.web.traefik.routes.api]
+hosts = ["api"]
+port = 8080
+
+[services.web.traefik.routes.admin]
+hosts = ["admin"]
+port = 9090
+```
+
+路由键（`api` / `admin`）是稳定身份，分别生成
+`nsetup-<项目>-<服务>-api` / `nsetup-<项目>-<服务>-admin` router 与 backend；
+域名、端口和其他路由参数都在同一个具名表内声明，增删或重排其他路由不会改变身份。
+旧的 `[[services.*.traefik.routes]]` 数组语法不再接受。
 
 `image` 与 `version` 在生成时合成 `image:version` 写入 IR，解析时拆开；`image`
 本身带标签或摘要属于配置错误。各模板的版本字段语义一致（其中基础设施模板的
