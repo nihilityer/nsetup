@@ -122,6 +122,7 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
             if response.stacks.is_empty() {
                 write_line("没有受管项目")?;
             } else {
+                write_line("项目\t服务\t状态")?;
                 for stack in response.stacks {
                     write_line(&format!(
                         "{}\t{}\t{}",

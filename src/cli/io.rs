@@ -3,6 +3,7 @@
 use crate::constants::{MAX_CONFIG_SIZE, MAX_RPC_MESSAGE_SIZE};
 use crate::rpc::proto;
 use anyhow::Context;
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -131,12 +132,70 @@ pub(super) fn write_diagnostic(value: &str) -> anyhow::Result<()> {
 
 /// 为列表输出生成紧凑的单行状态。
 pub(super) fn compact_status(value: &str) -> String {
-    value.lines().next().unwrap_or("未知").to_string()
+    let value = value.trim();
+    if value.is_empty() {
+        return String::from("stopped");
+    }
+
+    let Some(containers) = parse_compose_status(value) else {
+        return value.lines().next().unwrap_or("unknown").to_string();
+    };
+    if containers.is_empty() {
+        return String::from("stopped");
+    }
+    let mut counts = BTreeMap::<String, usize>::new();
+    for container in containers {
+        let Some(state) = container
+            .get("State")
+            .and_then(serde_json::Value::as_str)
+            .filter(|state| !state.is_empty())
+        else {
+            continue;
+        };
+        let health = container
+            .get("Health")
+            .and_then(serde_json::Value::as_str)
+            .filter(|health| !health.is_empty());
+        let status =
+            health.map_or_else(|| state.to_string(), |health| format!("{state} ({health})"));
+        *counts.entry(status).or_default() += 1;
+    }
+    if counts.is_empty() {
+        return String::from("unknown");
+    }
+    counts
+        .into_iter()
+        .map(|(status, count)| {
+            if count == 1 {
+                status
+            } else {
+                format!("{status} x{count}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// 兼容 Compose 输出的单个对象、JSON 数组和逐行 JSON 对象。
+fn parse_compose_status(value: &str) -> Option<Vec<serde_json::Value>> {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value) {
+        return match parsed {
+            serde_json::Value::Array(containers) => Some(containers),
+            container @ serde_json::Value::Object(_) => Some(vec![container]),
+            _ => None,
+        };
+    }
+    value
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::write_new_file;
+    use super::{compact_status, write_new_file};
     use std::os::unix::fs::PermissionsExt;
 
     /// 含密钥的导出文件始终只允许所有者读写。
@@ -152,5 +211,30 @@ mod tests {
         std::fs::remove_file(&path)?;
         assert_eq!(mode, 0o600);
         Ok(())
+    }
+
+    /// 列表状态忽略 Compose JSON 中体积很大的无关字段。
+    #[test]
+    fn list_status_keeps_only_state_and_health() {
+        let status =
+            r#"{"State":"running","Health":"healthy","Labels":"very-long","Mounts":"/data"}"#;
+        assert_eq!(compact_status(status), "running (healthy)");
+    }
+
+    /// 多容器逐行 JSON 状态会按相同状态聚合。
+    #[test]
+    fn list_status_aggregates_line_delimited_containers() {
+        let status = concat!(
+            "{\"State\":\"running\",\"Health\":\"healthy\"}\n",
+            "{\"State\":\"running\",\"Health\":\"healthy\"}\n"
+        );
+        assert_eq!(compact_status(status), "running (healthy) x2");
+    }
+
+    /// 没有运行容器时显示明确且紧凑的状态。
+    #[test]
+    fn list_status_reports_stopped_for_empty_output() {
+        assert_eq!(compact_status("\n"), "stopped");
+        assert_eq!(compact_status("[]"), "stopped");
     }
 }
