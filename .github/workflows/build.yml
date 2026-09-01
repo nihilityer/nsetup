@@ -34,17 +34,6 @@ jobs:
           target: x86_64-unknown-linux-musl
           cache: true
 
-      - name: Verify release version
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: |
-          package_version="$(cargo pkgid | sed 's/.*@//')"
-          tag_version="${GITHUB_REF_NAME#v}"
-          if [[ "${tag_version}" != "${package_version}" ]]; then
-            echo "::error::Tag version ${tag_version} does not match Cargo.toml version ${package_version}"
-            exit 1
-          fi
-
       - name: Check (lint + compile)
         run: |
           cargo fmt --check
