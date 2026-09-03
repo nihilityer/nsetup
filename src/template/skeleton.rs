@@ -177,6 +177,9 @@ cloudflare_token = "replace-me"
 version = "v3.8.0"
 http_port = 80
 https_port = 443
+# 通过 Authelia ForwardAuth 保护 dashboard；仍保留内网来源限制。
+# 请先准备 Authelia 配置，再开启此项。
+dashboard_authelia = true
 "#;
 
 /// CLI 输出的带注释静态站点模板。

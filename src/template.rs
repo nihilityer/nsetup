@@ -302,6 +302,9 @@ pub struct TraefikConfig {
     /// 宿主机 HTTPS 和 HTTP/3 端口。
     #[serde(default = "default_https_port")]
     pub https_port: u16,
+    /// 是否使用 Authelia `ForwardAuth` 保护 Traefik dashboard。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dashboard_authelia: bool,
 }
 
 /// 静态站点 TOML 文档。
@@ -428,4 +431,9 @@ const fn default_http_port() -> u16 {
 /// 返回 Traefik 默认 HTTPS 端口。
 const fn default_https_port() -> u16 {
     443
+}
+
+/// 判断布尔值是否为默认关闭状态。
+const fn is_false(value: &bool) -> bool {
+    !*value
 }

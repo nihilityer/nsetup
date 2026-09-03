@@ -251,6 +251,7 @@ cloudflare_token = "secret"
 version = "v3.8.0"
 http_port = 8080
 https_port = 8443
+dashboard_authelia = true
 "#;
     let config = Config::default();
     let generated = apply(input, &config)?;
@@ -258,6 +259,9 @@ https_port = 8443
     let service = &generated.spec.document.services["traefik"];
     assert!(service.labels.contains(&String::from(
         "traefik.http.routers.dashboard.service=api@internal"
+    )));
+    assert!(service.labels.contains(&String::from(
+        "traefik.http.routers.dashboard.middlewares=internal-only@file,authelia@file"
     )));
     assert!(service.labels.iter().all(|label| {
         !label.starts_with("traefik.http.services.dashboard.loadbalancer.server.port=")
@@ -289,8 +293,29 @@ https_port = 8443
     assert!(dynamic.contains("X-Forwarded-Port: '8443'"));
     assert!(!dynamic.contains("defaultGeneratedCert"));
     let exported = export(&generated.spec, &config)?;
+    assert!(exported.contains("dashboard_authelia = true"));
     let regenerated = apply(&exported, &config)?;
     assert_eq!(generated.spec, regenerated.spec);
+    Ok(())
+}
+
+/// 未开启 Authelia 时 dashboard 仍只允许内网访问。
+#[test]
+fn traefik_dashboard_authelia_defaults_to_disabled() -> anyhow::Result<()> {
+    let input = r#"
+format = 1
+template = "traefik"
+domain = "example.com"
+acme_email = "admin@example.com"
+cloudflare_token = "secret"
+version = "v3.8.0"
+"#;
+    let generated = apply(input, &Config::default())?;
+    let labels = &generated.spec.document.services["traefik"].labels;
+    assert!(labels.contains(&String::from(
+        "traefik.http.routers.dashboard.middlewares=internal-only@file"
+    )));
+    assert!(labels.iter().all(|label| !label.contains("authelia@file")));
     Ok(())
 }
 

@@ -80,6 +80,11 @@ pub(super) fn export_traefik(spec: &StackSpec, config: &Config) -> anyhow::Resul
         .and_then(|route| route.hosts.first())
         .cloned()
         .unwrap_or_else(|| format!("traefik.{}", config.domain));
+    let dashboard_authelia = service.labels.iter().any(|label| {
+        label
+            .strip_prefix("traefik.http.routers.dashboard.middlewares=")
+            .is_some_and(|value| value.split(',').any(|name| name == "authelia@file"))
+    });
     let domain = spec
         .environment
         .get(super::traefik::DOMAIN_KEY)
@@ -112,6 +117,7 @@ pub(super) fn export_traefik(spec: &StackSpec, config: &Config) -> anyhow::Resul
         version: required_env(spec, "TRAEFIK_VERSION")?,
         http_port,
         https_port,
+        dashboard_authelia,
     })
 }
 

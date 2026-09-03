@@ -1,5 +1,8 @@
 # nsetup 架构设计
 
+本文面向开发与设计维护；安装、部署和认证操作分别见
+[使用与运维](USAGE.md)和 [Authelia 认证](AUTHELIA.md)。
+
 `nsetup` 是 Linux 主机上的 Docker Compose 应用管理工具，面向家庭服务器场景：
 一台机器、一个反向代理入口、若干容器化应用。
 
@@ -154,6 +157,7 @@ cloudflare_token = "..."
 version = "v3.8.0"
 http_port = 80
 https_port = 443
+dashboard_authelia = true
 ```
 
 生成 Traefik 项目：ACME + Cloudflare DNS 证书、HTTP→HTTPS 重定向、HTTP/3、
@@ -161,6 +165,10 @@ https_port = 443
 forwarded-headers / internal-only / tls）。Traefik 项目与应用项目完全同构：
 同样经 IR 生成、受同样的约束、用同样的命令运维。升级 Traefik 就是修改
 `version` 后重新 `up --force`。
+
+`dashboard_authelia = true` 会在固定的 `internal-only@file` 之后追加
+`authelia@file`，使控制台同时受内网来源限制与 Authelia 登录保护；关闭或省略时
+只保留内网限制。启用前应先准备可用的 Authelia 配置。
 
 Traefik 的运行默认值以 `main` 分支既有基础设施生成器为基线：dashboard 路由固定
 指向 `api@internal`；路由使用 `cloudflare` resolver 和主域名 + 通配符 SAN；关闭

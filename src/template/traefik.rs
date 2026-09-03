@@ -53,7 +53,7 @@ pub(super) fn generate(input: TraefikConfig, config: &Config) -> anyhow::Result<
             ),
             (String::from("ACME_EMAIL"), String::from("${ACME_EMAIL}")),
         ]),
-        labels: dashboard_labels(&dashboard_host, &input.domain),
+        labels: dashboard_labels(&dashboard_host, &input.domain, input.dashboard_authelia),
         healthcheck: Some(healthcheck),
         logging: Some(Logging {
             driver: String::from("json-file"),
@@ -147,7 +147,12 @@ fn traefik_command(https_port: u16) -> Vec<String> {
 }
 
 /// 构造 dashboard 到 `api@internal` 的官方推荐路由标签。
-fn dashboard_labels(host: &str, domain: &str) -> Vec<String> {
+fn dashboard_labels(host: &str, domain: &str, authelia: bool) -> Vec<String> {
+    let middlewares = if authelia {
+        "internal-only@file,authelia@file"
+    } else {
+        "internal-only@file"
+    };
     vec![
         String::from("io.nsetup.template=traefik"),
         String::from("traefik.enable=true"),
@@ -159,7 +164,7 @@ fn dashboard_labels(host: &str, domain: &str) -> Vec<String> {
         String::from("traefik.http.routers.dashboard.tls.certresolver=cloudflare"),
         format!("traefik.http.routers.dashboard.tls.domains[0].main={domain}"),
         format!("traefik.http.routers.dashboard.tls.domains[0].sans=*.{domain}"),
-        String::from("traefik.http.routers.dashboard.middlewares=internal-only@file"),
+        format!("traefik.http.routers.dashboard.middlewares={middlewares}"),
     ]
 }
 
