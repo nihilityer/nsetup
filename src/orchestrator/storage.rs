@@ -124,6 +124,50 @@ pub(super) fn write_attachment(root: &Path, file: &GeneratedFile) -> anyhow::Res
     write_project_file(&destination, &file.content, file.mode)
 }
 
+/// 原子替换项目内的单个受管附属文件。
+pub(super) fn replace_attachment(root: &Path, file: &GeneratedFile) -> anyhow::Result<()> {
+    validate_relative_path(&file.path)?;
+    let destination = root.join(&file.path);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("附属文件缺少父目录"))?;
+    create_safe_directories(root, parent)?;
+    if let Ok(metadata) = fs::symlink_metadata(&destination)
+        && (!metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        anyhow::bail!("拒绝覆盖非普通文件: {}", destination.display());
+    }
+    let temporary = sibling_temporary(&destination, "replace")?;
+    if temporary.exists() {
+        anyhow::bail!("附属文件临时路径已存在: {}", temporary.display());
+    }
+    let result = (|| -> anyhow::Result<()> {
+        write_project_file(&temporary, &file.content, file.mode)?;
+        fs::rename(&temporary, &destination)?;
+        Ok(())
+    })();
+    if result.is_err() && temporary.exists() {
+        fs::remove_file(&temporary)?;
+    }
+    result
+}
+
+/// 删除项目内的单个普通附属文件；文件不存在时返回 `false`。
+pub(super) fn remove_attachment(root: &Path, path: &Path) -> anyhow::Result<bool> {
+    validate_relative_path(path)?;
+    let destination = root.join(path);
+    let metadata = match fs::symlink_metadata(&destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        anyhow::bail!("拒绝删除非普通文件: {}", destination.display());
+    }
+    fs::remove_file(&destination)?;
+    Ok(true)
+}
+
 /// 创建附属文件目录链，同时拒绝符号链接。
 fn create_safe_directories(root: &Path, destination: &Path) -> anyhow::Result<()> {
     let relative = destination

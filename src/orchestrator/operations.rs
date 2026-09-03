@@ -58,11 +58,27 @@ impl Orchestrator {
                 replace: true,
             });
         }
+        self.attach_oidc_client_fragments(&mut generated)?;
+        let oidc_fragment = if generated.kind == TemplateKind::Authelia {
+            None
+        } else {
+            Some(self.prepare_oidc_client_fragment(&generated.spec)?)
+        };
         self.deploy(&generated.spec, &generated.files, force)?;
+        let oidc_updated = match oidc_fragment {
+            Some(fragment) => {
+                self.sync_oidc_client_fragment(&generated.spec.name, fragment.as_ref())?
+            }
+            None => false,
+        };
         if start {
             docker::compose_up(&self.config, &self.project_dir(&generated.spec.name)?, None)?;
         }
-        Ok(format!("项目 {} 已应用", generated.spec.name))
+        Ok(format!(
+            "项目 {} 已应用{}",
+            generated.spec.name,
+            oidc_update_suffix(oidc_updated)
+        ))
     }
 
     /// 将 Compose 文档导入受支持的 IR 并替换项目。
@@ -84,11 +100,16 @@ impl Orchestrator {
             String::new()
         };
         let spec = StackSpec::parse(name, compose_yaml, env_file.unwrap_or(&preserved))?;
+        let oidc_fragment = self.prepare_oidc_client_fragment(&spec)?;
         self.deploy(&spec, &[], true)?;
+        let oidc_updated = self.sync_oidc_client_fragment(name, oidc_fragment.as_ref())?;
         if start {
             docker::compose_up(&self.config, &directory, None)?;
         }
-        Ok(format!("项目 {name} 已导入"))
+        Ok(format!(
+            "项目 {name} 已导入{}",
+            oidc_update_suffix(oidc_updated)
+        ))
     }
 
     /// 将当前项目状态导出为规范化 TOML。
@@ -241,6 +262,19 @@ impl Orchestrator {
             .with_context(|| format!("无法移动待删除项目: {}", directory.display()))?;
         fs::remove_dir_all(&trash)
             .with_context(|| format!("无法删除项目目录: {}", trash.display()))?;
-        Ok(format!("项目 {name} 已删除；bind mount 数据未删除"))
+        let oidc_updated = self.sync_oidc_client_fragment(name, None)?;
+        Ok(format!(
+            "项目 {name} 已删除；bind mount 数据未删除{}",
+            oidc_update_suffix(oidc_updated)
+        ))
+    }
+}
+
+/// 返回 OIDC 客户端片段变更后的运维提示。
+pub(super) const fn oidc_update_suffix(updated: bool) -> &'static str {
+    if updated {
+        "；Authelia OIDC 配置已更新，重启 authelia 后生效"
+    } else {
+        ""
     }
 }

@@ -1,8 +1,8 @@
 //! 将各类 TOML 声明展开为统一 IR 与附属文件。
 
 use super::{
-    AppConfig, AppNetwork, AppServiceConfig, FORMAT_VERSION, HealthcheckConfig, StaticConfig,
-    TemplateKind, TemplateOutput,
+    APP_OIDC_CLIENTS_KEY, AppConfig, AppNetwork, AppServiceConfig, FORMAT_VERSION,
+    HealthcheckConfig, StaticConfig, TemplateKind, TemplateOutput, oidc,
 };
 use crate::config::Config;
 use crate::constants::PROXY_NETWORK;
@@ -23,6 +23,14 @@ pub(super) fn generate_app(input: AppConfig, config: &Config) -> anyhow::Result<
         anyhow::bail!("app 配置的 template 必须为 app");
     }
     validate_name("项目名", &input.name)?;
+    let mut environment = BTreeMap::new();
+    if let Some(authelia) = &input.authelia {
+        oidc::validate_clients(&authelia.oidc_clients)?;
+        environment.insert(
+            String::from(APP_OIDC_CLIENTS_KEY),
+            serde_json::to_string(&authelia.oidc_clients)?,
+        );
+    }
     if input.services.is_empty() {
         anyhow::bail!("app 模板至少需要一个服务");
     }
@@ -83,7 +91,7 @@ pub(super) fn generate_app(input: AppConfig, config: &Config) -> anyhow::Result<
     let spec = StackSpec {
         name: input.name,
         document,
-        environment: BTreeMap::new(),
+        environment,
     };
     spec.validate()?;
     Ok(TemplateOutput {

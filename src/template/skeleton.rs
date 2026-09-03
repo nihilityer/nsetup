@@ -106,6 +106,22 @@ hosts = ["media"]
 # pass_host_header = false
 # priority = 200
 
+# 可选 Authelia OIDC client 由当前应用拥有；client_id 来自具名表键。
+# 先生成客户端 ID 和客户端密钥；Random Password 配置到应用，Digest 写入 TOML：
+# docker run --rm --pull=never authelia/authelia:4.39.20 authelia crypto rand --length 72 --charset rfc3986
+# docker run --rm --pull=never authelia/authelia:4.39.20 authelia crypto hash generate pbkdf2 --variant sha512 --random --random.length 72 --random.charset rfc3986
+# [authelia.oidc_clients.my-app]
+# client_name = "My Application"
+# client_secret_hash = '$pbkdf2-sha512$replace-with-generated-digest'
+# authorization_policy = "two_factor"
+# redirect_uris = ["https://app.example.com/oauth/callback"]
+# scopes = ["openid", "profile", "email", "groups"]
+# grant_types = ["authorization_code"]
+# require_pkce = false
+# token_endpoint_auth_method = "client_secret_basic" # 或 client_secret_post
+# SPA/CLI 等公共客户端应省略 client_secret_hash，并设置 public = true、
+# require_pkce = true、token_endpoint_auth_method = "none"。
+
 # 多服务项目继续增加 [services.<名称>]；每个服务至少需要 image 与 version。
 # [services.worker]
 # image = "ghcr.io/example/media-worker"
@@ -117,8 +133,14 @@ pub(super) const AUTHELIA_SKELETON: &str = r#"# Authelia 基础认证设施模�
 # 先用以下命令交互生成 password_hash：
 # docker run --rm --pull=never -it authelia/authelia:4.39.20 authelia crypto hash generate argon2
 # 三个密钥分别运行一次：openssl rand -hex 32
+# storage_encryption_key 在数据库首次初始化后必须保持不变；轮换时先用旧密钥执行
+# authelia storage encryption change-key，不能直接在 TOML 中替换。
 # 重点：[users.admin] 中的 admin 是登录用户名；修改登录名要修改表名，
 # 不是只修改 display_name 或 email。应用变更后运行 nsetup restart authelia。
+# 可选 OIDC provider 需要额外的 HMAC 与 RSA 私钥：
+# openssl rand -hex 64
+# openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out oidc-rs256.pem
+# OIDC 客户端不在此文件声明；请在对应应用中使用 [authelia.oidc_clients.<client_id>]。
 format = 1
 template = "authelia"
 host = "auth"
@@ -128,6 +150,15 @@ default_policy = "one_factor"
 jwt_secret = "replace-with-at-least-32-random-characters"
 session_secret = "replace-with-at-least-32-random-characters"
 storage_encryption_key = "replace-with-at-least-32-random-characters"
+
+# 取消以下注释以启用 OIDC provider；私钥必须完整粘贴。
+# [oidc]
+# hmac_secret = "replace-with-at-least-64-random-characters"
+# jwk_private_key = """
+# -----BEGIN PRIVATE KEY-----
+# replace-with-generated-rsa-private-key
+# -----END PRIVATE KEY-----
+# """
 
 [users.admin]
 display_name = "Administrator"

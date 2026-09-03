@@ -3,6 +3,9 @@
 use super::{TemplateKind, apply, export};
 use crate::config::Config;
 
+/// Authelia OIDC provider 与应用客户端行为。
+mod oidc;
+
 /// 通用应用骨架本身可直接应用，且不会启用注释中的有副作用选项。
 #[test]
 fn app_skeleton_is_valid_with_optional_defaults_disabled() -> anyhow::Result<()> {
@@ -211,6 +214,9 @@ fn authelia_template_round_trip() -> anyhow::Result<()> {
     let configuration = String::from_utf8(configuration.content.clone())?;
     let _configuration_yaml: serde_yaml::Value = serde_yaml::from_str(&configuration)?;
     assert!(configuration.contains("implementation: 'ForwardAuth'"));
+    assert!(configuration.contains("default_2fa_method: 'totp'"));
+    assert!(configuration.contains("totp:\n  disable: false"));
+    assert!(configuration.contains("webauthn:\n  disable: true"));
     assert!(!configuration.contains("jwt-secret-value"));
     let exported = export(&generated.spec, &config)?;
     let regenerated = apply(&exported, &config)?;
@@ -223,6 +229,14 @@ fn authelia_template_round_trip() -> anyhow::Result<()> {
 fn authelia_template_rejects_placeholders() {
     let result = apply(super::skeleton::AUTHELIA_SKELETON, &Config::default());
     assert!(result.is_err());
+}
+
+/// Authelia 骨架明确说明存储密钥不能随普通重新应用而变化。
+#[test]
+fn authelia_skeleton_documents_storage_key_stability() {
+    let skeleton = super::skeleton::AUTHELIA_SKELETON;
+    assert!(skeleton.contains("storage_encryption_key 在数据库首次初始化后必须保持不变"));
+    assert!(skeleton.contains("authelia storage encryption change-key"));
 }
 
 /// Traefik 状态、密钥与模板类型在 IR 导出后保持不变。

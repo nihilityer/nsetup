@@ -11,6 +11,8 @@ use std::path::PathBuf;
 mod authelia;
 /// TOML 声明到 IR 的模板生成。
 mod generate;
+/// 应用拥有的 Authelia OIDC 客户端声明。
+pub mod oidc;
 /// IR 到 TOML 声明的模板反解。
 mod reverse;
 /// CLI 使用的带注释配置骨架。
@@ -27,6 +29,8 @@ use skeleton::{APP_SKELETON, AUTHELIA_SKELETON, STATIC_SKELETON, TRAEFIK_SKELETO
 
 /// 当前面向用户的配置格式版本。
 pub const FORMAT_VERSION: u32 = 1;
+/// app 模板在项目 `.env` 中持久化 OIDC 客户端映射的键。
+const APP_OIDC_CLIENTS_KEY: &str = "NSETUP_APP_AUTHELIA_OIDC_CLIENTS_JSON";
 
 /// 与 Compose 状态一同写入的项目附属文件。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,8 +108,19 @@ pub struct AppConfig {
     pub template: Option<String>,
     /// 项目名。
     pub name: String,
+    /// 可选的应用级 Authelia 集成声明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authelia: Option<AppAutheliaConfig>,
     /// 以 Compose 服务名为键的服务映射。
     pub services: BTreeMap<String, AppServiceConfig>,
+}
+
+/// 应用拥有的 Authelia 集成配置。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AppAutheliaConfig {
+    /// 以 `client_id` 为键的 OIDC 客户端映射。
+    pub oidc_clients: BTreeMap<String, oidc::AutheliaOidcClientConfig>,
 }
 
 /// 应用模板中的单个服务。
@@ -356,6 +371,42 @@ pub fn export(spec: &StackSpec, config: &Config) -> anyhow::Result<String> {
         output.push('\n');
     }
     Ok(output)
+}
+
+/// 返回应用项目声明的 OIDC client ID，用于跨项目冲突检查。
+pub fn app_oidc_client_ids(spec: &StackSpec) -> anyhow::Result<Vec<String>> {
+    Ok(app_oidc_clients(spec)?.into_keys().collect())
+}
+
+/// 生成应用拥有、由 Authelia 汇总加载的 OIDC 客户端片段。
+pub fn app_oidc_client_fragment(spec: &StackSpec) -> anyhow::Result<Option<GeneratedFile>> {
+    let clients = app_oidc_clients(spec)?;
+    if clients.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(GeneratedFile {
+        path: PathBuf::from("config/oidc-clients").join(format!("{}.yml", spec.name)),
+        content: oidc::clients_yaml(&clients)?.into_bytes(),
+        mode: 0o640,
+        replace: true,
+    }))
+}
+
+/// 判断 Authelia 项目状态是否具备 OIDC provider 密钥。
+pub fn authelia_oidc_enabled(spec: &StackSpec) -> bool {
+    authelia::oidc_enabled(spec)
+}
+
+/// 从应用项目 `.env` 恢复并校验 OIDC 客户端映射。
+fn app_oidc_clients(
+    spec: &StackSpec,
+) -> anyhow::Result<BTreeMap<String, oidc::AutheliaOidcClientConfig>> {
+    let Some(value) = spec.environment.get(APP_OIDC_CLIENTS_KEY) else {
+        return Ok(BTreeMap::new());
+    };
+    let clients = serde_json::from_str(value)?;
+    oidc::validate_clients(&clients)?;
+    Ok(clients)
 }
 
 /// 返回已注册模板的带注释配置骨架。

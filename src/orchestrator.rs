@@ -9,6 +9,8 @@ use std::path::PathBuf;
 mod deploy;
 /// 服务局部编辑与网络修改。
 mod edit;
+/// 应用 OIDC 客户端片段与 Authelia 的同步。
+mod oidc;
 /// 项目生命周期与查询操作。
 mod operations;
 /// 安全路径与项目文件操作。

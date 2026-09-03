@@ -188,6 +188,47 @@ email = "admin@example.com"
 groups = ["admins"]
 ```
 
+OIDC provider 是 Authelia 模板的可选全局能力，只拥有 provider HMAC 与签名
+私钥：
+
+```toml
+[oidc]
+hmac_secret = "...至少 64 个 RFC3986 非保留字符..."
+jwk_private_key = """
+-----BEGIN PRIVATE KEY-----
+...PKCS#8 或 PKCS#1 RSA 私钥...
+-----END PRIVATE KEY-----
+"""
+```
+
+客户端不属于 Authelia TOML，而是由对应的 app TOML 声明。具名映射键是稳定的
+`client_id`：
+
+```toml
+[authelia.oidc_clients.gitea]
+client_name = "Gitea"
+client_secret_hash = '$pbkdf2-sha512$...'
+authorization_policy = "two_factor"
+redirect_uris = ["https://git.example.com/user/oauth2/authelia/callback"]
+scopes = ["openid", "profile", "email", "groups"]
+grant_types = ["authorization_code", "refresh_token"]
+require_pkce = false
+token_endpoint_auth_method = "client_secret_basic"
+```
+
+机密客户端只接受密钥摘要，不接受明文；客户端应用保存生成摘要时对应的明文。
+公共客户端不配置摘要，必须启用 S256 PKCE 并使用 `none` token endpoint 认证。
+回调 URI 是区分大小写的完整 URI，非回环 HTTP 回调会被拒绝。OIDC 客户端的
+`authorization_policy` 与用于 ForwardAuth 的 `access_control.default_policy`
+相互独立。
+
+应用客户端映射作为 app IR 的受管元数据存入该应用 `.env`，以便独立导出。
+部署 app 时，编排层将它原子同步为
+`authelia/config/oidc-clients/<应用项目>.yml`；取消声明或删除 app 时删除同名
+片段。重新部署 Authelia 时会从所有现有 app IR 重建该目录。跨项目校验保证
+`client_id` 全局唯一；已部署的 Authelia 未启用 `[oidc]` 时拒绝新客户端。
+片段变更后会明确提示重启 Authelia，不隐式改变其运行状态。
+
 `users` 下的 TOML 表名是认证用户名：`[users.admin]` 生成用户名 `admin`；
 `display_name` 只用于展示，`email` 默认也不作为登录别名。修改登录名必须修改表名，
 例如将其改为 `[users.nihilityer]`，再执行 `up --force` 与 `restart authelia`。
@@ -198,6 +239,17 @@ groups = ["admins"]
 状态位于第一个 `data_root` 的 `authelia/`，删除项目不会删除认证状态。用户库由
 TOML 声明管理，`watch = false`，并禁用容器内密码修改与重置，避免运行时文件和
 导出状态形成双重真相。用户名或密码哈希变更后必须显式重启容器加载新用户库。
+`storage_encryption_key` 是持久化状态的加密根密钥，数据库初始化后必须保持稳定；
+轮换必须先用旧密钥执行 Authelia 的 `storage encryption change-key`，不能仅重写配置。
+二次验证固定使用 TOTP：将其显式启用并设为默认方法，同时禁用 WebAuthn；是否要求
+二次验证仍分别由 ForwardAuth 的 `default_policy` 和 OIDC 客户端的
+`authorization_policy` 决定。
+
+启用 OIDC 时，模板额外生成 `OIDC_HMAC_SECRET` 与 `OIDC_JWK_PRIVATE_KEY` 两个
+`0600` 文件，通过 Authelia `template` 配置过滤器从只读 `/secrets` 挂载读取；
+`configuration.yml` 不包含这两个 provider 密钥的明文。它在模板过滤阶段遍历各应用
+片段，为 Authelia 构造单一 `identity_providers.oidc.clients` 列表；provider 配置仍
+持久化在 Authelia 项目的受管 `.env` 中以支持独立导出。
 
 Traefik 模板始终生成 `authelia@file` ForwardAuth 中间件，地址固定为共享
 `nsetup-proxy` 网络内的 `http://authelia:9091/api/authz/forward-auth`。普通应用在
@@ -388,13 +440,17 @@ bind mount 白名单 = `data_roots` ∪ `stacks_root` ∪ `docker_socket`（精�
 | `spec/service` | 服务镜像版本与 Traefik label 语义视图的双向转换 |
 | `spec/value` | 路由、端口、bind mount、健康检查、镜像与名称值对象校验 |
 | `template` | 模板公共 TOML 模型、注册表与稳定入口 |
-| `template/authelia` | Authelia TOML ↔ IR，并生成配置、用户库与文件型密钥 |
+| `template/authelia` | Authelia TOML ↔ IR、服务定义与基础配置生成 |
+| `template/authelia/oidc` | Authelia OIDC provider 校验、配置与文件型密钥 |
+| `template/authelia/users` | 文件用户库模型、校验与 YAML 生成 |
+| `template/oidc` | app 拥有的 Authelia OIDC 客户端模型、校验与 YAML 片段 |
 | `template/generate` | app/traefik/static TOML → IR，并生成模板附属文件 |
 | `template/reverse` | 当前 IR → 规范化 TOML，恢复模板参数与服务语义 |
 | `template/skeleton` | CLI 输出的带注释 TOML 配置骨架 |
 | `orchestrator` | 编排器及其请求、响应公共模型 |
 | `orchestrator/operations` | 应用、导入、查询和项目生命周期操作 |
 | `orchestrator/edit` | 服务局部编辑、标签合并和网络语义修改 |
+| `orchestrator/oidc` | 跨项目 OIDC client ID 校验及 app 片段向 Authelia 同步 |
 | `orchestrator/deploy` | deploy 写盘收口、冲突检查和受管目录解析 |
 | `orchestrator/storage` | 安全路径、附属文件复制、原子文件写入和回滚辅助 |
 | `docker` | `docker compose` 子进程封装（统一使用配置的 `docker_socket`） |

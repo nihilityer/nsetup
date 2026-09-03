@@ -100,11 +100,20 @@ nsetup up -f static.toml --assets ./dist --start
 Authelia 模板使用文件用户库、文件型密钥和 SQLite，运行状态持久化到第一个
 `data_root` 下的 `authelia/`。先交互生成密码哈希，再替换模板中的占位值：
 
+模板将 TOTP 设为默认且唯一的二次验证方式，并禁用 WebAuthn；未配置 Duo，因此
+不会提供移动推送。`default_policy` 决定普通 ForwardAuth 路由是否必须进行二次验证，
+OIDC 客户端则使用各自的 `authorization_policy`。
+
 ```bash
 docker run --rm --pull=never -it authelia/authelia:4.39.20 \
   authelia crypto hash generate argon2
 openssl rand -hex 32   # 三个密钥分别运行一次
 ```
+
+`storage_encryption_key` 用于加密 SQLite 中的敏感字段。数据库首次初始化后必须保留
+原值；普通 `up --force` 不得重新生成它。需要轮换时，应停止 Authelia，先用旧密钥
+执行 `authelia storage encryption change-key`，再把 TOML 更新为新密钥。丢失旧密钥
+后无法解密已有的 TOTP、WebAuthn 和 OIDC 状态。
 
 > **重点：登录用户名由 `[users.<用户名>]` 的表名决定。** 模板中的
 > `[users.admin]` 表示登录用户名是 `admin`；`display_name` 只是显示名称，`email`
@@ -119,6 +128,56 @@ nsetup up -f authelia.toml --force
 nsetup restart authelia
 ```
 
+可选 OIDC provider 是 Authelia 的全局能力，只在 `authelia.toml` 中配置 HMAC 和
+RS256 私钥。每个 OIDC 客户端则由实际使用它的应用 TOML 拥有，具名表键就是
+`client_id`。先生成 provider HMAC、RS256 私钥、客户端 ID 与客户端密钥：
+
+```bash
+openssl rand -hex 64
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out oidc-rs256.pem
+docker run --rm --pull=never authelia/authelia:4.39.20 \
+  authelia crypto rand --length 72 --charset rfc3986
+docker run --rm --pull=never authelia/authelia:4.39.20 \
+  authelia crypto hash generate pbkdf2 --variant sha512 --random \
+  --random.length 72 --random.charset rfc3986
+```
+
+```toml
+# authelia.toml
+[oidc]
+hmac_secret = "...openssl rand 的输出..."
+jwk_private_key = """
+-----BEGIN PRIVATE KEY-----
+...oidc-rs256.pem 的完整内容...
+-----END PRIVATE KEY-----
+"""
+```
+
+```toml
+# gitea.toml（与 name、services 同级）
+[authelia.oidc_clients.gitea]
+client_name = "Gitea"
+client_secret_hash = '$pbkdf2-sha512$...'
+authorization_policy = "two_factor"
+redirect_uris = ["https://git.example.com/user/oauth2/authelia/callback"]
+scopes = ["openid", "profile", "email", "groups"]
+grant_types = ["authorization_code", "refresh_token"]
+require_pkce = false
+token_endpoint_auth_method = "client_secret_basic"
+```
+
+PBKDF2 命令输出的 `Random Password` 配置到客户端应用，`Digest` 才写入
+`client_secret_hash`；回调 URI 区分大小写且必须精确一致。公共 SPA/CLI 客户端省略
+`client_secret_hash`，并配置 `public = true`、`require_pkce = true` 和
+`token_endpoint_auth_method = "none"`。应用使用的 discovery 地址为
+`https://<认证门户域名>/.well-known/openid-configuration`。OIDC 的
+`authorization_policy` 独立于全局 `default_policy`。
+
+`nsetup up -f gitea.toml --force` 会把该应用拥有的客户端同步到
+`stacks_root/authelia/config/oidc-clients/gitea.yml`；从应用 TOML 中删除声明或删除
+整个应用项目时，对应片段也会删除。客户端变更后需要执行
+`nsetup restart authelia`；全部应用中的 `client_id` 必须全局唯一。
+
 需要认证的应用只需在路由中加入 `authelia`；认证门户自身不会套用认证中间件：
 
 ```toml
@@ -126,6 +185,9 @@ nsetup restart authelia
 hosts = ["admin"]
 middlewares = ["authelia", "tls"]
 ```
+
+原生 OIDC 登录与 Traefik ForwardAuth 是两种独立集成方式；只使用应用自身的 OIDC
+登录时，通常不需要再给该路由添加 `authelia` 中间件。
 
 整体更新已有项目需要 `--force`。静态站点再次上传 `--assets` 时会整体替换站点文件；
 Traefik 的 `acme.json` 与 Authelia 的 SQLite 状态会在更新时保留。导出的基础设施

@@ -1,5 +1,10 @@
 //! Authelia 基础认证设施模板及其可重建状态。
 
+mod oidc;
+mod users;
+
+use self::oidc::OidcProviderConfig;
+use self::users::AutheliaUser;
 use super::{FORMAT_VERSION, GeneratedFile, TemplateKind, TemplateOutput};
 use crate::config::{Config, validate_domain};
 use crate::constants::PROXY_NETWORK;
@@ -22,6 +27,10 @@ const JWT_SECRET_KEY: &str = "NSETUP_AUTHELIA_JWT_SECRET";
 const SESSION_SECRET_KEY: &str = "NSETUP_AUTHELIA_SESSION_SECRET";
 /// Authelia 模板在项目 `.env` 中持久化存储加密密钥的键。
 const STORAGE_SECRET_KEY: &str = "NSETUP_AUTHELIA_STORAGE_ENCRYPTION_KEY";
+/// Authelia 模板在项目 `.env` 中持久化 OIDC HMAC 的键。
+const OIDC_HMAC_SECRET_KEY: &str = "NSETUP_AUTHELIA_OIDC_HMAC_SECRET";
+/// Authelia 模板在项目 `.env` 中持久化 OIDC RS256 私钥的键。
+const OIDC_JWK_PRIVATE_KEY: &str = "NSETUP_AUTHELIA_OIDC_JWK_PRIVATE_KEY";
 
 /// Authelia 基础认证设施的 TOML 文档。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +56,9 @@ pub(super) struct AutheliaConfig {
     pub session_secret: String,
     /// `SQLite` 敏感字段加密密钥。
     pub storage_encryption_key: String,
+    /// 可选的 `OpenID Connect` provider；客户端由应用声明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<OidcProviderConfig>,
     /// 以登录名为键的声明式本地用户库。
     pub users: BTreeMap<String, AutheliaUser>,
 }
@@ -79,46 +91,6 @@ impl AutheliaPolicy {
             _ => anyhow::bail!("不支持的 Authelia 默认策略: {value}"),
         }
     }
-}
-
-/// Authelia 文件认证后端中的单个用户。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(super) struct AutheliaUser {
-    /// 登录后展示的名称。
-    pub display_name: String,
-    /// 由 Authelia 生成的密码哈希，禁止填写明文密码。
-    pub password_hash: String,
-    /// 用户邮件地址。
-    pub email: String,
-    /// 用户所属组。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub groups: Vec<String>,
-    /// 是否禁止该用户登录。
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub disabled: bool,
-}
-
-/// 序列化为 Authelia `users_database.yml` 的顶层文档。
-#[derive(Serialize)]
-struct UserDatabase<'a> {
-    /// 以登录名为键的用户映射。
-    users: BTreeMap<&'a str, UserDatabaseEntry<'a>>,
-}
-
-/// Authelia 用户数据库要求的字段名称。
-#[derive(Serialize)]
-struct UserDatabaseEntry<'a> {
-    /// 是否禁止该用户登录。
-    disabled: bool,
-    /// 用户展示名称。
-    displayname: &'a str,
-    /// 密码哈希。
-    password: &'a str,
-    /// 用户邮件地址。
-    email: &'a str,
-    /// 用户所属组。
-    groups: &'a [String],
 }
 
 /// 从 TOML 生成 Authelia 项目、配置文件和文件型密钥。
@@ -173,6 +145,12 @@ pub(super) fn generate(input: &AutheliaConfig, config: &Config) -> anyhow::Resul
         healthcheck: Some(healthcheck),
         ..Service::default()
     };
+    if input.oidc.is_some() {
+        service.environment.insert(
+            String::from("X_AUTHELIA_CONFIG_FILTERS"),
+            String::from("template"),
+        );
+    }
     service.set_routes(
         "authelia",
         "authelia",
@@ -189,30 +167,38 @@ pub(super) fn generate(input: &AutheliaConfig, config: &Config) -> anyhow::Resul
         }],
     )?;
     document.services.insert(String::from("authelia"), service);
+    let mut environment = BTreeMap::from([
+        (String::from(VERSION_KEY), input.version.clone()),
+        (
+            String::from(REDIRECTION_KEY),
+            input.default_redirection_url.clone(),
+        ),
+        (
+            String::from(POLICY_KEY),
+            input.default_policy.as_str().to_string(),
+        ),
+        (String::from(USERS_KEY), users_json),
+        (String::from(JWT_SECRET_KEY), input.jwt_secret.clone()),
+        (
+            String::from(SESSION_SECRET_KEY),
+            input.session_secret.clone(),
+        ),
+        (
+            String::from(STORAGE_SECRET_KEY),
+            input.storage_encryption_key.clone(),
+        ),
+    ]);
+    if let Some(oidc) = &input.oidc {
+        environment.insert(String::from(OIDC_HMAC_SECRET_KEY), oidc.hmac_secret.clone());
+        environment.insert(
+            String::from(OIDC_JWK_PRIVATE_KEY),
+            oidc.jwk_private_key.clone(),
+        );
+    }
     let spec = StackSpec {
         name: String::from("authelia"),
         document,
-        environment: BTreeMap::from([
-            (String::from(VERSION_KEY), input.version.clone()),
-            (
-                String::from(REDIRECTION_KEY),
-                input.default_redirection_url.clone(),
-            ),
-            (
-                String::from(POLICY_KEY),
-                input.default_policy.as_str().to_string(),
-            ),
-            (String::from(USERS_KEY), users_json),
-            (String::from(JWT_SECRET_KEY), input.jwt_secret.clone()),
-            (
-                String::from(SESSION_SECRET_KEY),
-                input.session_secret.clone(),
-            ),
-            (
-                String::from(STORAGE_SECRET_KEY),
-                input.storage_encryption_key.clone(),
-            ),
-        ]),
+        environment,
     };
     spec.validate()?;
     Ok(TemplateOutput {
@@ -239,6 +225,13 @@ pub(super) fn export(spec: &StackSpec) -> anyhow::Result<AutheliaConfig> {
         .and_then(|route| route.hosts.into_iter().next())
         .ok_or_else(|| anyhow::anyhow!("authelia 模板缺少认证门户路由"))?;
     let users = serde_json::from_str(required_environment(spec, USERS_KEY)?)?;
+    let oidc = match spec.environment.get(OIDC_HMAC_SECRET_KEY) {
+        Some(hmac_secret) => Some(OidcProviderConfig {
+            hmac_secret: hmac_secret.clone(),
+            jwk_private_key: required_environment(spec, OIDC_JWK_PRIVATE_KEY)?.to_string(),
+        }),
+        None => None,
+    };
     Ok(AutheliaConfig {
         format: FORMAT_VERSION,
         template: String::from("authelia"),
@@ -249,8 +242,15 @@ pub(super) fn export(spec: &StackSpec) -> anyhow::Result<AutheliaConfig> {
         jwt_secret: required_environment(spec, JWT_SECRET_KEY)?.to_string(),
         session_secret: required_environment(spec, SESSION_SECRET_KEY)?.to_string(),
         storage_encryption_key: required_environment(spec, STORAGE_SECRET_KEY)?.to_string(),
+        oidc,
         users,
     })
+}
+
+/// 判断当前 Authelia 项目状态是否启用了 OIDC provider。
+pub(super) fn oidc_enabled(spec: &StackSpec) -> bool {
+    spec.environment.contains_key(OIDC_HMAC_SECRET_KEY)
+        && spec.environment.contains_key(OIDC_JWK_PRIVATE_KEY)
 }
 
 /// 校验 Authelia TOML 的模板、版本、域名、密钥与用户字段。
@@ -267,41 +267,15 @@ fn validate_input(input: &AutheliaConfig, config: &Config) -> anyhow::Result<()>
     validate_secret("jwt_secret", &input.jwt_secret)?;
     validate_secret("session_secret", &input.session_secret)?;
     validate_secret("storage_encryption_key", &input.storage_encryption_key)?;
+    if let Some(oidc) = &input.oidc {
+        oidc.validate()?;
+    }
     if input.users.is_empty() {
         anyhow::bail!("Authelia 至少需要一个声明式用户");
     }
     for (username, user) in &input.users {
         crate::spec::validate_name("Authelia 用户名", username)?;
-        validate_user(username, user)?;
-    }
-    Ok(())
-}
-
-/// 校验单个声明式用户且拒绝明文或占位密码。
-fn validate_user(username: &str, user: &AutheliaUser) -> anyhow::Result<()> {
-    if user.display_name.trim().is_empty()
-        || user.display_name.len() > 128
-        || user.display_name.contains(['\n', '\r'])
-    {
-        anyhow::bail!("Authelia 用户 {username} 的 display_name 无效");
-    }
-    if !user.password_hash.starts_with('$')
-        || user.password_hash.len() < 20
-        || user.password_hash.contains(char::is_whitespace)
-        || user.password_hash.contains("replace-with")
-    {
-        anyhow::bail!("Authelia 用户 {username} 必须使用有效密码哈希，不能填写明文或占位值");
-    }
-    validate_email(&user.email)?;
-    for group in &user.groups {
-        if group.is_empty()
-            || group.len() > 64
-            || !group
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
-            anyhow::bail!("Authelia 用户 {username} 的组名无效: {group}");
-        }
+        users::validate(username, user)?;
     }
     Ok(())
 }
@@ -317,20 +291,6 @@ fn validate_secret(label: &str, value: &str) -> anyhow::Result<()> {
         anyhow::bail!("{label} 必须是至少 32 字符且仅含字母、数字、-、_ 的非占位密钥");
     }
     Ok(())
-}
-
-/// 校验 Authelia 文件用户的邮件地址。
-fn validate_email(value: &str) -> anyhow::Result<()> {
-    if value.len() > 254 || value.chars().any(char::is_whitespace) {
-        anyhow::bail!("Authelia 用户邮件地址无效: {value}");
-    }
-    let (local, domain) = value
-        .rsplit_once('@')
-        .ok_or_else(|| anyhow::anyhow!("Authelia 用户邮件地址无效: {value}"))?;
-    if local.is_empty() {
-        anyhow::bail!("Authelia 用户邮件地址无效: {value}");
-    }
-    validate_domain(domain)
 }
 
 /// 校验默认跳转地址只使用无凭据、无端口的 HTTPS 域名。
@@ -359,33 +319,15 @@ fn expand_host(value: &str, domain: &str) -> anyhow::Result<String> {
 /// 构造 Authelia 拥有的配置、用户数据库和只读密钥文件。
 fn generated_files(input: &AutheliaConfig, domain: &str) -> anyhow::Result<Vec<GeneratedFile>> {
     let host = expand_host(&input.host, domain)?;
-    let users = UserDatabase {
-        users: input
-            .users
-            .iter()
-            .map(|(name, user)| {
-                (
-                    name.as_str(),
-                    UserDatabaseEntry {
-                        disabled: user.disabled,
-                        displayname: &user.display_name,
-                        password: &user.password_hash,
-                        email: &user.email,
-                        groups: &user.groups,
-                    },
-                )
-            })
-            .collect(),
-    };
-    Ok(vec![
+    let mut files = vec![
         generated_file(
             "config/configuration.yml",
-            configuration_yaml(input, domain, &host),
+            configuration_yaml(input, domain, &host)?,
             0o640,
         ),
         generated_file(
             "config/users_database.yml",
-            serde_yaml::to_string(&users)?,
+            users::database_yaml(&input.users)?,
             0o600,
         ),
         generated_file(
@@ -403,7 +345,16 @@ fn generated_files(input: &AutheliaConfig, domain: &str) -> anyhow::Result<Vec<G
             format!("{}\n", input.storage_encryption_key),
             0o600,
         ),
-    ])
+        generated_file(
+            "config/oidc-clients/.nsetup-managed",
+            String::from("应用拥有的 OIDC 客户端片段由 nsetup 管理。\n"),
+            0o640,
+        ),
+    ];
+    if let Some(oidc) = &input.oidc {
+        files.extend(oidc.generated_files());
+    }
+    Ok(files)
 }
 
 /// 构造每次整体应用时都会替换的模板附属文件。
@@ -417,8 +368,8 @@ fn generated_file(path: &str, content: String, mode: u32) -> GeneratedFile {
 }
 
 /// 生成不包含密钥明文的 Authelia YAML 配置。
-fn configuration_yaml(input: &AutheliaConfig, domain: &str, host: &str) -> String {
-    format!(
+fn configuration_yaml(input: &AutheliaConfig, domain: &str, host: &str) -> anyhow::Result<String> {
+    let mut output = format!(
         r#"server:
   address: 'tcp://:9091'
   endpoints:
@@ -427,8 +378,12 @@ fn configuration_yaml(input: &AutheliaConfig, domain: &str, host: &str) -> Strin
         implementation: 'ForwardAuth'
 log:
   level: 'info'
+default_2fa_method: 'totp'
 totp:
+  disable: false
   issuer: '{domain}'
+webauthn:
+  disable: true
 identity_validation:
   reset_password: {{}}
 authentication_backend:
@@ -465,7 +420,11 @@ notifier:
         input.default_policy.as_str(),
         host,
         input.default_redirection_url,
-    )
+    );
+    if let Some(oidc) = &input.oidc {
+        output.push_str(&oidc.configuration_yaml());
+    }
+    Ok(output)
 }
 
 /// 读取 Authelia 导出所需的项目环境字段。
@@ -474,11 +433,6 @@ fn required_environment<'a>(spec: &'a StackSpec, key: &str) -> anyhow::Result<&'
         .get(key)
         .map(String::as_str)
         .ok_or_else(|| anyhow::anyhow!("Authelia 项目 .env 缺少 {key}"))
-}
-
-/// 用于省略 `false` 值的 Serde 辅助函数。
-const fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 /// 返回默认认证门户短主机名。

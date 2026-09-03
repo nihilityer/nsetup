@@ -1,5 +1,6 @@
 //! 服务局部编辑、标签合并与网络语义修改。
 
+use super::operations::oidc_update_suffix;
 use super::{Edit, NetworkEdit, Orchestrator};
 use crate::constants::PROXY_NETWORK;
 use crate::docker;
@@ -80,11 +81,16 @@ impl Orchestrator {
         spec.document.services.insert(service_name.clone(), service);
         clean_unused_networks(&mut spec.document);
         spec.validate()?;
+        let oidc_fragment = self.prepare_oidc_client_fragment(&spec)?;
         self.deploy(&spec, &[], true)?;
+        let oidc_updated = self.sync_oidc_client_fragment(name, oidc_fragment.as_ref())?;
         if edit.start {
             docker::compose_up(&self.config, &self.project_dir(name)?, Some(&service_name))?;
         }
-        Ok(format!("项目 {name} 的服务 {service_name} 已更新"))
+        Ok(format!(
+            "项目 {name} 的服务 {service_name} 已更新{}",
+            oidc_update_suffix(oidc_updated)
+        ))
     }
 }
 

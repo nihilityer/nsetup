@@ -45,12 +45,17 @@ impl Orchestrator {
             if target.is_dir() {
                 copy_auxiliary(&target, &stage)?;
             }
-            if files.iter().any(|file| file.path.starts_with("site")) {
-                let staged_site = stage.join("site");
-                if staged_site.exists() {
-                    fs::remove_dir_all(&staged_site).with_context(|| {
-                        format!("无法替换静态站点目录: {}", staged_site.display())
-                    })?;
+            for owned_directory in ["site", "config/oidc-clients"] {
+                if files
+                    .iter()
+                    .any(|file| file.path.starts_with(owned_directory))
+                {
+                    let staged_directory = stage.join(owned_directory);
+                    if staged_directory.exists() {
+                        fs::remove_dir_all(&staged_directory).with_context(|| {
+                            format!("无法替换受管附属目录: {}", staged_directory.display())
+                        })?;
+                    }
                 }
             }
             write_project_file(

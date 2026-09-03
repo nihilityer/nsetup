@@ -1,8 +1,9 @@
 //! 从当前 IR 状态反解规范化 TOML 声明。
 
 use super::{
-    AppConfig, AppNetwork, AppServiceConfig, FORMAT_VERSION, HealthcheckConfig, StaticConfig,
-    TemplateKind, TemplateRouteProtocol, TraefikConfig, TraefikRouteConfig, TraefikRoutesConfig,
+    AppAutheliaConfig, AppConfig, AppNetwork, AppServiceConfig, FORMAT_VERSION, HealthcheckConfig,
+    StaticConfig, TemplateKind, TemplateRouteProtocol, TraefikConfig, TraefikRouteConfig,
+    TraefikRoutesConfig,
 };
 use crate::config::Config;
 use crate::spec::{
@@ -12,6 +13,8 @@ use std::collections::BTreeMap;
 
 /// 从当前 IR 字段重建应用模板。
 pub(super) fn export_app(spec: &StackSpec) -> anyhow::Result<AppConfig> {
+    let oidc_clients = super::app_oidc_clients(spec)?;
+    let authelia = (!oidc_clients.is_empty()).then_some(AppAutheliaConfig { oidc_clients });
     let mut services = BTreeMap::new();
     for (name, source) in &spec.document.services {
         let (image, version) = source.image_version()?;
@@ -63,6 +66,7 @@ pub(super) fn export_app(spec: &StackSpec) -> anyhow::Result<AppConfig> {
         format: FORMAT_VERSION,
         template: None,
         name: spec.name.clone(),
+        authelia,
         services,
     })
 }
