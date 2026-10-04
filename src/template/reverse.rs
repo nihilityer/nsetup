@@ -153,6 +153,7 @@ pub(super) fn export_traefik(spec: &StackSpec, config: &Config) -> anyhow::Resul
     Ok(TraefikConfig {
         format: FORMAT_VERSION,
         template: String::from("traefik"),
+        name: spec.name.clone(),
         domain,
         acme_email: required_env(spec, "ACME_EMAIL")?,
         cloudflare_token: required_env(spec, "CF_DNS_API_TOKEN")?,
@@ -190,6 +191,9 @@ pub(super) fn export_static(spec: &StackSpec) -> anyhow::Result<StaticConfig> {
         host,
         version: required_env(spec, "NGINX_VERSION")?,
         middlewares: route.middlewares,
+        user: service.user.clone(),
+        group_add: service.group_add.clone(),
+        hooks: spec.project_hooks()?.get("web").cloned(),
     })
 }
 
@@ -299,12 +303,22 @@ pub fn detect_kind(spec: &StackSpec) -> anyhow::Result<TemplateKind> {
 }
 
 /// 判断挂载是否为 `--files` 注入的 `files/` 目录源。
+///
+/// 同一条挂载可能写成绝对路径（`/var/lib/nsetup/stacks/<项目>/files`）或相对项目
+/// 目录的路径（`files`、`./files`）；生成 Compose 时相对写法已经展开为绝对路径，
+/// 因此这里按目录分量比较，导出时把两种来源都过滤掉，避免重新应用时与 `--files`
+/// 自动注入的挂载重复。
 fn is_files_mount(value: &str, project_name: &str) -> bool {
-    let marker = format!(
-        "/{project_name}/{}:",
-        crate::template::files::FILES_DIRECTORY
-    );
-    value.contains(&marker)
+    let Ok(mount) = crate::spec::BindMount::parse(value) else {
+        return false;
+    };
+    let source = std::path::Path::new(mount.host_path.trim_end_matches('/'));
+    let directory = crate::template::files::FILES_DIRECTORY;
+    source.file_name().is_some_and(|name| name == directory)
+        && source
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|name| name == project_name)
 }
 
 /// 从 Compose 网络字段推导高层网络模式。
@@ -342,4 +356,30 @@ fn required_env(spec: &StackSpec, key: &str) -> anyhow::Result<String> {
         .get(key)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("项目 .env 缺少 {key}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_files_mount;
+
+    /// `--files` 注入的挂载无论写成绝对还是相对路径都要在导出时被过滤（R6）。
+    #[test]
+    fn filters_injected_files_mounts() {
+        assert!(is_files_mount(
+            "/var/lib/nsetup/stacks/observability/files:/opt/nsetup/files:ro",
+            "observability"
+        ));
+        assert!(is_files_mount(
+            "/var/lib/nsetup/stacks/observability/./files:/opt/nsetup/files:ro",
+            "observability"
+        ));
+        assert!(!is_files_mount(
+            "files/prometheus:/etc/prometheus:ro",
+            "demo"
+        ));
+        assert!(!is_files_mount(
+            "/srv/data/demo/files/x.yml:/etc/x.yml:ro",
+            "demo"
+        ));
+    }
 }

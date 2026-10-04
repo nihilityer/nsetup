@@ -1,6 +1,6 @@
 //! CLI 本地命令与远程 RPC 命令执行。
 
-use super::args::{AssetsModeArg, Cli, Command};
+use super::args::{AssetsModeArg, AssetsPermsArg, Cli, Command};
 use super::edit::edit_request;
 use super::io::{
     compact_status, read_assets, read_files, read_limited, stdin_is_terminal, write_diagnostic,
@@ -118,7 +118,7 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
                 stack.status
             ))?;
             if args.routes {
-                write_text(&render_routes(&stack.compose_yaml)?)?;
+                write_text(&render_routes(&stack.name, &stack.compose_yaml)?)?;
             } else {
                 write_text(&format!("\n{}", stack.compose_yaml))?;
             }
@@ -162,6 +162,9 @@ async fn run_up(client: &mut RpcClient, args: super::args::UpArgs) -> anyhow::Re
         .transpose()?
         .unwrap_or_default();
     let project_files = read_files(&args.files)?;
+    if args.files_only && assets.is_empty() && project_files.is_empty() {
+        anyhow::bail!("--files-only 需要同时提供 --files 或 --assets，否则没有可同步的内容");
+    }
     let stream = client
         .apply(proto::ApplyRequest {
             config_toml,
@@ -176,6 +179,11 @@ async fn run_up(client: &mut RpcClient, args: super::args::UpArgs) -> anyhow::Re
                 AssetsModeArg::Replace => proto::AssetsMode::Replace as i32,
             },
             files_into: args.files_into,
+            assets_perms: match args.assets_perms {
+                AssetsPermsArg::WorldReadable => proto::AssetsPerms::WorldReadable as i32,
+                AssetsPermsArg::Private => proto::AssetsPerms::Private as i32,
+            },
+            files_only: args.files_only,
         })
         .await?;
     write_operation_stream(stream).await
@@ -285,28 +293,20 @@ async fn run_config(client: &mut RpcClient, args: super::args::ConfigArgs) -> an
 
 /// 从 Compose YAML 渲染解析后的 Traefik 路由表。
 ///
+/// `project` 是项目名：nsetup 生成的 router 名固定为
+/// `nsetup-<项目>-<服务>-<路由>`，不带项目名无法把它们从 label 中还原出来。
+/// 表格同时包含模板生成的路由（来源 `nsetup`）和用户手写 label 的路由（来源
+/// `labels`），并给出 host、path、entrypoint、scheme、priority、backend 与中间件。
+///
 /// # 错误
 ///
 /// Compose YAML 或 Traefik label 无效时返回错误。
-fn render_routes(compose_yaml: &str) -> anyhow::Result<String> {
+fn render_routes(project: &str, compose_yaml: &str) -> anyhow::Result<String> {
     let document: crate::spec::Document =
         serde_yaml::from_str(compose_yaml).context("无法解析项目 Compose YAML")?;
     let mut rows = Vec::new();
     for (service_name, service) in &document.services {
-        for identity in service.user_route_identities()? {
-            rows.push(RouteRow {
-                host: identity.host.clone(),
-                path: identity.path_prefix.clone(),
-                entrypoint: identity.entrypoint.clone(),
-                protocol: identity.protocol.as_str().to_string(),
-                service: service_name.clone(),
-                port: None,
-                middlewares: Vec::new(),
-                priority: None,
-                managed: false,
-            });
-        }
-        for route in service.routes("", service_name)? {
+        for route in service.routes(project, service_name)? {
             for host in &route.hosts {
                 rows.push(RouteRow {
                     host: host.clone(),
@@ -321,14 +321,18 @@ fn render_routes(compose_yaml: &str) -> anyhow::Result<String> {
                 });
             }
         }
+        for row in user_route_rows(service_name, service)? {
+            rows.push(row);
+        }
     }
     if rows.is_empty() {
         return Ok(String::from("该项目没有 Traefik 路由\n"));
     }
     rows.sort_by(|left, right| {
-        (&left.host, &left.path, &left.entrypoint).cmp(&(
+        (&left.host, &left.path, &right.priority, &left.entrypoint).cmp(&(
             &right.host,
             &right.path,
+            &left.priority,
             &right.entrypoint,
         ))
     });
@@ -355,6 +359,34 @@ fn render_routes(compose_yaml: &str) -> anyhow::Result<String> {
         ));
     }
     Ok(output)
+}
+
+/// 把用户手写 label 声明的 router 还原为路由表行。
+///
+/// # 错误
+///
+/// label 不是合法 `KEY=VALUE` 列表时返回错误。
+fn user_route_rows(
+    service_name: &str,
+    service: &crate::spec::Service,
+) -> anyhow::Result<Vec<RouteRow>> {
+    let mut rows = Vec::new();
+    for route in service.user_routes()? {
+        for host in &route.hosts {
+            rows.push(RouteRow {
+                host: host.clone(),
+                path: route.path_prefix.clone().unwrap_or_default(),
+                entrypoint: route.entrypoint.clone(),
+                protocol: route.protocol.as_str().to_string(),
+                service: service_name.to_string(),
+                port: route.container_port,
+                middlewares: route.middlewares.clone(),
+                priority: route.priority,
+                managed: false,
+            });
+        }
+    }
+    Ok(rows)
 }
 
 /// 路由表的一行。
@@ -403,4 +435,72 @@ async fn write_operation_stream(
         anyhow::bail!("daemon 未返回操作完成阶段");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_routes;
+
+    /// `show --routes` 必须列出 nsetup 生成的路由，并区分方案与优先级（R3）。
+    #[test]
+    fn routes_table_lists_generated_routes() -> anyhow::Result<()> {
+        let config = crate::config::Config {
+            stacks_root: std::path::PathBuf::from("/srv/nsetup/stacks"),
+            ..crate::config::Config::default()
+        };
+        let input = r#"
+format = 1
+name = "netbird"
+[services.server]
+image = "netbirdio/netbird"
+version = "0.50.0"
+port = 80
+[services.server.traefik]
+[services.server.traefik.routes.grpc]
+hosts = ["netbird"]
+path_prefix = "/signalexchange.SignalExchange"
+port = 10000
+protocol = "h2c"
+priority = 200
+[services.dashboard]
+image = "netbirdio/dashboard"
+version = "2.0"
+port = 80
+labels = ["traefik.http.routers.custom.rule=Host(`extra.example.com`)", "traefik.http.services.custom.loadbalancer.server.port=8080"]
+[services.dashboard.traefik]
+hosts = ["netbird"]
+path_prefix = "/"
+priority = 1
+"#;
+        let generated = crate::template::apply(input, &config, None)?;
+        let table = render_routes(&generated.spec.name, &generated.spec.compose_yaml()?)?;
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines[0], "最终生效的 Traefik 路由");
+        let generated_row = lines
+            .iter()
+            .find(|line| line.contains("/signalexchange.SignalExchange"))
+            .ok_or_else(|| anyhow::anyhow!("缺少 nsetup 生成的路由: {table}"))?;
+        assert!(generated_row.contains("h2c"), "{generated_row}");
+        assert!(generated_row.contains("\t200\t"), "{generated_row}");
+        assert!(generated_row.contains("server:10000"), "{generated_row}");
+        assert!(generated_row.ends_with("\tnsetup"), "{generated_row}");
+        let label_row = lines
+            .iter()
+            .find(|line| line.starts_with("extra.example.com"))
+            .ok_or_else(|| anyhow::anyhow!("缺少 label 路由: {table}"))?;
+        assert!(label_row.contains("dashboard:8080"), "{label_row}");
+        assert!(label_row.ends_with("\tlabels"), "{label_row}");
+        Ok(())
+    }
+
+    /// 没有路由的项目仍给出明确结论。
+    #[test]
+    fn routes_table_reports_empty_projects() -> anyhow::Result<()> {
+        let compose = "services:\n  web:\n    image: example/web:1\n";
+        assert_eq!(
+            render_routes("plain", compose)?,
+            "该项目没有 Traefik 路由\n"
+        );
+        Ok(())
+    }
 }

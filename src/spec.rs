@@ -344,6 +344,30 @@ pub struct Route {
     pub priority: Option<u32>,
 }
 
+/// 用户手写 label 声明的一条 Traefik 路由。
+///
+/// 与 nsetup 从 `[services.*.traefik]` 生成的 [`Route`] 不同，这里保留 label 里的
+/// 原始表达，供 `nsetup show --routes` 与冲突检查使用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRoute {
+    /// label 中的原始 router 名。
+    pub router: String,
+    /// 规则中声明的全部主机名。
+    pub hosts: Vec<String>,
+    /// 规则中声明的可选路径前缀。
+    pub path_prefix: Option<String>,
+    /// 监听的 entrypoint 列表，已归一化排序。
+    pub entrypoint: String,
+    /// 后端协议。
+    pub protocol: RouteProtocol,
+    /// 后端容器端口；label 未声明时为 `None`。
+    pub container_port: Option<u16>,
+    /// 引用的中间件，保留原始 provider 后缀。
+    pub middlewares: Vec<String>,
+    /// 显式优先级。
+    pub priority: Option<u32>,
+}
+
 /// 受支持的 Traefik 后端协议。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RouteProtocol {

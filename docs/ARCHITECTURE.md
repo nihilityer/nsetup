@@ -525,6 +525,22 @@ bind mount 白名单 = `data_roots` ∪ `stacks_root` ∪ `docker_socket`（精�
 | 应用后重建容器 | 部署会整体替换项目目录，`up --start`（以及 `edit --start`）在项目有运行中容器时使用 `--force-recreate`，避免容器继续持有已被替换的目录 inode。 |
 | RPC 线路协议变化 | `Route.middlewares` 与 `EditRequest.middlewares` 由枚举改为字符串，并新增 `Doctor`、`SetDomain` 两个 RPC。升级时 CLI 与 daemon 必须来自同一版本；跨版本混用时新客户端调用新 RPC 会得到 `unimplemented`，中间件参数会自行校验失败而不是静默丢弃。 |
 
+## 0.2.1 兼容性说明
+
+升级到 0.2.1 时注意以下行为变化：
+
+| 变化 | 说明 |
+| --- | --- |
+| traefik / authelia 声明可省略 `name` | 两个模板的项目名固定为 `traefik` / `authelia`，`name` 可省略也可显式写出；写其它值会明确报错。0.2.0 中这两个模板任何情况都无法应用，0.2.1 修复。`nsetup template traefik\|authelia` 的骨架与 `nsetup export` 的产出都能直接 `nsetup up`。 |
+| `--files` / `--assets` 权限改为 `a+rX` | 上传资源目录由 `0750` 改为 `0755`、文件 `0644`，容器内非 root 进程（如 nginx worker）可以直接读取；需要收紧时用 `nsetup up --assets-perms private`（`0750`/`0640`）。 |
+| static 模板支持 `user` / `group_add` / `[hooks]` | 站点侧可以像 app 模板一样在 TOML 内修正属主与权限，不必再维护 `chmod` 兜底脚本。 |
+| `nsetup show --routes` 完整 | 修复了 router 前缀拼接错误：模板生成的路由（来源 `nsetup`）与用户手写 label 路由（来源 `labels`）会一起列出，并补上 BACKEND 与 PRIORITY 列。 |
+| `volumes` 支持相对项目目录的挂载源 | `files/x.yaml`、`./config` 与绝对路径等价，`stacks_root` 变更时不需要改仓库里的 TOML；命名卷与 `../` 仍被拒绝，展开后仍走白名单。 |
+| 新增 `up --files-only` | 只重新上传 `--files` / `--assets` 并保留现有容器（项目目录 inode 不变），用于同步配置文件内容；不触碰 `compose.yaml`、`.env`，也不执行钩子与 OIDC 同步。 |
+| 钩子输出与失败提示 | 钩子的 stdout/stderr 会作为进度信息回显；失败时的错误包含退出码、完整输出、容器当前状态与补救命令。`nsetup up --help` 说明钩子运行环境与 `/tmp` 只读。 |
+| Authelia `/config` 改为可写挂载 | 官方镜像 entrypoint 会执行 `chown -R ${PUID}:${PGID} /config`（镜像默认 `0:0`），只读挂载会让每次启动都往容器日志写 `chown: ... Read-only file system`；`/secrets` 保持只读。OIDC 片段改为原地重写，不再替换 inode。 |
+| `--restart-dependents` 文案 | 实际执行了重启时提示「已重启 authelia 使新客户端生效」，未重启时附带确切命令 `nsetup restart authelia`。 |
+
 ## 设计约束
 
 - **C1 镜像钉版本**：所有镜像必须带明确标签，拒绝 `latest` 与缺省标签；标签
@@ -540,11 +556,14 @@ bind mount 白名单 = `data_roots` ∪ `stacks_root` ∪ `docker_socket`（精�
   权限见磁盘布局表。
 - **C5 compose 字段子集**：只接受 IR 模型覆盖的 compose 指令，未知字段导入时
   报错。这保证任何项目都能被解析回 IR 进行编辑与导出。
-- **C6 数据路径白名单**：bind mount 源路径必须是绝对路径（相对路径报错），
-  归一化（解析 `.`/`..`、符号链接）后落在 `data_roots` 或 `stacks_root` 前缀
-  内，或等于 `docker_socket` 路径。白名单完全由配置推导，对所有项目（含
-  Traefik）一视同仁。多个应用挂载同一路径以共享数据是合法用法。Docker 启动
-  容器时会自动创建缺失的宿主目录，因此校验发生在任何 `compose up` 之前。
+- **C6 数据路径白名单**：bind mount 源路径可以写成绝对路径（`data_roots`、
+  `stacks_root` 或 `docker_socket` 内），也可以写成相对受管项目目录的路径
+  （`files/x.yaml`、`./config`）。相对写法在生成 Compose 之前展开为项目目录下的
+  绝对路径，再与绝对路径一起做归一化（解析 `.`/`..`、符号链接）与白名单校验。
+  命名卷（`mydata:/data`）与越出项目目录的 `../` 仍然报错。白名单完全由配置
+  推导，对所有项目（含 Traefik）一视同仁。多个应用挂载同一路径以共享数据是
+  合法用法。Docker 启动容器时会自动创建缺失的宿主目录，因此校验发生在任何
+  `compose up` 之前。
 - **C7 禁止命名卷**：持久化数据一律使用白名单内的 bind mount，位置可审计、
   可备份。compose 顶层 `volumes` 段与 `NAME:/path` 语法在导入时报错。
   删除项目只停止容器并删除项目目录，绑定挂载的数据不受影响。

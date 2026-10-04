@@ -51,13 +51,16 @@ impl RpcService {
     }
 
     /// 创建依次报告排队、执行与完成阶段的变更操作流。
+    ///
+    /// 闭包额外收到一个用于投递中间进度的发送端，使钩子输出这类不进入最终结果的
+    /// 信息也能实时回显给 CLI。发送失败只说明客户端已断开，不应中断操作本身。
     fn operation_stream<F>(
         &self,
         running: String,
         operation: F,
     ) -> RpcStream<proto::OperationProgress>
     where
-        F: FnOnce(Arc<Orchestrator>) -> anyhow::Result<String> + Send + 'static,
+        F: FnOnce(Arc<Orchestrator>, ProgressSender) -> anyhow::Result<String> + Send + 'static,
     {
         let manager = Arc::clone(&self.manager);
         let lock = Arc::clone(&self.lock);
@@ -85,7 +88,10 @@ impl RpcService {
             {
                 return;
             }
-            let mut task = tokio::task::spawn_blocking(move || operation(manager));
+            let progress = ProgressSender {
+                sender: sender.clone(),
+            };
+            let mut task = tokio::task::spawn_blocking(move || operation(manager, progress));
             let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
             heartbeat.tick().await;
             let mut elapsed = 0_u64;
@@ -128,6 +134,23 @@ impl RpcService {
 
 /// 拉取镜像与日志 RPC 使用的流类型。
 type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+/// 阻塞的编排操作用来回显中间进度的发送端。
+#[derive(Debug, Clone)]
+struct ProgressSender {
+    /// 操作进度通道发送端。
+    sender: mpsc::Sender<Result<proto::OperationProgress, Status>>,
+}
+
+impl ProgressSender {
+    /// 尽力投递一行中间进度；客户端已断开时静默丢弃。
+    fn report(&self, message: &str) {
+        let _ignored = self.sender.try_send(Ok(proto::OperationProgress {
+            stage: proto::OperationStage::Running as i32,
+            message: message.to_string(),
+        }));
+    }
+}
 
 /// 向仍连接的客户端发送一个修改操作阶段。
 async fn send_operation_progress(
@@ -173,7 +196,7 @@ impl OrchestratorRpc for RpcService {
         let request = request.into_inner();
         Ok(Response::new(self.operation_stream(
             String::from("正在校验并应用项目配置"),
-            move |manager| {
+            move |manager, progress| {
                 let assets: Vec<Asset> = request
                     .assets
                     .iter()
@@ -190,8 +213,10 @@ impl OrchestratorRpc for RpcService {
                         file: GeneratedFile {
                             path: PathBuf::from(template::files::FILES_DIRECTORY).join(&asset.path),
                             content: asset.content.clone(),
-                            mode: 0o644,
+                            mode: template::ASSET_FILE_MODE,
+                            directory_mode: template::ASSET_DIRECTORY_MODE,
                             replace: true,
+                            overwrite: true,
                         },
                     })
                     .collect::<Vec<_>>();
@@ -205,11 +230,17 @@ impl OrchestratorRpc for RpcService {
                     assets: &assets,
                     assets_provided: request.assets_provided || !assets.is_empty(),
                     replace_assets: request.assets_mode == proto::AssetsMode::Replace as i32,
+                    asset_permissions: match proto::AssetsPerms::try_from(request.assets_perms) {
+                        Ok(proto::AssetsPerms::Private) => template::AssetPermissions::Private,
+                        _ => template::AssetPermissions::WorldReadable,
+                    },
                     project_files: &project_files,
                     files_into: &files_into,
                     force: request.force,
                     start: request.start,
                     restart_dependents: request.restart_dependents,
+                    files_only: request.files_only,
+                    report: &|message| progress.report(message),
                 })
             },
         )))
@@ -224,7 +255,7 @@ impl OrchestratorRpc for RpcService {
         let request = request.into_inner();
         Ok(Response::new(self.operation_stream(
             format!("正在导入项目 {}", request.name),
-            move |manager| {
+            move |manager, _progress| {
                 manager.import_compose(
                     &request.name,
                     &request.compose_yaml,
@@ -294,7 +325,7 @@ impl OrchestratorRpc for RpcService {
         let edit = edit_from_proto(request).map_err(|error| status_from_error(&error))?;
         Ok(Response::new(self.operation_stream(
             format!("正在修改项目 {name}"),
-            move |manager| manager.edit(&name, edit),
+            move |manager, _progress| manager.edit(&name, edit),
         )))
     }
 
@@ -326,7 +357,7 @@ impl OrchestratorRpc for RpcService {
         let request = request.into_inner();
         Ok(Response::new(self.operation_stream(
             format!("正在删除项目 {}", request.name),
-            move |manager| manager.remove(&request.name, request.force),
+            move |manager, _progress| manager.remove(&request.name, request.force),
         )))
     }
 
@@ -339,7 +370,7 @@ impl OrchestratorRpc for RpcService {
         let name = request.into_inner().name;
         Ok(Response::new(self.operation_stream(
             format!("正在启动项目 {name}"),
-            move |manager| manager.start(&name),
+            move |manager, _progress| manager.start(&name),
         )))
     }
 
@@ -352,7 +383,7 @@ impl OrchestratorRpc for RpcService {
         let name = request.into_inner().name;
         Ok(Response::new(self.operation_stream(
             format!("正在停止项目 {name}"),
-            move |manager| manager.stop(&name),
+            move |manager, _progress| manager.stop(&name),
         )))
     }
 
@@ -365,7 +396,7 @@ impl OrchestratorRpc for RpcService {
         let name = request.into_inner().name;
         Ok(Response::new(self.operation_stream(
             format!("正在重启项目 {name}"),
-            move |manager| manager.restart(&name),
+            move |manager, _progress| manager.restart(&name),
         )))
     }
 
@@ -425,7 +456,7 @@ impl OrchestratorRpc for RpcService {
         let name = request.into_inner().name;
         Ok(Response::new(self.operation_stream(
             format!("正在构建项目 {name}"),
-            move |manager| manager.build(&name),
+            move |manager, _progress| manager.build(&name),
         )))
     }
 

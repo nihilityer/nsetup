@@ -100,17 +100,32 @@ nsetup up -f app.toml --force --start
 
 需要把宿主机文件交给容器读取时，不必使用 sudo 或一次性特权容器：`--files`
 把路径上传到项目目录的 `files/`，并以只读方式挂到每个服务的
-`/opt/nsetup/files`（用 `--files-into` 改挂载点）。目录参数会展开其中所有文件，
-单个文件参数按文件名上传：
+`/opt/nsetup/files`（用 `--files-into` 改挂载点）。目录参数的内容会**铺平**到
+`files/` 根（不保留目录名），多个 `--files` 会合并，同名目标路径会被拒绝；单个
+文件参数按文件名上传：
 
 ```bash
 nsetup up -f app.toml --files ./netbird.yaml --start
 # 容器内读取 /opt/nsetup/files/netbird.yaml
+nsetup up -f observability.toml --files ./prometheus --start
+# ./prometheus/* 直接落到 files/，容器内读取 /opt/nsetup/files/prometheus.yml
+```
+
+上传目录为 `0755`、文件为 `0644`（`a+rX`），容器内的非 root 进程可以直接读取；
+需要收紧时用 `--assets-perms private`（目录 `0750`、文件 `0640`）。
+
+`volumes` 的挂载源可以写绝对路径，也可以写相对项目目录的路径；相对写法让同一份
+TOML 在 `stacks_root` 变更后仍然可用：
+
+```toml
+[services.prometheus]
+volumes = ["files/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
 ```
 
 一次性初始化动作（建库、生成注册令牌、初始化 owner）用启动钩子声明。钩子在
-daemon 上以项目目录为工作目录、通过 `sh -c` 顺序执行，因此可以使用 shell 语法与
-项目内相对路径；`post_start` 只在 `--start` 时执行：
+daemon 主机上以项目目录为工作目录、通过 `sh -c` 顺序执行，因此可以使用 shell
+语法与项目内相对路径；`pre_start` 在 `compose up` 之前执行，`post_start` 只在
+`--start` 时、于启动之后执行：
 
 ```toml
 [services.gitea.hooks]
@@ -118,7 +133,14 @@ pre_start = ["install -d -m 0755 data"]
 post_start = ["docker exec gitea gitea admin user create --username owner"]
 ```
 
-容器需要以固定用户（尤其 root）读取宿主机文件时使用 `user` 与 `group_add`：
+钩子的运行环境：执行身份是 daemon 的运行用户（systemd 安装下为 root），可写路径
+只有受管项目目录与 `data_roots`，`/tmp` 与其余系统目录在 systemd 沙箱下是**只读**
+的（`ProtectSystem=strict`）。钩子的 stdout/stderr 会作为进度信息回显；失败时报错
+包含退出码、完整输出、容器当前状态与补救命令。完整说明见 `nsetup up --help`
+末尾的「运行环境」一节。
+
+容器需要以固定用户（尤其 root）读取宿主机文件时使用 `user` 与 `group_add`；
+static 模板同样支持这两个字段与顶层 `[hooks]`：
 
 ```toml
 [services.otel-collector]
@@ -147,6 +169,9 @@ nsetup up -f authelia.toml --start
 nsetup up -f app.toml --start
 ```
 
+`traefik` / `authelia` 模板的项目名固定，`name` 可以省略；`nsetup template` 的骨架与
+`nsetup export` 的产出都可以直接 `nsetup up`。
+
 Authelia 的用户、TOTP、ForwardAuth、OIDC 和密钥操作见
 [Authelia 认证](AUTHELIA.md)。
 
@@ -159,6 +184,21 @@ nsetup up -f static.toml --assets ./dist --start
 nsetup up -f static.toml --assets ./dist --assets-mode replace --force --start
 ```
 
+上传后的站点目录是 `0755`、文件 `0644`，官方 nginx 镜像的 worker（UID 101）可以
+直接读取；需要收紧权限时加 `--assets-perms private`。
+
+### 只同步资源（不重建容器）
+
+改动只涉及 `--files` / `--assets` 的内容时，用 `--files-only` 跳过 Compose 重建：
+项目目录 inode 不变，运行中容器的 bind mount 立即看到新内容：
+
+```bash
+nsetup up -f observability.toml --files ./prometheus --files-only
+```
+
+该模式只同步资源，不写 `compose.yaml` / `.env`，也不执行钩子与 OIDC 客户端同步；
+声明本身有变化（镜像版本、路由、端口等）时仍要正常执行一次 `nsetup up --force`。
+
 ## 导入、编辑与导出
 
 导入既有 Compose 项目：
@@ -168,8 +208,9 @@ nsetup import media -f compose.yaml --env-file .env --start
 ```
 
 IR 不支持但常见于生产文件的字段（`version`、`depends_on`、`deploy`、`x-*` 等）
-会被忽略，并在结果中列出清单；命名卷、相对 bind mount、未固定版本镜像等影响安全
-的字段仍会被拒绝。局部编辑单个服务或导出当前状态：
+会被忽略，并在结果中列出清单；命名卷、相对 bind mount（导入路径要求可审计的绝对
+路径，TOML 模板另见上文）、未固定版本镜像等影响安全的字段仍会被拒绝。局部编辑单个
+服务或导出当前状态：
 
 ```bash
 nsetup edit media --service web --version 1.1 --start
@@ -201,7 +242,10 @@ nsetup rm media
 而不是返回 `not a terminal`。
 
 自查域名 404 / 502 时使用 `doctor`；它比对容器上的 Traefik label 与 Traefik 实际
-加载的 router，列出未被接管的服务与原因，并在发现问题时以非零状态退出：
+加载的 router，列出未被接管的服务与原因，并在发现问题时以非零状态退出。
+`show --routes` 输出该项目最终生效的完整路由表：模板生成的（来源 `nsetup`）与用户
+手写 label 的（来源 `labels`）一起列出，包含 HOST、PATH、ENTRYPOINT、SCHEME、
+PRIORITY、BACKEND（`服务:端口`）与 MIDDLEWARES：
 
 ```bash
 nsetup show media --routes

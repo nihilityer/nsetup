@@ -150,9 +150,13 @@ hosts = ["media"]
 # require_pkce = true、token_endpoint_auth_method = "none"。
 
 # 需要把宿主机文件交给容器读取时，用 nsetup up -f app.toml --files ./config 上传：
-# 目录内容会写入项目目录的 files/ 并以只读方式挂到 /opt/nsetup/files
-# （可用 --files-into 改挂载点），无需 sudo 或一次性特权容器。
-# netbird 的 config.yaml 之类可以在 TOML 中直接引用 /opt/nsetup/files/config.yaml。
+# 目录内容会铺到项目目录的 files/ 并以只读方式挂到 /opt/nsetup/files
+# （可用 --files-into 改挂载点），无需 sudo 或一次性特权容器；上传目录为 0755、
+# 文件为 0644，容器内非 root 进程可以直接读取。
+# volumes 的挂载源可以写相对项目目录的路径，例如 files/config.yaml，这样更换
+# stacks_root 后 TOML 无需修改。
+# 只改了 files/ 内容、不需要重建容器时用 nsetup up -f app.toml --files ./config
+# --files-only：它只同步资源，不写 compose.yaml/.env，也不执行钩子。
 
 # 多服务项目继续增加 [services.<名称>]；每个服务至少需要 image 与 version。
 # [services.worker]
@@ -177,6 +181,8 @@ pub(super) const AUTHELIA_SKELETON: &str = r#"# Authelia 基础认证设施模�
 # 不请求 UserInfo 的应用必须为客户端配置 claims_policy 才能拿到 email/name/groups。
 format = 1
 template = "authelia"
+# 项目名固定为 authelia；这里显式写出只为与 app 模板保持一致，也可以省略。
+name = "authelia"
 host = "auth"
 version = "4.39.20"
 default_redirection_url = "https://example.com"
@@ -208,6 +214,12 @@ storage_encryption_key = "replace-with-at-least-32-random-characters"
 # tracing_address = "udp://otel-collector:4318"
 # tracing_sample_rate = 0.5
 
+# 生成的 Compose 把 config/ 以可写方式挂到 /config、secrets/ 只读挂到 /secrets。
+# 官方镜像的 entrypoint 会按 PUID/PGID（镜像默认 0:0）执行 chown -R /config，
+# 只读挂载会因此持续往容器日志写 `chown: ... Read-only file system`。
+# 需要以非 root 运行 Authelia 时，同时设置 PUID/PGID 与 user，并确保 secrets/
+# 中的只读密钥对该 UID 可读。
+
 [users.admin]
 display_name = "Administrator"
 password_hash = '$argon2id$replace-with-generated-password-hash'
@@ -219,6 +231,8 @@ groups = ["admins"]
 pub(super) const TRAEFIK_SKELETON: &str = r#"# 反向代理基础设施模板
 format = 1
 template = "traefik"
+# 项目名固定为 traefik；这里显式写出只为与 app 模板保持一致，也可以省略。
+name = "traefik"
 domain = "example.com"
 acme_email = "admin@example.com"
 cloudflare_token = "replace-me"
@@ -253,10 +267,25 @@ pub(super) const STATIC_SKELETON: &str = r#"# 静态 Nginx 站点；使用 --ass
 # 只读方式获得整个项目目录（/opt/nsetup），放入 nginx.conf 即可改写服务方式；
 # 默认站点配置由 config/nginx/default.conf 提供。
 # --assets-mode merge（默认）只覆盖同名文件，需要删除已下线文件时用 replace。
+# 上传后的站点目录为 0755、文件为 0644（a+rX），因此 nginx worker（UID 101）等
+# 非 root 进程可以直接读取，不再需要 chmod 兜底脚本；需要收紧权限时用
+# nsetup up --assets-perms private 上传（目录 0750、文件 0640）。
 format = 1
 template = "static"
 name = "docs"
 host = "docs"
 version = "1.27"
 middlewares = ["gzip"]
+
+# 容器运行用户与补充组。默认沿用镜像的 root 主进程 + nginx 用户 worker；需要让
+# 站点目录整体由固定用户读取时可以显式指定 UID[:GID]。
+# user = "101:101"
+# group_add = ["988"]
+
+# 可选启动钩子。在 daemon 上以项目目录为工作目录、通过 sh -c 执行；pre_start 在
+# compose up 之前、post_start 之后，post_start 仅在 --start 时运行。
+# 钩子用于站点侧修正属主/权限，例如把上传目录交给容器内的固定 UID：
+# [hooks]
+# pre_start = ["chmod -R a+rX site"]
+# post_start = ["docker exec docs-web-1 nginx -s reload"]
 "#;

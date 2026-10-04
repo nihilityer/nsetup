@@ -4,6 +4,16 @@
 OIDC provider。运行状态保存在第一个 `data_root` 的 `authelia/` 下，删除项目不会
 删除这些状态。
 
+生成的 Compose 把项目里的 `config/` **可写**挂到 `/config`、`secrets/` 只读挂到
+`/secrets`、`data_root` 挂到 `/data`。`/config` 必须可写：官方镜像的 entrypoint 在
+`PUID`/`PGID` 为 0（镜像默认值）时执行 `chown -R 0:0 /config`，只读挂载会让它每次
+启动都往容器日志写 `chown: /config/...: Read-only file system`，淹没真实错误。需要
+以非 root 运行 Authelia 时，同时设置 `PUID`/`PGID` 与 `user`，并确认 `secrets/` 中的
+只读密钥对该 UID 可读。
+
+OIDC 客户端片段（`config/oidc-clients/<项目>.yml`）在更新时**原地重写**，不替换
+inode，因此容器 entrypoint 改过的属主不会被下一次 `up` 悄悄改回；写入权限只提不降。
+
 ## 初始化
 
 先生成模板和密码哈希，再为三个基础密钥分别生成随机值：

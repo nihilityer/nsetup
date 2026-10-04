@@ -9,9 +9,12 @@ socket 调用，无需反复使用 `sudo`，也不会默认开放管理端口。
 - 用 TOML 声明并管理单服务、多服务和静态站点；
 - 生成 Traefik 与 Authelia 基础设施，同一域名下按路径或协议拆分多条路由；
 - 用 `--files` 上传宿主机文件、用 `[services.*.hooks]` 声明一次性初始化，无需 sudo；
+- 用 `--files-only` 只同步配置文件内容而不重建容器，用相对项目目录的 `volumes`
+  挂载源避免写死 `stacks_root`；
 - 导入既有 Compose 项目（忽略不支持字段并列出清单），并从当前状态导出 TOML；
 - 统一执行启动、停止、升级、日志和删除等操作；
-- 用 `nsetup doctor` 比对容器 label 与 Traefik 实际加载的路由；
+- 用 `nsetup show <项目> --routes` 查看模板生成与 label 声明的完整生效路由表，
+  用 `nsetup doctor` 比对容器 label 与 Traefik 实际加载的路由；
 - 限制 bind mount 根目录，并支持带 token 的远程 daemon。
 
 ## 快速开始
@@ -64,3 +67,7 @@ cargo test --quiet
 cargo clippy --all-targets --quiet -- -D warnings
 git diff --check
 ```
+
+需要真实 daemon 与 Docker 的端到端验收（R1–R8、上传权限、路由表、钩子、相对挂载、
+`--files-only`、Authelia 挂载）用 `tests/e2e/run.sh`，它会在临时目录里起一个前台
+daemon，不需要 root；详见 [tests/e2e/README.md](tests/e2e/README.md)。

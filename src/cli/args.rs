@@ -81,6 +81,9 @@ pub enum Command {
     /// 输出带注释的 TOML 模板骨架。
     Template(TemplateArgs),
     /// 应用 TOML 模板声明。
+    ///
+    /// 钩子与上传目录的语义见下方「运行环境」与「资源上传」两节。
+    #[command(after_help = UP_AFTER_HELP)]
     Up(UpArgs),
     /// 导入受支持的 Compose YAML 项目。
     Import(ImportArgs),
@@ -147,6 +150,29 @@ pub struct TemplateArgs {
     pub name: String,
 }
 
+/// `up` 帮助末尾的钩子与资源上传说明。
+const UP_AFTER_HELP: &str = "\
+运行环境（[services.<服务>.hooks]，static 模板为顶层 [hooks]）：
+  执行位置   daemon 主机，不进入容器；通过 sh -c 逐条执行，工作目录是项目目录
+  执行身份   daemon 的运行身份（systemd 安装下是 root）
+  可写路径   受管项目目录与 daemon 的 data_roots
+  只读路径   /tmp 与其余系统目录（ProtectSystem=strict）；不要在钩子里写 /tmp
+  执行顺序   pre_start 在 compose up 之前，post_start 仅在带 --start 时、于启动之后
+  输出可见   stdout/stderr 会作为进度信息回显；失败时错误包含退出码与容器当前状态
+  环境变量   PATH/HOME/LANG 继承自 daemon 的环境
+
+资源上传（--files / --assets）：
+  --files <路径>       目录内容铺到项目 files/ 根（不保留目录名），多个 --files 合并；
+                       同名目标路径会被拒绝；单文件按文件名上传
+  --files-into <目标>  files/ 在容器内的挂载点，默认 /opt/nsetup/files，不是宿主侧重命名
+  --assets <目录>      仅 static 模板；写入项目 site/ 并挂载到 /usr/share/nginx/html
+  --assets-mode        merge 只覆盖同名文件，replace 先清空站点目录
+  --assets-perms       a+rX（默认，目录 0755、文件 0644）或 private（0750/0640）
+  --files-only         只同步上述资源，保留现有容器不做重建
+
+volumes 的挂载源可以写绝对路径（data_roots 或项目目录内），也可以写相对项目目录的
+路径，例如 files/prometheus/prometheus.yml 或 ./files/x.yaml。";
+
 /// `up` 接受的参数。
 #[derive(Debug, Args)]
 pub struct UpArgs {
@@ -165,11 +191,23 @@ pub struct UpArgs {
     )]
     pub assets_mode: AssetsModeArg,
     /// 上传到项目 `files/` 目录并挂载进容器的文件或目录；可重复指定。
+    ///
+    /// 目录参数以其内容铺到项目 `files/` 根（不保留目录名），多个 `--files`
+    /// 会合并，重复的目标路径会被拒绝；`--files-into` 是容器内的挂载点，
+    /// 不是宿主侧的重命名。
     #[arg(long = "files", value_name = "路径")]
     pub files: Vec<PathBuf>,
     /// `--files` 在容器内的挂载目标。
     #[arg(long, default_value = "/opt/nsetup/files", hide_default_value = true)]
     pub files_into: String,
+    /// `--assets` 上传后的权限策略：`a+rX`（默认）或 `private`。
+    #[arg(
+        long,
+        default_value = "a+rX",
+        hide_default_value = true,
+        hide_possible_values = true
+    )]
+    pub assets_perms: AssetsPermsArg,
     /// 应用成功后启动项目。
     #[arg(long)]
     pub start: bool,
@@ -179,6 +217,9 @@ pub struct UpArgs {
     /// Authelia OIDC 客户端变化后顺带重启 authelia。
     #[arg(long)]
     pub restart_dependents: bool,
+    /// 只重新上传 `--files` / `--assets`，保留现有容器不做任何重建。
+    #[arg(long)]
+    pub files_only: bool,
 }
 
 /// `import` 接受的参数。
@@ -266,6 +307,16 @@ pub enum AssetsModeArg {
     Merge,
     /// 先清空站点目录再写入上传的文件。
     Replace,
+}
+
+/// `--assets` 上传后的权限策略。
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AssetsPermsArg {
+    /// 目录 0755、文件 0644：容器内非 root 进程可直接读取。
+    #[value(name = "a+rX")]
+    WorldReadable,
+    /// 目录 0750、文件 0640：仅属主与属组可读，需要自行处理容器内权限。
+    Private,
 }
 
 /// 简单项目命令共用的参数。

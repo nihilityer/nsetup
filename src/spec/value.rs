@@ -83,9 +83,13 @@ impl PublishedPort {
 impl BindMount {
     /// 解析 bind mount 并拒绝命名卷。
     ///
+    /// 宿主机侧支持三种写法：以 `/` 开头的绝对路径、以 `./` 开头或直接以名字开头的
+    /// 项目内相对路径（例如 `files/prometheus/prometheus.yml`）。相对路径由 daemon
+    /// 按受管项目目录解析并校验，因此 `stacks_root` 变更时不需要修改仓库里的 TOML。
+    ///
     /// # 错误
     ///
-    /// 遇到命名卷、相对路径或无效目标时返回错误。
+    /// 遇到命名卷、无效相对路径或无效目标时返回错误。
     pub fn parse(value: &str) -> anyhow::Result<Self> {
         let parts: Vec<&str> = value.split(':').collect();
         let (host_path, container_path, read_only) = match parts.as_slice() {
@@ -94,7 +98,12 @@ impl BindMount {
             [_, _, mode] => anyhow::bail!("卷挂载模式仅支持 ro: {mode}"),
             _ => anyhow::bail!("卷挂载格式必须是 HOST:CONTAINER[:ro]: {value}"),
         };
-        if !Path::new(host_path).is_absolute() {
+        let host_path = host_path.trim();
+        if host_path.starts_with('/') {
+            // 绝对路径：继续由部署期的白名单校验，见 Orchestrator::validate_mounts。
+        } else if is_project_relative_source(host_path) {
+            validate_project_relative_source(host_path)?;
+        } else {
             anyhow::bail!("禁止命名卷或相对 bind mount: {host_path}");
         }
         if !Path::new(container_path).is_absolute() {
@@ -107,6 +116,22 @@ impl BindMount {
         })
     }
 
+    /// 判断宿主机源是否为相对受管项目目录的路径。
+    #[must_use]
+    pub fn is_project_relative(&self) -> bool {
+        !self.host_path.starts_with('/')
+    }
+
+    /// 将相对项目目录的源解析为绝对路径；绝对路径原样返回。
+    #[must_use]
+    pub fn resolved_host_path(&self, project_directory: &Path) -> std::path::PathBuf {
+        if self.is_project_relative() {
+            project_directory.join(&self.host_path)
+        } else {
+            std::path::PathBuf::from(&self.host_path)
+        }
+    }
+
     /// 将 bind mount 序列化为规范短语法。
     #[must_use]
     pub fn compose_value(&self) -> String {
@@ -117,6 +142,64 @@ impl BindMount {
             if self.read_only { ":ro" } else { "" }
         )
     }
+}
+
+/// 判断宿主机源是否像项目内相对路径，而不是命名卷。
+///
+/// `./x`、`../x` 是明确的相对路径；没有 `.` 前缀时要求至少含一个 `/`，从而把
+/// `mydata` 这类命名卷与 `files/x.yaml` 这类相对路径区分开。
+fn is_project_relative_source(value: &str) -> bool {
+    value.starts_with("./") || value.starts_with("../") || value.contains('/')
+}
+
+/// 校验项目内相对挂载源不越出项目目录。
+///
+/// # 错误
+///
+/// 路径为空、指向上级目录或含非法分量时返回错误。
+fn validate_project_relative_source(value: &str) -> anyhow::Result<()> {
+    let path = Path::new(value);
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("bind mount 宿主机源不能为空");
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            std::path::Component::CurDir => {}
+            _ => anyhow::bail!(
+                "相对 bind mount 必须是项目目录内的路径，不能包含 ..、根或前缀: {value}"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// 归一化绝对路径，移除 `.` 与多余的 `..` 分量。
+///
+/// # 错误
+///
+/// 路径不是绝对路径或 `..` 越出根目录时返回错误。
+pub(super) fn normalize_absolute_path(path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("路径必须是绝对路径: {}", path.display());
+    }
+    let mut output = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => output.push(Path::new("/")),
+            std::path::Component::Normal(value) => output.push(value),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !output.pop() {
+                    anyhow::bail!("路径越出根目录: {}", path.display());
+                }
+            }
+            std::path::Component::Prefix(_) => {
+                anyhow::bail!("不支持的平台路径: {}", path.display());
+            }
+        }
+    }
+    Ok(output)
 }
 
 impl Healthcheck {
@@ -419,4 +502,57 @@ pub(super) fn validate_docker_object_name(label: &str, value: &str) -> anyhow::R
         anyhow::bail!("{label}无效: {value}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BindMount;
+
+    /// 挂载源支持绝对路径与相对项目目录两种写法（R6）。
+    #[test]
+    fn bind_mount_accepts_project_relative_sources() -> anyhow::Result<()> {
+        let relative =
+            BindMount::parse("files/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro")?;
+        assert!(relative.is_project_relative());
+        assert!(relative.read_only);
+        assert_eq!(
+            relative.resolved_host_path(std::path::Path::new("/srv/stacks/demo")),
+            std::path::Path::new("/srv/stacks/demo/files/prometheus/prometheus.yml")
+        );
+
+        let dotted = BindMount::parse("./files:/opt/files:ro")?;
+        assert!(dotted.is_project_relative());
+
+        let absolute = BindMount::parse("/srv/data/demo:/data")?;
+        assert!(!absolute.is_project_relative());
+        assert_eq!(
+            absolute.resolved_host_path(std::path::Path::new("/srv/stacks/demo")),
+            std::path::Path::new("/srv/data/demo")
+        );
+        Ok(())
+    }
+
+    /// 命名卷与越出项目目录的相对路径仍然被拒绝。
+    #[test]
+    fn bind_mount_rejects_named_volumes_and_escapes() {
+        assert!(BindMount::parse("mydata:/data").is_err());
+        assert!(BindMount::parse("../outside:/data").is_err());
+        assert!(BindMount::parse("files/../../etc:/data").is_err());
+        assert!(BindMount::parse("./files:relative/target").is_err());
+    }
+
+    /// 绝对路径分量被归一化，去掉多余的 `.`（R6）。
+    #[test]
+    fn normalizes_absolute_paths() -> anyhow::Result<()> {
+        assert_eq!(
+            super::normalize_absolute_path(std::path::Path::new("/srv/stacks/demo/./files"))?,
+            std::path::Path::new("/srv/stacks/demo/files")
+        );
+        assert_eq!(
+            super::normalize_absolute_path(std::path::Path::new("/srv/one/../two"))?,
+            std::path::Path::new("/srv/two")
+        );
+        assert!(super::normalize_absolute_path(std::path::Path::new("relative")).is_err());
+        Ok(())
+    }
 }

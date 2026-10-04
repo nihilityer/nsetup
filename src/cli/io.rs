@@ -256,11 +256,7 @@ mod tests {
     /// 含密钥的导出文件始终只允许所有者读写。
     #[test]
     fn export_file_uses_private_permissions() -> anyhow::Result<()> {
-        let path = std::env::temp_dir().join(format!(
-            "nsetup-export-test-{}-{:016x}.toml",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
+        let path = crate::test_support::temp_path("nsetup-export-test")?.with_extension("toml");
         write_new_file(&path, b"format = 1\n")?;
         let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
         std::fs::remove_file(&path)?;

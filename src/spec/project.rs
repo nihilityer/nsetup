@@ -143,6 +143,42 @@ impl StackSpec {
         Ok(())
     }
 
+    /// 把相对受管项目目录的 bind mount 源展开为绝对路径。
+    ///
+    /// Compose 只把 `./`、`../` 或绝对路径当作宿主路径，其余短语法一律按命名卷处理；
+    /// 因此 TOML 里允许的 `files/x.yaml` 这类写法必须在生成 Compose 之前展开为
+    /// 项目目录下的绝对路径。展开结果仍受部署期白名单约束。
+    ///
+    /// # 错误
+    ///
+    /// 项目目录不是绝对路径或挂载书写无效时返回错误。
+    pub fn resolve_relative_mounts(&mut self, project_directory: &Path) -> anyhow::Result<()> {
+        if !project_directory.is_absolute() {
+            anyhow::bail!("项目目录必须是绝对路径: {}", project_directory.display());
+        }
+        for (name, service) in &mut self.document.services {
+            for value in &mut service.volumes {
+                let mount = BindMount::parse(value)?;
+                if mount.is_project_relative() {
+                    *value = BindMount {
+                        // 归一化掉 `.` 分量，得到 `/…/<项目>/files/x.yaml` 这样的路径。
+                        host_path: super::value::normalize_absolute_path(
+                            &mount.resolved_host_path(project_directory),
+                        )?
+                        .display()
+                        .to_string(),
+                        ..mount
+                    }
+                    .compose_value();
+                }
+            }
+            if service.volumes.iter().any(|value| value.is_empty()) {
+                anyhow::bail!("服务 {name} 的 bind mount 展开为空");
+            }
+        }
+        Ok(())
+    }
+
     /// 返回仅由 IR 生成的规范化 Compose YAML。
     ///
     /// # 错误

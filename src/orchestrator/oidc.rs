@@ -107,10 +107,11 @@ impl Orchestrator {
         }
     }
 
-    /// 应用客户端片段变更，返回是否真的改动了 Authelia 项目的状态。
+    /// 应用客户端片段变更，返回是否真的改动了 Authelia 项目的状态，以及是否顺带重启。
     ///
     /// `restart_dependents` 为真且确实发生变更时，顺带重启已部署的 Authelia 项目；
-    /// Authelia 只在进程启动时读取客户端片段，不重启则新客户端不会生效。
+    /// Authelia 只在进程启动时读取客户端片段，不重启则新客户端不会生效。返回值里的
+    /// 重启标记用于生成与实际行为一致的提示文案。
     ///
     /// # 错误
     ///
@@ -120,12 +121,13 @@ impl Orchestrator {
         project_name: &str,
         change: OidcChange,
         restart_dependents: bool,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<(bool, bool)> {
         let updated = self.write_oidc_change(project_name, change)?;
-        if updated && restart_dependents && self.authelia_deployed()? {
-            crate::docker::compose_restart(&self.config, &self.project_dir("authelia")?)?;
+        if !updated || !restart_dependents || !self.authelia_deployed()? {
+            return Ok((updated, false));
         }
-        Ok(updated)
+        crate::docker::compose_restart(&self.config, &self.project_dir("authelia")?)?;
+        Ok((updated, true))
     }
 
     /// 将单个项目的期望客户端片段写入或移出已部署的 Authelia 项目。

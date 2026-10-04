@@ -110,6 +110,20 @@ message ApplyRequest {
   AssetsMode assets_mode = 8;
   // `--files` 在容器内的挂载目标。
   string files_into = 9;
+  // `--assets` 上传后的权限策略。
+  AssetsPerms assets_perms = 10;
+  // 只重新上传 `--files` / `--assets`，保留现有容器。
+  bool files_only = 11;
+}
+
+// `--assets` 上传后的权限策略。
+enum AssetsPerms {
+  // 未指定时按 a+rX 处理：目录 0755、文件 0644，容器内非 root 进程可读。
+  ASSETS_PERMS_UNSPECIFIED = 0;
+  // a+rX：目录 0755、文件 0644。
+  ASSETS_PERMS_WORLD_READABLE = 1;
+  // 仅属主与属组可读：目录 0750、文件 0640。
+  ASSETS_PERMS_PRIVATE = 2;
 }
 
 // `--assets` 与既有站点内容的合并方式。

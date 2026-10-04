@@ -1,6 +1,6 @@
 [package]
 name = "nsetup"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["nihilityer"]
 description = "Nihility 机器守护进程及其 nsetup 管理 CLI"

@@ -2,13 +2,170 @@
 
 use crate::config::set_mode;
 use crate::constants::{COMPOSE_FILE, ENV_FILE};
-use crate::template::GeneratedFile;
+use crate::template::{GeneratedFile, TemplateOutput};
 use anyhow::Context;
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+
+impl super::Orchestrator {
+    /// 只在现有项目目录内更新上传资源，不替换目录也不重建容器。
+    ///
+    /// `--files-only` 用于同步配置文件内容：项目目录本身保持不变，运行中容器的
+    /// bind mount 会立刻看到新内容。站点目录按 `--assets-mode` 语义同步，`files/`
+    /// 目录与整体部署保持一致，只保留本次 `--files` 上传的内容。
+    ///
+    /// # 错误
+    ///
+    /// 项目尚未部署、路径不安全或写入失败时返回错误。
+    pub(super) fn sync_files(
+        &self,
+        project: &str,
+        generated: &TemplateOutput,
+    ) -> anyhow::Result<()> {
+        if generated.files.is_empty() {
+            return Ok(());
+        }
+        let directory = self.existing_project_dir(project)?;
+        // 先确认项目状态完整，避免把资源写进一个半成品目录。
+        let _spec = crate::spec::StackSpec::load(&directory)?;
+        validate_generated_files(&generated.files)?;
+        let owned: Vec<&Path> = super::OWNED_DIRECTORIES.iter().map(Path::new).collect();
+        for owned_directory in &owned {
+            sync_owned_directory(&directory, owned_directory, &generated.files)?;
+        }
+        for file in &generated.files {
+            if owned.iter().any(|owned| is_owned_file(file, owned)) {
+                continue;
+            }
+            write_attachment(&directory, file, file.directory_mode)?;
+        }
+        Ok(())
+    }
+}
+
+/// 判断一个附属文件是否属于某个受管目录。
+///
+/// 按目录分量比较，避免 `config` 把 `config/nginx` 之外的 `configx` 也算进来。
+#[must_use]
+pub(super) fn is_owned_file(file: &GeneratedFile, owned: &Path) -> bool {
+    file.path.starts_with(owned)
+}
+
+/// 写入一个受管目录的全部附属文件，并保留声明为「不替换」的既有文件。
+///
+/// 受管目录在重新应用时整体重写，才能清掉上一次部署残留的陈旧文件；但 `replace`
+/// 为假的上传（`--assets-mode merge`）必须保留未上传的既有文件，模板里由用户拥有的
+/// 文件（例如 traefik 的 `config/dynamic/custom.yml`）也不允许被清掉。因此在重写前
+/// 先把这些文件读进内存，重写后再还原，最后统一写盘。
+///
+/// # 错误
+///
+/// 目录不是普通目录、读取既有文件或写入失败时返回错误。
+pub(super) fn sync_owned_directory(
+    root: &Path,
+    owned: &Path,
+    files: &[GeneratedFile],
+) -> anyhow::Result<()> {
+    // 附属文件路径相对项目根（`files/x.yaml`），先折算成相对受管目录的路径，
+    // 才能直接写进 `root/<受管目录>/`。
+    let mut relative_files = Vec::new();
+    for file in files.iter().filter(|file| is_owned_file(file, owned)) {
+        relative_files.push(GeneratedFile {
+            path: relative_path(&file.path, owned)?,
+            ..file.clone()
+        });
+    }
+    if relative_files.is_empty() {
+        return Ok(());
+    }
+    let directory = root.join(owned);
+    // 先把声明为「不替换」的既有文件读进内存，再决定是否清空目录。
+    let preserved = stage_preserved_files(&directory, &relative_files)?;
+    // 只有出现整体替换的上传时才清空目录，否则 `merge` 会丢掉既有文件。
+    if relative_files.iter().any(|file| file.replace) {
+        reset_owned_directory(&directory, true)?;
+    }
+    if !directory.exists() {
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("无法创建受管附属目录: {}", directory.display()))?;
+        set_mode(&directory, relative_files[0].directory_mode)?;
+    }
+    for file in preserved.iter().chain(relative_files.iter()) {
+        write_attachment(&directory, file, file.directory_mode)?;
+    }
+    Ok(())
+}
+
+/// 剥掉受管目录前缀，得到相对该目录的路径。
+///
+/// # 错误
+///
+/// 路径不属于该受管目录时返回错误。
+fn relative_path(path: &Path, owned: &Path) -> anyhow::Result<PathBuf> {
+    path.strip_prefix(owned)
+        .map(Path::to_path_buf)
+        .map_err(|_| anyhow::anyhow!("附属文件越出受管目录: {}", path.display()))
+}
+
+/// 把受管目录中声明为「不替换」的既有文件读入内存，供目录重写后还原。
+///
+/// 返回的文件路径已改为相对受管目录，可以交给 [`write_attachment`] 直接写回。
+///
+/// # 错误
+///
+/// 既有路径不是普通文件或无法读取时返回错误。
+fn stage_preserved_files(
+    directory: &Path,
+    relative_files: &[GeneratedFile],
+) -> anyhow::Result<Vec<GeneratedFile>> {
+    let mut preserved = Vec::new();
+    for file in relative_files.iter().filter(|file| !file.replace) {
+        let source = directory.join(&file.path);
+        let metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            anyhow::bail!("受管附属路径不是普通文件: {}", source.display());
+        }
+        preserved.push(GeneratedFile {
+            content: fs::read(&source)
+                .with_context(|| format!("无法读取既有附属文件: {}", source.display()))?,
+            directory_mode: metadata.permissions().mode() & 0o777,
+            ..file.clone()
+        });
+    }
+    Ok(preserved)
+}
+
+/// 删除一个受管目录，使其只保留本次写入的内容。
+///
+/// `reset` 为假时保持目录现状。
+///
+/// # 错误
+///
+/// 目标不是普通目录或删除失败时返回错误。
+pub(super) fn reset_owned_directory(directory: &Path, reset: bool) -> anyhow::Result<()> {
+    if !reset {
+        return Ok(());
+    }
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            anyhow::bail!("受管附属目录不安全: {}", directory.display());
+        }
+        Ok(_) => {
+            fs::remove_dir_all(directory)
+                .with_context(|| format!("无法替换受管附属目录: {}", directory.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
 
 /// 对可能不存在的路径，解析其最长现有前缀中的符号链接。
 pub(super) fn resolve_existing_prefix(path: &Path) -> anyhow::Result<PathBuf> {
@@ -125,7 +282,7 @@ pub(super) fn write_attachment(
 ) -> anyhow::Result<()> {
     validate_relative_path(&file.path)?;
     let destination = root.join(&file.path);
-    if !file.replace && destination.is_file() {
+    if !file.overwrite && destination.is_file() {
         return Ok(());
     }
     let parent = destination
@@ -142,6 +299,10 @@ pub(super) fn write_attachment(
 
 /// 原子替换项目内的单个受管附属文件。
 ///
+/// 目标已存在时改为原地重写：改名会换掉 inode 属主，让容器内读取该文件的进程
+/// （例如 Authelia 读取 OIDC 客户端片段）拿到一个属主不明的新文件，也会在只读
+/// 挂载上留下孤儿临时文件。原地写入只改内容，属主与属组保持不变。
+///
 /// # 错误
 ///
 /// 路径不安全、父目录被符号链接占用或写入失败时返回错误。
@@ -156,10 +317,15 @@ pub(super) fn replace_attachment(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("附属文件缺少父目录"))?;
     create_safe_directories(root, parent, directory_mode)?;
-    if let Ok(metadata) = fs::symlink_metadata(&destination)
-        && (!metadata.is_file() || metadata.file_type().is_symlink())
-    {
-        anyhow::bail!("拒绝覆盖非普通文件: {}", destination.display());
+    let mut mode = file.mode;
+    if let Ok(metadata) = fs::symlink_metadata(&destination) {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            anyhow::bail!("拒绝覆盖非普通文件: {}", destination.display());
+        }
+        // 只提权、不降权：容器内 entrypoint（例如 Authelia 的 `chown -R 0:0 /config`）
+        // 可能已经把文件改成更严格或更宽松的属主与权限，原地重写时保留可读性。
+        mode = mode.max(metadata.permissions().mode() & 0o777);
+        return write_project_file(&destination, &file.content, mode);
     }
     let temporary = sibling_temporary(&destination, "replace")?;
     if temporary.exists() {
@@ -223,9 +389,17 @@ fn create_safe_directories(
 pub(super) fn write_project_file(path: &Path, content: &[u8], mode: u32) -> anyhow::Result<()> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true).mode(mode);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("无法写入文件: {}", path.display()))?;
+    let mut file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            anyhow::anyhow!(
+                "无法写入文件: {}（属主没有写权限；容器内的 entrypoint 可能已把它 chown 给别的用户，\
+                 请以 root 运行 nsetup 或手工修正属主）",
+                path.display()
+            )
+        } else {
+            anyhow::Error::new(error).context(format!("无法写入文件: {}", path.display()))
+        }
+    })?;
     file.write_all(content)?;
     file.sync_all()?;
     set_mode(path, mode)
@@ -243,8 +417,6 @@ pub(super) fn sibling_temporary(target: &Path, kind: &str) -> anyhow::Result<Pat
         rand::random::<u64>()
     )))
 }
-
-use std::os::unix::fs::PermissionsExt;
 
 #[cfg(test)]
 mod tests {
@@ -264,5 +436,146 @@ mod tests {
             Path::new("/srv/data/two")
         );
         Ok(())
+    }
+
+    // 受管资源同步测试（R7）。
+    use crate::config::Config;
+    use crate::orchestrator::Orchestrator;
+    use crate::template::{GeneratedFile, TemplateKind, TemplateOutput};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+
+    /// `--files-only` 只改内容：项目目录 inode 不变，运行中容器才不需要重建（R7）。
+    #[test]
+    fn files_only_sync_keeps_project_inode() -> anyhow::Result<()> {
+        let root = crate::test_support::temp_directory("nsetup-files-only")?;
+        let project = root.join("demo");
+        std::fs::create_dir(&project)?;
+        std::fs::write(
+            project.join(crate::constants::COMPOSE_FILE),
+            "services:\n  web:\n    image: example/web:1\n",
+        )?;
+        std::fs::write(project.join(crate::constants::ENV_FILE), "")?;
+        std::fs::create_dir(project.join("files"))?;
+        std::fs::write(project.join("files/stale.yaml"), "stale: true\n")?;
+        let before = std::fs::metadata(&project)?.ino();
+
+        let manager = Orchestrator::new(Config {
+            stacks_root: root.clone(),
+            ..Config::default()
+        })?;
+        let generated = TemplateOutput {
+            spec: crate::spec::StackSpec::load(&project)?,
+            files: vec![GeneratedFile {
+                path: PathBuf::from("files/fresh.yaml"),
+                content: b"fresh: true\n".to_vec(),
+                mode: crate::template::ASSET_FILE_MODE,
+                directory_mode: crate::template::ASSET_DIRECTORY_MODE,
+                replace: true,
+                overwrite: true,
+            }],
+            kind: TemplateKind::App,
+        };
+        manager.sync_files("demo", &generated)?;
+
+        assert_eq!(before, std::fs::metadata(&project)?.ino());
+        assert_eq!(
+            std::fs::read_to_string(project.join("files/fresh.yaml"))?,
+            "fresh: true\n"
+        );
+        assert!(
+            !project.join("files/stale.yaml").exists(),
+            "受管 files/ 目录应只保留本次上传的内容"
+        );
+        Ok(())
+    }
+
+    /// 未部署的项目不能只同步资源，否则会写出半成品目录（R7）。
+    #[test]
+    fn files_only_requires_deployed_project() -> anyhow::Result<()> {
+        let root = crate::test_support::temp_directory("nsetup-files-only-missing")?;
+        let manager = Orchestrator::new(Config {
+            stacks_root: root,
+            ..Config::default()
+        })?;
+        let generated = TemplateOutput {
+            spec: crate::spec::StackSpec::parse(
+                "demo",
+                "services:\n  web:\n    image: example/web:1\n",
+                "",
+            )?,
+            files: vec![GeneratedFile {
+                path: PathBuf::from("files/fresh.yaml"),
+                content: b"fresh: true\n".to_vec(),
+                mode: crate::template::ASSET_FILE_MODE,
+                directory_mode: crate::template::ASSET_DIRECTORY_MODE,
+                replace: true,
+                overwrite: true,
+            }],
+            kind: TemplateKind::App,
+        };
+        assert!(manager.sync_files("demo", &generated).is_err());
+        Ok(())
+    }
+
+    /// 受管目录的写入语义：`replace` 清空陈旧文件，非 `replace` 保留既有内容。
+    #[test]
+    fn owned_directory_sync_follows_replace_semantics() -> anyhow::Result<()> {
+        let root = crate::test_support::temp_directory("nsetup-reset-owned")?;
+        let site = root.join("site");
+        std::fs::create_dir(&site)?;
+        std::fs::write(site.join("kept.html"), "kept")?;
+
+        // merge：只覆盖同名文件，既有文件必须保留。
+        let merge = vec![file("site/index.html", false)];
+        super::sync_owned_directory(&root, std::path::Path::new("site"), &merge)?;
+        assert!(site.join("kept.html").is_file());
+        assert_eq!(
+            std::fs::read_to_string(site.join("index.html"))?,
+            "generated\n"
+        );
+        std::fs::write(site.join("stale.html"), "stale")?;
+
+        // replace：清空目录后只写入本次上传的内容。
+        let replace = vec![file("site/index.html", true)];
+        super::sync_owned_directory(&root, std::path::Path::new("site"), &replace)?;
+        assert!(!site.join("kept.html").exists());
+        assert!(!site.join("stale.html").exists());
+        assert!(site.join("index.html").is_file());
+
+        // 用户拥有的文件（replace = false）在整体重写后必须被还原。
+        let mixed = vec![
+            file("config/dynamic/nsetup.yml", true),
+            user_file("config/dynamic/custom.yml"),
+        ];
+        let dynamic = root.join("config/dynamic");
+        std::fs::create_dir_all(&dynamic)?;
+        std::fs::write(dynamic.join("custom.yml"), "用户自己的路由")?;
+        super::sync_owned_directory(&root, std::path::Path::new("config/dynamic"), &mixed)?;
+        assert_eq!(
+            std::fs::read_to_string(dynamic.join("custom.yml"))?,
+            "用户自己的路由"
+        );
+        Ok(())
+    }
+
+    /// 构造一个受管附属文件描述。
+    fn file(path: &str, replace: bool) -> GeneratedFile {
+        GeneratedFile {
+            path: PathBuf::from(path),
+            content: b"generated\n".to_vec(),
+            mode: crate::template::ASSET_FILE_MODE,
+            directory_mode: crate::template::ASSET_DIRECTORY_MODE,
+            replace,
+            overwrite: true,
+        }
+    }
+
+    /// 构造一个「用户拥有」的附属文件描述：不整体替换，也不覆盖既有内容。
+    fn user_file(path: &str) -> GeneratedFile {
+        GeneratedFile {
+            overwrite: false,
+            ..file(path, false)
+        }
     }
 }

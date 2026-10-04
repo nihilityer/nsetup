@@ -3,7 +3,8 @@
 use super::GeneratedFile;
 use super::{
     APP_OIDC_CLIENTS_KEY, AppConfig, AppNetwork, AppServiceConfig, FORMAT_VERSION,
-    HealthcheckCommand, HealthcheckConfig, StaticConfig, TemplateKind, TemplateOutput, oidc,
+    HealthcheckCommand, HealthcheckConfig, PRIVATE_DIRECTORY_MODE, StaticConfig, TemplateKind,
+    TemplateOutput, oidc,
 };
 use crate::config::Config;
 use crate::spec::{
@@ -136,6 +137,15 @@ pub(super) fn generate_static(
     validate_name("项目名", &input.name)?;
     validate_version(&input.version)?;
     validate_middlewares(&input.middlewares)?;
+    if let Some(user) = &input.user {
+        validate_user(user)?;
+    }
+    for group in &input.group_add {
+        validate_group(group)?;
+    }
+    if let Some(hooks) = &input.hooks {
+        validate_hooks("static 服务 web", hooks)?;
+    }
     let host = expand_host(&input.host, &config.domain)?;
     let directory = config.stacks_root.join(&input.name);
     let mut document = Document::default();
@@ -161,6 +171,8 @@ pub(super) fn generate_static(
             ),
         ]),
         labels: vec![String::from("io.nsetup.template=static")],
+        user: input.user,
+        group_add: input.group_add,
         ..Service::default()
     };
     service.set_routes(
@@ -180,11 +192,18 @@ pub(super) fn generate_static(
         }],
     )?;
     document.services.insert(String::from("web"), service);
-    let spec = StackSpec {
+    let mut spec = StackSpec {
         name: input.name,
         document,
         environment: BTreeMap::from([(String::from("NGINX_VERSION"), input.version)]),
     };
+    if let Some(service_hooks) = &input.hooks {
+        let mut hooks = BTreeMap::new();
+        if !service_hooks.is_empty() {
+            hooks.insert(String::from("web"), service_hooks.clone());
+        }
+        spec.set_project_hooks(&hooks)?;
+    }
     spec.validate()?;
     Ok(TemplateOutput {
         spec,
@@ -203,7 +222,9 @@ fn static_files() -> Vec<GeneratedFile> {
         path: PathBuf::from("config/nginx/default.conf"),
         content: STATIC_NGINX_CONFIG.as_bytes().to_vec(),
         mode: 0o644,
+        directory_mode: PRIVATE_DIRECTORY_MODE,
         replace: true,
+        overwrite: true,
     }]
 }
 

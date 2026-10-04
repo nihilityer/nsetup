@@ -548,12 +548,7 @@ mod tests {
     /// 隐藏暂存目录必须使用真实项目名，不能把非法目录名交给 Compose。
     #[test]
     fn staged_compose_uses_managed_project_name() -> anyhow::Result<()> {
-        let directory = std::env::temp_dir().join(format!(
-            ".traefik.stage-{}-{:016x}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        std::fs::create_dir(&directory)?;
+        let directory = crate::test_support::temp_directory(".traefik.stage")?;
         std::fs::write(
             directory.join(crate::constants::COMPOSE_FILE),
             "services:\n  traefik:\n    image: traefik:v3.8.0\n",

@@ -11,6 +11,9 @@ mod orchestrator;
 mod rpc;
 mod spec;
 mod template;
+/// 单元测试共用的临时目录辅助。
+#[cfg(test)]
+mod test_support;
 
 /// 解析命令行并运行选定的二进制角色。
 #[tokio::main]

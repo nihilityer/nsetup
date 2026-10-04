@@ -91,7 +91,7 @@ impl Orchestrator {
         spec.validate()?;
         let oidc_change = self.prepare_oidc_change(&spec)?;
         self.deploy(&spec, &[], true)?;
-        let oidc_updated = self.apply_oidc_change(name, oidc_change, true)?;
+        let (oidc_updated, oidc_restarted) = self.apply_oidc_change(name, oidc_change, true)?;
         if edit.start {
             docker::compose_up(
                 &self.config,
@@ -102,7 +102,7 @@ impl Orchestrator {
         }
         Ok(format!(
             "项目 {name} 的服务 {service_name} 已更新{}",
-            oidc_update_suffix(oidc_updated)
+            oidc_update_suffix(oidc_updated, oidc_restarted)
         ))
     }
 }

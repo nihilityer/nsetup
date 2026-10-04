@@ -25,7 +25,8 @@ const DYNAMIC_FILE: &str = "nsetup.yml";
 /// 将 Traefik TOML 转换为 IR 与附属文件。
 pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result<TemplateOutput> {
     validate(input)?;
-    let directory = config.stacks_root.join("traefik");
+    let project = input.name.as_str();
+    let directory = config.stacks_root.join(project);
     let dashboard_host = format!("traefik.{}", input.domain);
     let mut document = Document::default();
     document.networks.insert(
@@ -71,8 +72,8 @@ pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result
         ..Service::default()
     };
     service.set_routes(
-        "traefik",
-        "traefik",
+        project,
+        project,
         &[crate::spec::Route {
             name: String::from("dashboard"),
             hosts: vec![dashboard_host],
@@ -103,7 +104,7 @@ pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result
         );
     }
     let spec = StackSpec {
-        name: String::from("traefik"),
+        name: project.to_string(),
         document,
         environment,
     };
@@ -115,7 +116,9 @@ pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result
                 path: PathBuf::from("config/dynamic").join(DYNAMIC_FILE),
                 content: dynamic_config(input).into_bytes(),
                 mode: 0o640,
+                directory_mode: crate::template::PRIVATE_DIRECTORY_MODE,
                 replace: true,
+                overwrite: true,
             },
             // 用户可以在同一目录里追加自己的动态配置文件，traefik 的 file
             // provider 会加载目录中的全部 `*.yml`，因此 `nsetup up` 重写
@@ -124,13 +127,19 @@ pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result
                 path: PathBuf::from("config/dynamic/custom.yml"),
                 content: USER_DYNAMIC_TEMPLATE.as_bytes().to_vec(),
                 mode: 0o640,
+                directory_mode: crate::template::PRIVATE_DIRECTORY_MODE,
                 replace: false,
+                // 用户拥有的文件：只做首次生成，之后不再覆盖。
+                overwrite: false,
             },
             GeneratedFile {
                 path: PathBuf::from("config/acme.json"),
                 content: b"{}\n".to_vec(),
                 mode: 0o600,
+                directory_mode: crate::template::PRIVATE_DIRECTORY_MODE,
                 replace: false,
+                // 已签发的 ACME 证书不能被覆盖，否则每次应用都会重新申请。
+                overwrite: false,
             },
         ],
         kind: TemplateKind::Traefik,
@@ -349,6 +358,12 @@ fn validate(input: &TraefikConfig) -> anyhow::Result<()> {
     }
     if input.template != "traefik" {
         anyhow::bail!("Traefik 配置的 template 必须为 traefik");
+    }
+    if input.name != "traefik" {
+        anyhow::bail!(
+            "Traefik 模板的项目名固定为 traefik，不能声明 name = \"{}\"",
+            input.name
+        );
     }
     crate::config::validate_domain(&input.domain)?;
     validate_version(&input.version)?;

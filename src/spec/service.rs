@@ -3,7 +3,7 @@
 use super::value::validate_tagged_image;
 use super::{
     DEFAULT_ENTRYPOINT, HTTPS_ENTRYPOINT, Route, RouteBinding, RouteIdentity, RouteProtocol,
-    Service, split_tagged_image, validate_version,
+    Service, UserRoute, split_tagged_image, validate_version,
 };
 use crate::constants::PROXY_NETWORK;
 use anyhow::Context;
@@ -137,10 +137,46 @@ impl Service {
     /// 自定义 router（例如 `HostRegexp`）不参与 host 冲突判定，而不是让整个项目
     /// 校验失败。`traefik.enable=false` 的路由不会被 Traefik 加载，同样跳过。
     ///
+    /// 跨项目冲突判定只看 nsetup 自己生成的路由，因此该转换目前只用于回归测试
+    /// 验证 label 解析语义。
+    ///
     /// # 错误
     ///
     /// labels 本身不是合法 `KEY=VALUE` 列表时返回错误。
+    #[cfg(test)]
     pub fn user_route_identities(&self) -> anyhow::Result<Vec<RouteIdentity>> {
+        let mut identities: Vec<RouteIdentity> = self
+            .user_routes()?
+            .into_iter()
+            .flat_map(|route| {
+                route
+                    .hosts
+                    .iter()
+                    .map(|host| {
+                        RouteIdentity::new(
+                            host.clone(),
+                            route.path_prefix.as_deref(),
+                            &route.entrypoint,
+                            route.protocol,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        identities.sort();
+        identities.dedup();
+        Ok(identities)
+    }
+
+    /// 展开用户手写 label 声明的每个 router，用于诊断输出。
+    ///
+    /// 与 [`Self::user_route_identities`] 共用同一份解析逻辑：无法解析出主机名的
+    /// router 被跳过，`traefik.enable=false` 时不返回任何路由。
+    ///
+    /// # 错误
+    ///
+    /// labels 本身不是合法 `KEY=VALUE` 列表时返回错误。
+    pub fn user_routes(&self) -> anyhow::Result<Vec<UserRoute>> {
         let labels = label_map(&self.labels)?;
         if labels
             .get("traefik.enable")
@@ -148,7 +184,7 @@ impl Service {
         {
             return Ok(Vec::new());
         }
-        let mut identities = Vec::new();
+        let mut routes = Vec::new();
         for (key, rule) in &labels {
             let Some(rest) = key.strip_prefix("traefik.http.routers.") else {
                 continue;
@@ -156,32 +192,54 @@ impl Service {
             let Some(router) = rest.strip_suffix(".rule") else {
                 continue;
             };
+            // nsetup 生成的路由由 IR 侧统一渲染，这里只看用户手写 label。
             if router.starts_with("nsetup-") || !rule.contains("Host(") {
                 continue;
             }
             let Ok(hosts) = parse_hosts(rule) else {
                 continue;
             };
-            let path_prefix = parse_path_prefix(rule);
-            let entrypoint = labels
-                .get(&format!("traefik.http.routers.{router}.entrypoints"))
-                .map_or_else(
-                    || String::from(DEFAULT_ENTRYPOINT),
-                    |value| normalize_entrypoints(value),
-                );
-            let protocol = labels
-                .get(&format!(
-                    "traefik.http.services.{router}.loadbalancer.server.scheme"
-                ))
-                .and_then(|value| RouteProtocol::parse(value).ok())
-                .unwrap_or_default();
-            identities.extend(hosts.into_iter().map(|host| {
-                RouteIdentity::new(host, path_prefix.as_deref(), &entrypoint, protocol)
-            }));
+            let backend = labels
+                .get(&format!("traefik.http.routers.{router}.service"))
+                .cloned()
+                .unwrap_or_else(|| router.to_string());
+            routes.push(UserRoute {
+                router: router.to_string(),
+                hosts,
+                path_prefix: parse_path_prefix(rule),
+                entrypoint: labels
+                    .get(&format!("traefik.http.routers.{router}.entrypoints"))
+                    .map_or_else(
+                        || String::from(DEFAULT_ENTRYPOINT),
+                        |value| normalize_entrypoints(value),
+                    ),
+                protocol: labels
+                    .get(&format!(
+                        "traefik.http.services.{backend}.loadbalancer.server.scheme"
+                    ))
+                    .and_then(|value| RouteProtocol::parse(value).ok())
+                    .unwrap_or_default(),
+                container_port: labels
+                    .get(&format!(
+                        "traefik.http.services.{backend}.loadbalancer.server.port"
+                    ))
+                    .and_then(|value| value.parse::<u16>().ok()),
+                middlewares: labels
+                    .get(&format!("traefik.http.routers.{router}.middlewares"))
+                    .map(|value| {
+                        value
+                            .split(',')
+                            .filter(|item| !item.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                priority: labels
+                    .get(&format!("traefik.http.routers.{router}.priority"))
+                    .and_then(|value| value.parse::<u32>().ok()),
+            });
         }
-        identities.sort();
-        identities.dedup();
-        Ok(identities)
+        Ok(routes)
     }
 
     /// 替换为此项目服务生成的全部 label，并保留用户手写的 Traefik label。
@@ -370,7 +428,7 @@ pub(super) fn label_map(labels: &[String]) -> anyhow::Result<BTreeMap<String, St
 }
 
 /// 从 Traefik 规则提取主机名参数。
-pub(super) fn parse_hosts(rule: &str) -> anyhow::Result<Vec<String>> {
+pub fn parse_hosts(rule: &str) -> anyhow::Result<Vec<String>> {
     let mut hosts = Vec::new();
     let mut remaining = rule;
     while let Some(offset) = remaining.find("Host(") {
@@ -407,14 +465,14 @@ fn is_generated_traefik_key(key: &str) -> bool {
 }
 
 /// 从生成的 Traefik 规则提取可选路径前缀。
-fn parse_path_prefix(rule: &str) -> Option<String> {
+pub fn parse_path_prefix(rule: &str) -> Option<String> {
     let start = rule.find("PathPrefix(`")? + 12;
     let end = rule[start..].find("`)")? + start;
     Some(rule[start..end].to_string())
 }
 
 /// 归一化 label 中的 entrypoint 列表。
-fn normalize_entrypoints(value: &str) -> String {
+pub fn normalize_entrypoints(value: &str) -> String {
     let mut names: Vec<&str> = value
         .split(',')
         .map(str::trim)

@@ -39,6 +39,9 @@ const OIDC_CLAIMS_POLICIES_KEY: &str = "NSETUP_AUTHELIA_OIDC_CLAIMS_POLICIES_JSO
 const TELEMETRY_KEY: &str = "NSETUP_AUTHELIA_TELEMETRY_JSON";
 
 /// Authelia 基础认证设施的 TOML 文档。
+///
+/// 项目名固定为 `authelia`；这里的 `name` 只用于兼容通用头部写法与导出结果，
+/// 声明时必须与模板一致。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AutheliaConfig {
@@ -46,6 +49,9 @@ pub(super) struct AutheliaConfig {
     pub format: u32,
     /// 必填模板选择器。
     pub template: String,
+    /// 可选项目名；省略或写 `authelia` 均可。
+    #[serde(default = "super::default_authelia_name")]
+    pub name: String,
     /// 认证门户的短主机名或完整域名。
     #[serde(default = "default_host")]
     pub host: String,
@@ -206,8 +212,9 @@ impl AutheliaPolicy {
 /// 从 TOML 生成 Authelia 项目、配置文件和文件型密钥。
 pub(super) fn generate(input: &AutheliaConfig, config: &Config) -> anyhow::Result<TemplateOutput> {
     validate_input(input, config)?;
+    let project = input.name.as_str();
     let host = expand_host(&input.host, &config.domain)?;
-    let directory = config.stacks_root.join("authelia");
+    let directory = config.stacks_root.join(project);
     let data_directory = config
         .data_roots
         .first()
@@ -233,7 +240,10 @@ pub(super) fn generate(input: &AutheliaConfig, config: &Config) -> anyhow::Resul
         restart: Some(String::from("unless-stopped")),
         networks: vec![String::from("proxy")],
         volumes: vec![
-            format!("{}:/config:ro", directory.join("config").display()),
+            // `/config` 必须可写：官方镜像的 entrypoint 在 PUID/PGID 为 0 时执行
+            // `chown -R 0:0 /config`（镜像默认值就是 0），只读挂载会让每次启动都往
+            // 容器日志刷 `chown: ... Read-only file system`。密钥目录保持只读。
+            format!("{}:/config", directory.join("config").display()),
             format!("{}:/secrets:ro", directory.join("secrets").display()),
             format!("{}:/data", data_directory.display()),
         ],
@@ -321,7 +331,7 @@ pub(super) fn generate(input: &AutheliaConfig, config: &Config) -> anyhow::Resul
         );
     }
     let spec = StackSpec {
-        name: String::from("authelia"),
+        name: project.to_string(),
         document,
         environment,
     };
@@ -364,6 +374,7 @@ pub(super) fn export(spec: &StackSpec) -> anyhow::Result<AutheliaConfig> {
     Ok(AutheliaConfig {
         format: FORMAT_VERSION,
         template: String::from("authelia"),
+        name: spec.name.clone(),
         host,
         version: required_environment(spec, VERSION_KEY)?.to_string(),
         default_redirection_url: required_environment(spec, REDIRECTION_KEY)?.to_string(),
@@ -393,6 +404,12 @@ fn validate_input(input: &AutheliaConfig, config: &Config) -> anyhow::Result<()>
     }
     if input.template != "authelia" {
         anyhow::bail!("Authelia 配置的 template 必须为 authelia");
+    }
+    if input.name != "authelia" {
+        anyhow::bail!(
+            "Authelia 模板的项目名固定为 authelia，不能声明 name = \"{}\"",
+            input.name
+        );
     }
     crate::spec::validate_version(&input.version)?;
     let _host = expand_host(&input.host, &config.domain)?;
@@ -499,7 +516,9 @@ fn generated_file(path: &str, content: String, mode: u32) -> GeneratedFile {
         path: PathBuf::from(path),
         content: content.into_bytes(),
         mode,
+        directory_mode: super::PRIVATE_DIRECTORY_MODE,
         replace: true,
+        overwrite: true,
     }
 }
 

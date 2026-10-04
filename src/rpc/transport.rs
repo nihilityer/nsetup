@@ -42,8 +42,16 @@ async fn serve_unix(config: Config, socket: PathBuf) -> anyhow::Result<()> {
         .output()
         .context("无法设置 gRPC socket 属组")?;
     if !output.status.success() {
-        anyhow::bail!(
-            "无法设置 gRPC socket 属组: {}",
+        // systemd 安装以 root 运行，属组必须设置成功；手工在普通用户下前台调试
+        // daemon 时无权 chown，此时保留进程属主即可，不应让调试无法进行。
+        if is_root()? {
+            anyhow::bail!(
+                "无法设置 gRPC socket 属组: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        tracing::warn!(
+            "无法设置 gRPC socket 属组（当前非 root，仅本次调试）：{}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -109,6 +117,22 @@ fn prepare_socket(socket: &Path) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+/// 判断当前进程的有效用户是否为 root。
+///
+/// # 错误
+///
+/// 无法执行 `id -u` 时返回错误。
+fn is_root() -> anyhow::Result<bool> {
+    let output = Command::new("id")
+        .arg("-u")
+        .output()
+        .context("无法检查当前用户")?;
+    if !output.status.success() {
+        anyhow::bail!("id -u 失败，无法确认当前用户");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "0")
 }
 
 /// 使用固定工作量比较校验 TCP Bearer 元数据。

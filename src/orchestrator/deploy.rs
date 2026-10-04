@@ -2,8 +2,8 @@
 
 use super::Orchestrator;
 use super::storage::{
-    copy_auxiliary, resolve_existing_prefix, sibling_temporary, validate_generated_files,
-    write_attachment, write_project_file,
+    copy_auxiliary, is_owned_file, resolve_existing_prefix, sibling_temporary,
+    sync_owned_directory, validate_generated_files, write_attachment, write_project_file,
 };
 use crate::config::set_mode;
 use crate::constants::{COMPOSE_FILE, ENV_FILE};
@@ -49,19 +49,12 @@ impl Orchestrator {
             if target.is_dir() {
                 copy_auxiliary(&target, &stage)?;
             }
-            // 受管目录在重新应用时整体替换，避免残留上一次部署的陈旧文件。
-            for owned_directory in super::OWNED_DIRECTORIES {
-                if files
-                    .iter()
-                    .any(|file| file.path.starts_with(owned_directory))
-                {
-                    let staged_directory = stage.join(owned_directory);
-                    if staged_directory.exists() {
-                        fs::remove_dir_all(&staged_directory).with_context(|| {
-                            format!("无法替换受管附属目录: {}", staged_directory.display())
-                        })?;
-                    }
-                }
+            // 受管目录在重新应用时整体重写，避免残留上一次部署的陈旧文件；声明为
+            // 「不替换」的文件（merge 上传、用户拥有的 custom.yml）会被保留。
+            let owned_directories: Vec<&Path> =
+                super::OWNED_DIRECTORIES.iter().map(Path::new).collect();
+            for owned in &owned_directories {
+                sync_owned_directory(&stage, owned, files)?;
             }
             write_project_file(
                 &stage.join(COMPOSE_FILE),
@@ -70,7 +63,13 @@ impl Orchestrator {
             )?;
             write_project_file(&stage.join(ENV_FILE), spec.env_file().as_bytes(), 0o600)?;
             for file in files {
-                write_attachment(&stage, file, 0o750)?;
+                if owned_directories
+                    .iter()
+                    .any(|owned| is_owned_file(file, owned))
+                {
+                    continue;
+                }
+                write_attachment(&stage, file, file.directory_mode)?;
             }
             let _validated = docker::compose_config(&self.config, &stage, &spec.name)?;
             self.commit_stage(&stage, &target, &spec.name)?;
@@ -114,6 +113,9 @@ impl Orchestrator {
     }
 
     /// 解析 bind mount 源路径并执行由配置推导的白名单。
+    ///
+    /// 绝对路径必须位于 `data_roots` 或 `stacks_root` 内；相对路径按本项目的目录
+    /// 解析，因此天然落在受管项目目录内，但仍会再走一次同一份白名单校验。
     fn validate_mounts(&self, spec: &StackSpec) -> anyhow::Result<()> {
         let roots: Vec<PathBuf> = self
             .config
@@ -123,10 +125,12 @@ impl Orchestrator {
             .map(|path| resolve_existing_prefix(path))
             .collect::<anyhow::Result<_>>()?;
         let docker_socket = resolve_existing_prefix(&self.config.docker_socket)?;
+        let project_directory = self.project_dir(&spec.name)?;
         for (service_name, service) in &spec.document.services {
             for value in &service.volumes {
                 let mount = BindMount::parse(value)?;
-                let source = resolve_existing_prefix(Path::new(&mount.host_path))?;
+                let source =
+                    resolve_existing_prefix(&mount.resolved_host_path(&project_directory))?;
                 let allowed =
                     source == docker_socket || roots.iter().any(|root| source.starts_with(root));
                 if !allowed {

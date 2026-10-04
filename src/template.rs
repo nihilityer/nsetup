@@ -32,6 +32,37 @@ use skeleton::{APP_SKELETON, AUTHELIA_SKELETON, STATIC_SKELETON, TRAEFIK_SKELETO
 
 /// 当前面向用户的配置格式版本。
 pub const FORMAT_VERSION: u32 = 1;
+/// 模板拥有的附属目录默认权限：只有属主与属组可以进入。
+pub const PRIVATE_DIRECTORY_MODE: u32 = 0o750;
+/// 上传给容器读取的目录权限（`a+rX`），保证非 root 进程可以穿行。
+pub const ASSET_DIRECTORY_MODE: u32 = 0o755;
+/// 上传给容器读取的文件权限（`a+rX`）。
+pub const ASSET_FILE_MODE: u32 = 0o644;
+/// `--assets-perms private` 使用的目录权限，仅属主与属组可读。
+pub const PRIVATE_ASSET_DIRECTORY_MODE: u32 = 0o750;
+/// `--assets-perms private` 使用的文件权限，仅属主与属组可读。
+pub const PRIVATE_ASSET_FILE_MODE: u32 = 0o640;
+
+/// 上传资源在受管项目目录中使用的权限策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AssetPermissions {
+    /// 默认策略 `a+rX`：目录 `0755`、文件 `0644`，容器内非 root 进程可直接读取。
+    #[default]
+    WorldReadable,
+    /// 仅属主与属组可读：目录 `0750`、文件 `0640`，适合需要自行收紧权限的场景。
+    Private,
+}
+
+impl AssetPermissions {
+    /// 返回目录与文件权限模式。
+    #[must_use]
+    pub const fn modes(self) -> (u32, u32) {
+        match self {
+            Self::WorldReadable => (ASSET_DIRECTORY_MODE, ASSET_FILE_MODE),
+            Self::Private => (PRIVATE_ASSET_DIRECTORY_MODE, PRIVATE_ASSET_FILE_MODE),
+        }
+    }
+}
 /// app 模板在项目 `.env` 中持久化 OIDC 客户端映射的键。
 const APP_OIDC_CLIENTS_KEY: &str = "NSETUP_APP_AUTHELIA_OIDC_CLIENTS_JSON";
 
@@ -44,8 +75,21 @@ pub struct GeneratedFile {
     pub content: Vec<u8>,
     /// Unix 权限模式。
     pub mode: u32,
-    /// 是否替换已复制的现有附属文件。
+    /// 新建父目录时使用的 Unix 权限模式。
+    ///
+    /// 模板拥有的配置沿用私有目录；交给容器内非 root 进程读取的上传资源必须使用
+    /// `0755`，否则容器无法穿行目录。
+    pub directory_mode: u32,
+    /// 部署时是否清空所属受管目录。
+    ///
+    /// 上传资源由 `--assets-mode` 控制：`replace` 为真时先清空再写入，为假时保留
+    /// 未上传的既有文件（`merge` 语义）。
     pub replace: bool,
+    /// 目标文件已存在时是否覆盖。
+    ///
+    /// 模板交给用户拥有的文件（例如 traefik 的 `dynamic/custom.yml`）为 `false`，
+    /// 首次生成后不再覆盖用户编辑；上传资源与模板拥有的配置为 `true`。
+    pub overwrite: bool,
 }
 
 /// 模板转换输出。
@@ -96,6 +140,16 @@ impl TemplateKind {
             Self::Authelia => "authelia",
             Self::Traefik => "traefik",
             Self::Static => "static",
+        }
+    }
+
+    /// 返回固定项目名的模板使用的项目名；`app` / `static` 的项目名必须由声明给出。
+    #[must_use]
+    pub const fn fixed_project_name(self) -> Option<&'static str> {
+        match self {
+            Self::Authelia => Some("authelia"),
+            Self::Traefik => Some("traefik"),
+            Self::App | Self::Static => None,
         }
     }
 }
@@ -312,6 +366,9 @@ pub enum TemplateRouteProtocol {
 }
 
 /// Traefik 基础设施 TOML 文档。
+///
+/// 项目名固定为 `traefik`；这里的 `name` 只用于兼容通用头部写法与导出结果，
+/// 声明时必须与模板一致。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TraefikConfig {
@@ -319,6 +376,9 @@ pub struct TraefikConfig {
     pub format: u32,
     /// 必填模板选择器。
     pub template: String,
+    /// 可选项目名；省略或写 `traefik` 均可。
+    #[serde(default = "default_traefik_name")]
+    pub name: String,
     /// 基础 DNS 域名。
     pub domain: String,
     /// ACME 联系邮箱。
@@ -387,6 +447,15 @@ pub struct StaticConfig {
     /// 常用 Traefik 中间件。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub middlewares: Vec<String>,
+    /// 覆盖 Nginx 内置用户的 `UID[:GID]`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// 除主用户组外额外加入的补充组。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_add: Vec<String>,
+    /// 可选 Compose 启动钩子。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<ServiceHooks>,
 }
 
 /// 解析声明并生成统一 IR。
@@ -424,11 +493,66 @@ pub fn apply(
         TemplateKind::Traefik => traefik::generate(&toml::from_str(input)?, config)?,
         TemplateKind::Static => generate_static(toml::from_str(input)?, config)?,
     };
+    if let Some(declared) = declared_project_name(input)?
+        && declared != output.spec.name
+    {
+        anyhow::bail!(
+            "TOML 配置的 name 为 {declared}，但 template = \"{}\" 的项目名固定为 {}",
+            kind.as_str(),
+            output.spec.name
+        );
+    }
+    // 相对项目目录的挂载源必须在生成 Compose 之前展开为绝对路径：Compose 只把
+    // `./`、`../` 或绝对路径当作宿主路径，其余短语法一律按命名卷处理。
+    let project_directory = config.stacks_root.join(&output.spec.name);
+    output.spec.resolve_relative_mounts(&project_directory)?;
     if let Some(directory) = entrypoint {
-        let project_directory = config.stacks_root.join(&output.spec.name);
         files::bind_directory(&mut output.spec, &project_directory, directory)?;
     }
     Ok(output)
+}
+
+/// 读取声明中的项目名；`traefik` / `authelia` 模板允许省略。
+///
+/// # 错误
+///
+/// `name` 存在但不是字符串时返回错误。
+pub fn declared_project_name(input: &str) -> anyhow::Result<Option<String>> {
+    let value: toml::Value = toml::from_str(input).context("TOML 配置格式错误")?;
+    match value.get("name") {
+        None => Ok(None),
+        Some(value) => Ok(Some(
+            value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("TOML 配置的 name 必须是字符串"))?
+                .to_string(),
+        )),
+    }
+}
+
+/// 返回头部声明的项目名；`traefik` / `authelia` 模板省略时回退到固定项目名。
+///
+/// `app` / `static` 模板没有固定项目名且没有可用回退值时返回 `None`，由模板
+/// 自己的校验给出「缺少 name」的错误。
+///
+/// # 错误
+///
+/// `name` 存在但不是字符串，或 `template` 值未知时返回错误。
+pub fn resolve_project_name(input: &str, fallback: Option<&str>) -> anyhow::Result<Option<String>> {
+    if let Some(name) = declared_project_name(input)? {
+        return Ok(Some(name));
+    }
+    let value: toml::Value = toml::from_str(input).context("TOML 配置格式错误")?;
+    let kind = TemplateKind::parse(
+        value
+            .get("template")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("app"),
+    )?;
+    Ok(kind
+        .fixed_project_name()
+        .map(str::to_string)
+        .or_else(|| fallback.map(str::to_string)))
 }
 
 /// 从当前由 Compose 承载的 IR 重建规范化 TOML。
@@ -465,7 +589,9 @@ pub fn app_oidc_client_fragment(spec: &StackSpec) -> anyhow::Result<Option<Gener
         path: PathBuf::from("config/oidc-clients").join(format!("{}.yml", spec.name)),
         content: oidc::clients_yaml(&clients)?.into_bytes(),
         mode: 0o640,
+        directory_mode: PRIVATE_DIRECTORY_MODE,
         replace: true,
+        overwrite: true,
     }))
 }
 
@@ -538,6 +664,16 @@ const fn default_http_port() -> u16 {
 /// 返回 Traefik 默认 HTTPS 端口。
 const fn default_https_port() -> u16 {
     443
+}
+
+/// 返回 Traefik 模板固定的项目名。
+fn default_traefik_name() -> String {
+    String::from("traefik")
+}
+
+/// 返回 Authelia 模板固定的项目名。
+pub fn default_authelia_name() -> String {
+    String::from("authelia")
 }
 
 /// 返回 Traefik 默认指标端口。

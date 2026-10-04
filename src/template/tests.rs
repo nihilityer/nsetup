@@ -432,6 +432,76 @@ dashboard_authelia = true
     Ok(())
 }
 
+/// Traefik / Authelia 骨架可以直接应用，且核心开关真的落到 command/配置里（R1）。
+#[test]
+fn infrastructure_skeletons_apply_and_round_trip() -> anyhow::Result<()> {
+    let config = Config::default();
+    let traefik = apply(super::skeleton::TRAEFIK_SKELETON, &config, None)?;
+    assert_eq!(traefik.kind, TemplateKind::Traefik);
+    assert_eq!(traefik.spec.name, "traefik");
+    let service = &traefik.spec.document.services["traefik"];
+    assert!(
+        service
+            .command
+            .contains(&String::from("--metrics.prometheus=true"))
+    );
+    assert!(
+        service
+            .ports
+            .iter()
+            .any(|port| port == "127.0.0.1:8081:8081/tcp")
+    );
+    let exported = export(&traefik.spec, &config)?;
+    assert!(exported.contains("name = \"traefik\""));
+    let regenerated = apply(&exported, &config, None)?;
+    assert_eq!(traefik.spec, regenerated.spec);
+
+    let authelia_input = super::skeleton::AUTHELIA_SKELETON
+        .replace(
+            "replace-with-at-least-32-random-characters",
+            "0123456789abcdef0123456789abcdef",
+        )
+        .replace(
+            "'$argon2id$replace-with-generated-password-hash'",
+            "'$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA'",
+        );
+    let authelia = apply(&authelia_input, &config, None)?;
+    assert_eq!(authelia.kind, TemplateKind::Authelia);
+    assert_eq!(authelia.spec.name, "authelia");
+    let configuration = authelia
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("config/configuration.yml"))
+        .ok_or_else(|| anyhow::anyhow!("Authelia 模板缺少 configuration.yml"))?;
+    let configuration = String::from_utf8(configuration.content.clone())?;
+    assert!(configuration.contains("forward-auth"));
+    let exported = export(&authelia.spec, &config)?;
+    assert!(exported.contains("name = \"authelia\""));
+    let regenerated = apply(&exported, &config, None)?;
+    assert_eq!(authelia.spec, regenerated.spec);
+    Ok(())
+}
+
+/// traefik / authelia 的 `name` 可以省略、也可以显式写出，两者语义一致（R1）。
+#[test]
+fn infrastructure_templates_accept_optional_name() -> anyhow::Result<()> {
+    let skeleton = super::skeleton::TRAEFIK_SKELETON.replace("name = \"traefik\"\n", "");
+    let generated = apply(&skeleton, &Config::default(), None)?;
+    assert_eq!(generated.spec.name, "traefik");
+    assert_eq!(generated.kind, TemplateKind::Traefik);
+
+    let explicit = apply(super::skeleton::TRAEFIK_SKELETON, &Config::default(), None)?;
+    assert_eq!(generated.spec, explicit.spec);
+
+    let wrong = apply(
+        &super::skeleton::TRAEFIK_SKELETON.replace("name = \"traefik\"", "name = \"proxy\""),
+        &Config::default(),
+        None,
+    );
+    assert!(wrong.is_err(), "固定项目名的模板不应接受其它 name");
+    Ok(())
+}
+
 /// 未开启 Authelia 时 dashboard 仍只允许内网访问。
 #[test]
 fn traefik_dashboard_authelia_defaults_to_disabled() -> anyhow::Result<()> {
@@ -822,4 +892,86 @@ fn infrastructure_skeletons_document_new_options() {
             "静态骨架缺少说明: {example}"
         );
     }
+}
+
+/// 站点资源的权限策略：默认 a+rX，可显式收紧（R2）。
+#[test]
+fn asset_permissions_default_to_world_readable() {
+    use super::{ASSET_DIRECTORY_MODE, ASSET_FILE_MODE, AssetPermissions};
+    assert_eq!(
+        AssetPermissions::default().modes(),
+        (ASSET_DIRECTORY_MODE, ASSET_FILE_MODE)
+    );
+    assert_eq!(AssetPermissions::default().modes(), (0o755, 0o644));
+    assert_eq!(AssetPermissions::Private.modes(), (0o750, 0o640));
+}
+
+/// static 模板支持 `user` / `group_add` / `hooks`，站点侧无需外部脚本修权限（R2）。
+#[test]
+fn static_template_supports_user_groups_and_hooks() -> anyhow::Result<()> {
+    let input = r#"
+format = 1
+template = "static"
+name = "docs"
+host = "docs"
+version = "1.27"
+user = "101:101"
+group_add = ["988"]
+[hooks]
+pre_start = ["chmod -R a+rX site"]
+post_start = ["docker exec docs-web-1 nginx -s reload"]
+"#;
+    let config = Config::default();
+    let generated = apply(input, &config, None)?;
+    let service = &generated.spec.document.services["web"];
+    assert_eq!(service.user.as_deref(), Some("101:101"));
+    assert_eq!(service.group_add, vec![String::from("988")]);
+    let pre_start = generated
+        .spec
+        .service_hooks(crate::spec::HookStage::PreStart)?;
+    assert_eq!(pre_start.len(), 1);
+    assert_eq!(pre_start[0].1, "chmod -R a+rX site");
+    let post_start = generated
+        .spec
+        .service_hooks(crate::spec::HookStage::PostStart)?;
+    assert_eq!(post_start.len(), 1);
+
+    let exported = export(&generated.spec, &config)?;
+    assert!(exported.contains("user = \"101:101\""));
+    let regenerated = apply(&exported, &config, None)?;
+    assert_eq!(generated.spec, regenerated.spec);
+    Ok(())
+}
+
+/// Authelia 的 config 目录必须可写，否则官方 entrypoint 的 chown 会刷只读报错（R8）。
+#[test]
+fn authelia_config_mount_is_writable() -> anyhow::Result<()> {
+    let input = r#"
+format = 1
+template = "authelia"
+version = "4.39.20"
+default_redirection_url = "https://example.com"
+jwt_secret = "0123456789abcdef0123456789abcdef"
+session_secret = "1123456789abcdef0123456789abcdef"
+storage_encryption_key = "2123456789abcdef0123456789abcdef"
+[users.admin]
+display_name = "Administrator"
+password_hash = '$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA'
+email = "admin@example.com"
+"#;
+    let generated = apply(input, &Config::default(), None)?;
+    let volumes = &generated.spec.document.services["authelia"].volumes;
+    let config_mount = volumes
+        .iter()
+        .find(|value| value.ends_with(":/config"))
+        .ok_or_else(|| anyhow::anyhow!("Authelia 缺少 /config 挂载: {volumes:?}"))?;
+    assert!(
+        !config_mount.ends_with(":ro"),
+        "/config 必须以可写方式挂载: {config_mount}"
+    );
+    assert!(
+        volumes.iter().any(|value| value.ends_with(":/secrets:ro")),
+        "secrets 目录必须保持只读: {volumes:?}"
+    );
+    Ok(())
 }
