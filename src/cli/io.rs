@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// 在严格大小限制下读取 UTF-8 文本文件。
 ///
@@ -27,19 +27,74 @@ pub(super) fn read_limited(path: &Path, limit: usize) -> anyhow::Result<String> 
 ///
 /// # 错误
 ///
-/// 遇到符号链接、特殊文件、不安全路径或超大上传时返回错误。
+/// 目录为空、遇到符号链接、特殊文件、不安全路径或超大上传时返回错误。
 pub(super) fn read_assets(root: &Path) -> anyhow::Result<Vec<proto::Asset>> {
     if !root.is_dir() {
         anyhow::bail!("assets 不是目录: {}", root.display());
     }
     let mut output = Vec::new();
     read_assets_at(root, root, &mut output)?;
+    if output.is_empty() {
+        anyhow::bail!("assets 目录为空，没有可上传的文件: {}", root.display());
+    }
     output.sort_by(|left, right| left.path.cmp(&right.path));
     let total: usize = output.iter().map(|asset| asset.content.len()).sum();
     if total > MAX_RPC_MESSAGE_SIZE - MAX_CONFIG_SIZE {
         anyhow::bail!("静态站点文件总大小超过 RPC 限制");
     }
     Ok(output)
+}
+
+/// 从文件或目录参数加载 `--files` 上传内容。
+///
+/// 目录参数以其自身为基准展开，单个文件参数按文件名上传；重复的目标路径会被拒绝，
+/// 避免同一份声明产生不确定的结果。
+///
+/// # 错误
+///
+/// 参数不存在、不是普通文件或目录、含符号链接、目标路径重复或超大时返回错误。
+pub(super) fn read_files(inputs: &[PathBuf]) -> anyhow::Result<Vec<proto::Asset>> {
+    let mut output = Vec::new();
+    for input in inputs {
+        let metadata = std::fs::symlink_metadata(input)
+            .with_context(|| format!("无法读取 --files 路径: {}", input.display()))?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("--files 不允许符号链接: {}", input.display());
+        }
+        if metadata.is_dir() {
+            read_assets_at(input, input, &mut output)?;
+        } else if metadata.is_file() {
+            let name = input
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| anyhow::anyhow!("--files 文件名无效: {}", input.display()))?;
+            output.push(proto::Asset {
+                path: name.to_string(),
+                content: std::fs::read(input)
+                    .with_context(|| format!("无法读取 --files 文件: {}", input.display()))?,
+            });
+        } else {
+            anyhow::bail!("--files 仅支持普通文件和目录: {}", input.display());
+        }
+    }
+    output.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut seen = std::collections::BTreeSet::new();
+    for asset in &output {
+        if !seen.insert(asset.path.clone()) {
+            anyhow::bail!("--files 目标路径重复: {}", asset.path);
+        }
+    }
+    let total: usize = output.iter().map(|asset| asset.content.len()).sum();
+    if total > MAX_RPC_MESSAGE_SIZE - MAX_CONFIG_SIZE {
+        anyhow::bail!("--files 文件总大小超过 RPC 限制");
+    }
+    Ok(output)
+}
+
+/// 判断当前标准输入是否连接到终端。
+#[must_use]
+pub(super) fn stdin_is_terminal() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdin())
 }
 
 /// 遍历一层静态资源目录且不跟随符号链接。

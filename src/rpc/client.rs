@@ -85,9 +85,36 @@ impl RpcClient {
     /// # 错误
     ///
     /// RPC 或传输失败时返回错误。
-    pub async fn export(&mut self, name: String) -> anyhow::Result<proto::ExportResponse> {
-        let request = self.request(proto::ExportRequest { name });
+    pub async fn export(
+        &mut self,
+        name: String,
+        keep_comments: bool,
+    ) -> anyhow::Result<proto::ExportResponse> {
+        let request = self.request(proto::ExportRequest {
+            name,
+            keep_comments,
+        });
         Ok(self.inner.export(request).await?.into_inner())
+    }
+
+    /// 请求 daemon 自查 Traefik 接管情况。
+    ///
+    /// # 错误
+    ///
+    /// RPC 或传输失败时返回错误。
+    pub async fn doctor(&mut self) -> anyhow::Result<proto::DoctorResponse> {
+        let request = self.request(proto::DoctorRequest {});
+        Ok(self.inner.doctor(request).await?.into_inner())
+    }
+
+    /// 请求 daemon 热更新主域名。
+    ///
+    /// # 错误
+    ///
+    /// RPC 或传输失败时返回错误。
+    pub async fn set_domain(&mut self, domain: String) -> anyhow::Result<proto::SetDomainResponse> {
+        let request = self.request(proto::SetDomainRequest { domain });
+        Ok(self.inner.set_domain(request).await?.into_inner())
     }
 
     /// 应用部分服务修改。

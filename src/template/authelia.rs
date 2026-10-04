@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub(super) use self::oidc::valid_claims_policy_name;
+
 /// Authelia 模板在项目 `.env` 中持久化镜像版本的键。
 const VERSION_KEY: &str = "AUTHELIA_VERSION";
 /// Authelia 模板在项目 `.env` 中持久化默认跳转地址的键。
@@ -31,9 +33,13 @@ const STORAGE_SECRET_KEY: &str = "NSETUP_AUTHELIA_STORAGE_ENCRYPTION_KEY";
 const OIDC_HMAC_SECRET_KEY: &str = "NSETUP_AUTHELIA_OIDC_HMAC_SECRET";
 /// Authelia 模板在项目 `.env` 中持久化 OIDC RS256 私钥的键。
 const OIDC_JWK_PRIVATE_KEY: &str = "NSETUP_AUTHELIA_OIDC_JWK_PRIVATE_KEY";
+/// Authelia 模板在项目 `.env` 中持久化 OIDC claims policy 的键。
+const OIDC_CLAIMS_POLICIES_KEY: &str = "NSETUP_AUTHELIA_OIDC_CLAIMS_POLICIES_JSON";
+/// Authelia 模板在项目 `.env` 中持久化遥测配置的键。
+const TELEMETRY_KEY: &str = "NSETUP_AUTHELIA_TELEMETRY_JSON";
 
 /// Authelia 基础认证设施的 TOML 文档。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AutheliaConfig {
     /// 配置模式版本。
@@ -59,8 +65,112 @@ pub(super) struct AutheliaConfig {
     /// 可选的 `OpenID Connect` provider；客户端由应用声明。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc: Option<OidcProviderConfig>,
+    /// 可选自身遥测；省略时 Authelia 不暴露指标也不导出 trace。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<AutheliaTelemetryConfig>,
     /// 以登录名为键的声明式本地用户库。
     pub users: BTreeMap<String, AutheliaUser>,
+}
+
+/// Authelia 自身的遥测配置。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AutheliaTelemetryConfig {
+    /// 暴露 Prometheus 指标的监听地址，例如 `tcp://0.0.0.0:9959`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_address: Option<String>,
+    /// 指标路径，默认 `/metrics`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_path: Option<String>,
+    /// 导出 trace 的地址，例如 `udp://otel-collector:4318`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing_address: Option<String>,
+    /// trace 采样率；省略时沿用 Authelia 默认值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing_sample_rate: Option<f64>,
+}
+
+impl AutheliaTelemetryConfig {
+    /// 判断是否声明了任何遥测端点。
+    const fn is_empty(&self) -> bool {
+        self.metrics_address.is_none()
+            && self.metrics_path.is_none()
+            && self.tracing_address.is_none()
+            && self.tracing_sample_rate.is_none()
+    }
+
+    /// 校验监听地址、指标路径与采样率。
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(address) = &self.metrics_address {
+            validate_listen_address("telemetry.metrics_address", address)?;
+        }
+        if let Some(address) = &self.tracing_address {
+            validate_listen_address("telemetry.tracing_address", address)?;
+        }
+        if let Some(path) = &self.metrics_path
+            && (!path.starts_with('/') || path.len() > 256 || path.contains(char::is_whitespace))
+        {
+            anyhow::bail!("telemetry.metrics_path 必须是以 / 开头的路径: {path}");
+        }
+        if let Some(rate) = self.tracing_sample_rate
+            && !(0.0..=1.0).contains(&rate)
+        {
+            anyhow::bail!("telemetry.tracing_sample_rate 必须在 0.0 到 1.0 之间");
+        }
+        Ok(())
+    }
+
+    /// 生成 `telemetry` YAML 块。
+    fn yaml(&self) -> String {
+        let mut output = String::from("telemetry:\n");
+        if self.metrics_address.is_some() || self.metrics_path.is_some() {
+            output.push_str("  metrics:\n    enabled: true\n    address: '");
+            output.push_str(
+                self.metrics_address
+                    .as_deref()
+                    .unwrap_or("tcp://0.0.0.0:9959"),
+            );
+            output.push_str("'\n");
+            if let Some(path) = &self.metrics_path {
+                output.push_str(&format!("    path: '{path}'\n"));
+            }
+        }
+        if self.tracing_address.is_some() || self.tracing_sample_rate.is_some() {
+            output.push_str("  tracing:\n    enabled: true\n");
+            if let Some(address) = &self.tracing_address {
+                output.push_str(&format!("    address: '{address}'\n"));
+            }
+            if let Some(rate) = self.tracing_sample_rate {
+                output.push_str(&format!("    sample_rate: {rate}\n"));
+            }
+        }
+        output
+    }
+}
+
+/// 校验 `scheme://host:port` 或 `host:port` 形式的监听地址。
+///
+/// 允许 `tcp://`、`udp://` 等 Authelia 支持的传输前缀，以及容器名这类主机名。
+fn validate_listen_address(label: &str, value: &str) -> anyhow::Result<()> {
+    let address = match value.split_once("://") {
+        Some((scheme, rest)) => {
+            if scheme.is_empty() {
+                anyhow::bail!("{label} 的传输前缀无效: {value}");
+            }
+            rest
+        }
+        None => value,
+    };
+    let Some((host, port)) = address.rsplit_once(':') else {
+        anyhow::bail!("{label} 必须是 host:port 形式的监听地址: {value}");
+    };
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("{label} 的端口无效: {value}"))?;
+    if port == 0 || host.is_empty() || host.contains(char::is_whitespace) {
+        anyhow::bail!("{label} 必须是 host:port 形式的监听地址: {value}");
+    }
+    Ok(())
 }
 
 /// Authelia 默认访问控制策略。
@@ -161,6 +271,7 @@ pub(super) fn generate(input: &AutheliaConfig, config: &Config) -> anyhow::Resul
             container_port: 9091,
             middlewares: vec![String::from("tls")],
             protocol: RouteProtocol::Http,
+            entrypoint: String::from("https"),
             sticky_cookie: false,
             pass_host_header: None,
             priority: None,
@@ -193,6 +304,20 @@ pub(super) fn generate(input: &AutheliaConfig, config: &Config) -> anyhow::Resul
         environment.insert(
             String::from(OIDC_JWK_PRIVATE_KEY),
             oidc.jwk_private_key.clone(),
+        );
+        if !oidc.claims_policies.is_empty() {
+            environment.insert(
+                String::from(OIDC_CLAIMS_POLICIES_KEY),
+                serde_json::to_string(&oidc.claims_policies)?,
+            );
+        }
+    }
+    if let Some(telemetry) = &input.telemetry
+        && !telemetry.is_empty()
+    {
+        environment.insert(
+            String::from(TELEMETRY_KEY),
+            serde_json::to_string(telemetry)?,
         );
     }
     let spec = StackSpec {
@@ -229,6 +354,10 @@ pub(super) fn export(spec: &StackSpec) -> anyhow::Result<AutheliaConfig> {
         Some(hmac_secret) => Some(OidcProviderConfig {
             hmac_secret: hmac_secret.clone(),
             jwk_private_key: required_environment(spec, OIDC_JWK_PRIVATE_KEY)?.to_string(),
+            claims_policies: match spec.environment.get(OIDC_CLAIMS_POLICIES_KEY) {
+                Some(value) => serde_json::from_str(value)?,
+                None => BTreeMap::new(),
+            },
         }),
         None => None,
     };
@@ -243,6 +372,10 @@ pub(super) fn export(spec: &StackSpec) -> anyhow::Result<AutheliaConfig> {
         session_secret: required_environment(spec, SESSION_SECRET_KEY)?.to_string(),
         storage_encryption_key: required_environment(spec, STORAGE_SECRET_KEY)?.to_string(),
         oidc,
+        telemetry: match spec.environment.get(TELEMETRY_KEY) {
+            Some(value) => serde_json::from_str(value)?,
+            None => None,
+        },
         users,
     })
 }
@@ -269,6 +402,9 @@ fn validate_input(input: &AutheliaConfig, config: &Config) -> anyhow::Result<()>
     validate_secret("storage_encryption_key", &input.storage_encryption_key)?;
     if let Some(oidc) = &input.oidc {
         oidc.validate()?;
+    }
+    if let Some(telemetry) = &input.telemetry {
+        telemetry.validate()?;
     }
     if input.users.is_empty() {
         anyhow::bail!("Authelia 至少需要一个声明式用户");
@@ -423,6 +559,11 @@ notifier:
     );
     if let Some(oidc) = &input.oidc {
         output.push_str(&oidc.configuration_yaml());
+    }
+    if let Some(telemetry) = &input.telemetry
+        && !telemetry.is_empty()
+    {
+        output.push_str(&telemetry.yaml());
     }
     Ok(output)
 }

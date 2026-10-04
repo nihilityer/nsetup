@@ -2,6 +2,8 @@
 
 use crate::config::Config;
 use crate::spec::{BindMount, Healthcheck, PublishedPort, Route};
+
+pub use operations::ApplyRequest;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -23,13 +25,31 @@ pub struct Orchestrator {
     config: Config,
 }
 
-/// 随应用请求上传的附属文件。
+/// 每次应用时整体替换的受管附属目录。
+const OWNED_DIRECTORIES: [&str; 5] = [
+    "site",
+    "files",
+    "config/dynamic",
+    "config/nginx",
+    "config/oidc-clients",
+];
+
+/// 随应用请求上传的静态站点文件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
     /// 站点相对路径。
     pub path: PathBuf,
     /// 文件原始字节。
     pub content: Vec<u8>,
+}
+
+/// 由 `--files` 上传并挂载进容器的项目附属文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesUpload {
+    /// 相对 `files/` 目录的已校验路径。
+    pub path: PathBuf,
+    /// 已写入受管项目目录的附属描述。
+    pub file: crate::template::GeneratedFile,
 }
 
 /// 服务局部修改。

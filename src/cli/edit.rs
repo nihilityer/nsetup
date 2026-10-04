@@ -1,8 +1,8 @@
 //! 将 CLI 编辑参数转换为类型化 protobuf 请求。
 
-use super::args::{EditArgs, MiddlewareArg, NetworkArg, ProtocolArg};
+use super::args::{EditArgs, NetworkArg};
 use crate::rpc::proto;
-use crate::spec::{BindMount, PortProtocol, PublishedPort};
+use crate::spec::{BindMount, PortProtocol, PublishedPort, RouteProtocol, validate_middleware};
 use std::collections::HashMap;
 
 /// 将 CLI 编辑标志转换为类型化协议请求。
@@ -15,16 +15,15 @@ pub(super) fn edit_request(args: EditArgs) -> anyhow::Result<proto::EditRequest>
         && (args.path_prefix.is_some()
             || args.sticky_cookie
             || args.pass_host_header.is_some()
-            || args.priority.is_some())
+            || args.priority.is_some()
+            || args.entrypoint.is_some())
     {
         anyhow::bail!("路由专用参数需要至少一个 --host");
     }
-    let middleware_values: Vec<i32> = args
-        .middlewares
-        .iter()
-        .copied()
-        .map(middleware_value)
-        .collect();
+    for middleware in &args.middlewares {
+        validate_middleware(middleware)?;
+    }
+    let protocol = RouteProtocol::parse(&args.protocol)?;
     let routes = if args.hosts.is_empty() {
         Vec::new()
     } else {
@@ -36,8 +35,9 @@ pub(super) fn edit_request(args: EditArgs) -> anyhow::Result<proto::EditRequest>
                 args.container_port
                     .ok_or_else(|| anyhow::anyhow!("新增 --host 时必须提供 --port"))?,
             ),
-            middlewares: middleware_values.clone(),
-            protocol: protocol_value(args.protocol),
+            middlewares: args.middlewares.clone(),
+            protocol: protocol_value(protocol),
+            entrypoint: args.entrypoint,
             sticky_cookie: args.sticky_cookie,
             pass_host_header: args.pass_host_header,
             priority: args.priority,
@@ -62,20 +62,27 @@ pub(super) fn edit_request(args: EditArgs) -> anyhow::Result<proto::EditRequest>
     if !matches!(args.network, Some(NetworkArg::External)) && args.external_network.is_some() {
         anyhow::bail!("--external-network 只能与 --network external 一起使用");
     }
+    if args.healthcheck_cmd.is_some() && !args.healthcheck_exec.is_empty() {
+        anyhow::bail!("--healthcheck-cmd 与 --healthcheck-exec 不能同时使用");
+    }
     let health_fields_present = args.healthcheck_interval.is_some()
         || args.healthcheck_timeout.is_some()
         || args.healthcheck_start_period.is_some()
         || args.healthcheck_retries.is_some();
-    if health_fields_present && args.healthcheck_cmd.is_none() {
-        anyhow::bail!("健康检查参数需要 --healthcheck-cmd");
+    if health_fields_present && args.healthcheck_cmd.is_none() && args.healthcheck_exec.is_empty() {
+        anyhow::bail!("健康检查参数需要 --healthcheck-cmd 或 --healthcheck-exec");
     }
-    let healthcheck = args.healthcheck_cmd.map(|command| proto::Healthcheck {
-        command,
-        interval: args.healthcheck_interval,
-        timeout: args.healthcheck_timeout,
-        start_period: args.healthcheck_start_period,
-        retries: args.healthcheck_retries,
-    });
+    let healthcheck =
+        (args.healthcheck_cmd.is_some() || !args.healthcheck_exec.is_empty()).then(|| {
+            proto::Healthcheck {
+                command: args.healthcheck_cmd.unwrap_or_default(),
+                exec: args.healthcheck_exec,
+                interval: args.healthcheck_interval,
+                timeout: args.healthcheck_timeout,
+                start_period: args.healthcheck_start_period,
+                retries: args.healthcheck_retries,
+            }
+        });
     Ok(proto::EditRequest {
         name: args.name,
         service: args.service,
@@ -89,7 +96,7 @@ pub(super) fn edit_request(args: EditArgs) -> anyhow::Result<proto::EditRequest>
         environment,
         network_mode,
         external_network: args.external_network,
-        middlewares: middleware_values,
+        middlewares: args.middlewares,
         labels: args.labels,
         healthcheck,
         remove_healthcheck: args.remove_healthcheck,
@@ -129,22 +136,11 @@ const fn network_value(value: NetworkArg) -> i32 {
 }
 
 /// 将 CLI 协议选项转换为 protobuf 数值。
-const fn protocol_value(value: ProtocolArg) -> i32 {
+const fn protocol_value(value: RouteProtocol) -> i32 {
     match value {
-        ProtocolArg::Http => proto::RouteProtocol::Http as i32,
-        ProtocolArg::Https => proto::RouteProtocol::Https as i32,
-        ProtocolArg::H2c => proto::RouteProtocol::H2c as i32,
-    }
-}
-
-/// 将 CLI 中间件选项转换为 protobuf 数值。
-const fn middleware_value(value: MiddlewareArg) -> i32 {
-    match value {
-        MiddlewareArg::Authelia => proto::Middleware::Authelia as i32,
-        MiddlewareArg::Gzip => proto::Middleware::Gzip as i32,
-        MiddlewareArg::ForwardedHeaders => proto::Middleware::ForwardedHeaders as i32,
-        MiddlewareArg::InternalOnly => proto::Middleware::InternalOnly as i32,
-        MiddlewareArg::Tls => proto::Middleware::Tls as i32,
+        RouteProtocol::Http => proto::RouteProtocol::Http as i32,
+        RouteProtocol::Https => proto::RouteProtocol::Https as i32,
+        RouteProtocol::H2c => proto::RouteProtocol::H2c as i32,
     }
 }
 

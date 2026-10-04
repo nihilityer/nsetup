@@ -1,7 +1,7 @@
 //! 版本化 TOML 模板及其与 IR 的双向转换。
 
 use crate::config::Config;
-use crate::spec::{Logging, StackSpec};
+use crate::spec::{Logging, ServiceHooks, StackSpec};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 /// Authelia 基础认证设施模板。
 mod authelia;
+/// `files/` 附属目录的挂载入口。
+pub mod files;
 /// TOML 声明到 IR 的模板生成。
 mod generate;
 /// 应用拥有的 Authelia OIDC 客户端声明。
@@ -24,7 +26,8 @@ mod tests;
 mod traefik;
 
 use generate::{generate_app, generate_static};
-use reverse::{detect_kind, export_app, export_static, export_traefik};
+pub use reverse::detect_kind;
+use reverse::{export_app, export_static, export_traefik};
 use skeleton::{APP_SKELETON, AUTHELIA_SKELETON, STATIC_SKELETON, TRAEFIK_SKELETON};
 
 /// 当前面向用户的配置格式版本。
@@ -164,6 +167,15 @@ pub struct AppServiceConfig {
     /// 自定义 Docker label。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// 覆盖镜像内置用户的 `UID[:GID]`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// 除主用户组外额外加入的补充组。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_add: Vec<String>,
+    /// 可选的 Compose 启动钩子。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<ServiceHooks>,
     /// 可选健康检查。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<HealthcheckConfig>,
@@ -189,11 +201,14 @@ pub enum AppNetwork {
 }
 
 /// TOML 健康检查字段。
+///
+/// `command` 既可以是 shell 字符串（`CMD-SHELL`），也可以是 argv 数组（`CMD`），
+/// 后者用于没有 shell 的镜像。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HealthcheckConfig {
-    /// shell 命令。
-    pub command: String,
+    /// shell 命令或 argv 参数列表。
+    pub command: HealthcheckCommand,
     /// 检查间隔。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval: Option<String>,
@@ -206,6 +221,16 @@ pub struct HealthcheckConfig {
     /// 重试次数。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
+}
+
+/// 健康检查命令的两种受支持写法。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum HealthcheckCommand {
+    /// `CMD-SHELL` 形式：交给容器内 shell 解释的字符串。
+    Shell(String),
+    /// `CMD` 形式：直接执行的 argv 参数列表。
+    Exec(Vec<String>),
 }
 
 /// 服务的紧凑 Traefik 配置。
@@ -224,6 +249,9 @@ pub struct TraefikRoutesConfig {
     /// 后端协议。
     #[serde(default)]
     pub protocol: TemplateRouteProtocol,
+    /// 路由监听的 entrypoint；省略时使用 `https`。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub entrypoint: String,
     /// 粘性 Cookie 开关。
     #[serde(default)]
     pub sticky_cookie: bool,
@@ -256,6 +284,9 @@ pub struct TraefikRouteConfig {
     /// 后端协议。
     #[serde(default)]
     pub protocol: TemplateRouteProtocol,
+    /// 路由监听的 entrypoint；省略时继承紧凑配置。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub entrypoint: String,
     /// 粘性 Cookie 开关。
     #[serde(default)]
     pub sticky_cookie: bool,
@@ -305,6 +336,38 @@ pub struct TraefikConfig {
     /// 是否使用 Authelia `ForwardAuth` 保护 Traefik dashboard。
     #[serde(default, skip_serializing_if = "is_false")]
     pub dashboard_authelia: bool,
+    /// 是否暴露 Traefik 自身的 Prometheus 指标。
+    #[serde(default = "default_true")]
+    pub metrics: bool,
+    /// 指标入口在容器内监听的端口。
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+    /// 追加到生成动态配置中的自定义 Traefik 中间件。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub middlewares: BTreeMap<String, TraefikMiddlewareConfig>,
+}
+
+/// 追加到 Traefik 动态配置的单个自定义中间件。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TraefikMiddlewareConfig {
+    /// 中间件类型，例如 `replacePath`、`stripPrefix`、`headers`。
+    pub kind: String,
+    /// 类型对应的参数表；值按 YAML 标量或列表渲染。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub args: BTreeMap<String, TraefikMiddlewareValue>,
+}
+
+/// 自定义中间件参数的受支持取值。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TraefikMiddlewareValue {
+    /// 单个标量参数。
+    Scalar(String),
+    /// 列表参数。
+    List(Vec<String>),
+    /// 布尔参数。
+    Flag(bool),
 }
 
 /// 静态站点 TOML 文档。
@@ -328,10 +391,16 @@ pub struct StaticConfig {
 
 /// 解析声明并生成统一 IR。
 ///
+/// `entrypoint` 是保留给 `files/` 附属文件的容器挂载入口。
+///
 /// # 错误
 ///
 /// 当 TOML 格式错误、模板字段无效或输出不安全时返回错误。
-pub fn apply(input: &str, config: &Config) -> anyhow::Result<TemplateOutput> {
+pub fn apply(
+    input: &str,
+    config: &Config,
+    entrypoint: Option<&str>,
+) -> anyhow::Result<TemplateOutput> {
     let value: toml::Value = toml::from_str(input).context("TOML 配置格式错误")?;
     let format = value
         .get("format")
@@ -346,15 +415,20 @@ pub fn apply(input: &str, config: &Config) -> anyhow::Result<TemplateOutput> {
             .and_then(toml::Value::as_str)
             .unwrap_or("app"),
     )?;
-    match kind {
-        TemplateKind::App => generate_app(toml::from_str(input)?, config),
+    let mut output = match kind {
+        TemplateKind::App => generate_app(toml::from_str(input)?, config)?,
         TemplateKind::Authelia => {
             let input = toml::from_str(input)?;
-            authelia::generate(&input, config)
+            authelia::generate(&input, config)?
         }
-        TemplateKind::Traefik => traefik::generate(toml::from_str(input)?, config),
-        TemplateKind::Static => generate_static(toml::from_str(input)?, config),
+        TemplateKind::Traefik => traefik::generate(&toml::from_str(input)?, config)?,
+        TemplateKind::Static => generate_static(toml::from_str(input)?, config)?,
+    };
+    if let Some(directory) = entrypoint {
+        let project_directory = config.stacks_root.join(&output.spec.name);
+        files::bind_directory(&mut output.spec, &project_directory, directory)?;
     }
+    Ok(output)
 }
 
 /// 从当前由 Compose 承载的 IR 重建规范化 TOML。
@@ -423,6 +497,39 @@ pub const fn skeleton(kind: TemplateKind) -> &'static str {
     }
 }
 
+/// 追加带完整注释的配置骨架，使导出结果可以直接作为仓库交付物。
+///
+/// 反解得到的是规范化 TOML，原始注释无法恢复；这里把当前版本骨架的注释逐行前置，
+/// 得到“注释 + 当前值”的可读文件，而不是让注释整体丢失。
+///
+/// # 错误
+///
+/// 模板类型无法解析时返回错误。
+pub fn annotate(config_toml: &str, kind: TemplateKind) -> anyhow::Result<String> {
+    if toml::from_str::<toml::Value>(config_toml).is_err() {
+        anyhow::bail!("无法为非法 TOML 追加注释");
+    }
+    let mut output = String::from(
+        "# 由 nsetup export --keep-comments 生成：注释来自当前版本的模板骨架，\n\
+         # 下方即为当前状态等价的规范化 TOML；重新 apply 时注释会被忽略。\n\n",
+    );
+    for line in skeleton(kind).lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            output.push_str(line);
+        } else {
+            output.push_str("# ");
+            output.push_str(line);
+        }
+        output.push('\n');
+    }
+    output.push('\n');
+    output.push_str(config_toml);
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    Ok(output)
+}
+
 /// 返回 Traefik 默认 HTTP 端口。
 const fn default_http_port() -> u16 {
     80
@@ -431,6 +538,16 @@ const fn default_http_port() -> u16 {
 /// 返回 Traefik 默认 HTTPS 端口。
 const fn default_https_port() -> u16 {
     443
+}
+
+/// 返回 Traefik 默认指标端口。
+const fn default_metrics_port() -> u16 {
+    crate::spec::DEFAULT_METRICS_PORT
+}
+
+/// 返回布尔字段的默认开启值。
+const fn default_true() -> bool {
+    true
 }
 
 /// 判断布尔值是否为默认关闭状态。

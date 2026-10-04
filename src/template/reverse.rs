@@ -1,9 +1,9 @@
 //! 从当前 IR 状态反解规范化 TOML 声明。
 
 use super::{
-    AppAutheliaConfig, AppConfig, AppNetwork, AppServiceConfig, FORMAT_VERSION, HealthcheckConfig,
-    StaticConfig, TemplateKind, TemplateRouteProtocol, TraefikConfig, TraefikRouteConfig,
-    TraefikRoutesConfig,
+    AppAutheliaConfig, AppConfig, AppNetwork, AppServiceConfig, FORMAT_VERSION, HealthcheckCommand,
+    HealthcheckConfig, StaticConfig, TemplateKind, TemplateRouteProtocol, TraefikConfig,
+    TraefikMiddlewareConfig, TraefikRouteConfig, TraefikRoutesConfig,
 };
 use crate::config::Config;
 use crate::spec::{
@@ -12,9 +12,14 @@ use crate::spec::{
 use std::collections::BTreeMap;
 
 /// 从当前 IR 字段重建应用模板。
+///
+/// # 错误
+///
+/// 镜像、路由、健康检查或项目环境字段无法反解时返回错误。
 pub(super) fn export_app(spec: &StackSpec) -> anyhow::Result<AppConfig> {
     let oidc_clients = super::app_oidc_clients(spec)?;
     let authelia = (!oidc_clients.is_empty()).then_some(AppAutheliaConfig { oidc_clients });
+    let hooks = spec.project_hooks()?;
     let mut services = BTreeMap::new();
     for (name, source) in &spec.document.services {
         let (image, version) = source.image_version()?;
@@ -35,6 +40,15 @@ pub(super) fn export_app(spec: &StackSpec) -> anyhow::Result<AppConfig> {
         custom
             .labels
             .retain(|label| label != "io.nsetup.template=app");
+        // 重新应用时 `set_routes` 会把 enable 置回 true；只有用户在原始 labels 中
+        // 显式声明过 false 时才需要把该声明写回，避免导出后语义发生变化。
+        if source
+            .labels
+            .iter()
+            .any(|label| label == "traefik.enable=false")
+        {
+            custom.labels.push(String::from("traefik.enable=false"));
+        }
         let (network, external_network) = export_network(source, &spec.document);
         services.insert(
             name.clone(),
@@ -44,7 +58,12 @@ pub(super) fn export_app(spec: &StackSpec) -> anyhow::Result<AppConfig> {
                 container_name: source.container_name.clone(),
                 port,
                 publish: source.ports.clone(),
-                volumes: source.volumes.clone(),
+                volumes: source
+                    .volumes
+                    .iter()
+                    .filter(|value| !is_files_mount(value, &spec.name))
+                    .cloned()
+                    .collect(),
                 environment: source.environment.clone(),
                 command: source.command.clone(),
                 restart: source.restart.clone(),
@@ -52,6 +71,9 @@ pub(super) fn export_app(spec: &StackSpec) -> anyhow::Result<AppConfig> {
                 network,
                 external_network,
                 labels: custom.labels,
+                user: source.user.clone(),
+                group_add: source.group_add.clone(),
+                hooks: hooks.get(name).cloned(),
                 healthcheck: source
                     .healthcheck
                     .as_ref()
@@ -72,6 +94,10 @@ pub(super) fn export_app(spec: &StackSpec) -> anyhow::Result<AppConfig> {
 }
 
 /// 从当前 IR 与 `.env` 字段重建 Traefik 模板。
+///
+/// # 错误
+///
+/// 必需服务、端口或项目环境字段缺失时返回错误。
 pub(super) fn export_traefik(spec: &StackSpec, config: &Config) -> anyhow::Result<TraefikConfig> {
     let service = only_named_service(spec, "traefik")?;
     let routes = service.routes(&spec.name, "traefik")?;
@@ -108,6 +134,22 @@ pub(super) fn export_traefik(spec: &StackSpec, config: &Config) -> anyhow::Resul
         .iter()
         .find(|port| port.container_port == 443 && port.protocol == PortProtocol::Tcp)
         .map_or(443, |port| port.host_port);
+    // 指标入口只在启动参数里声明，容器端口始终是配置的 metrics_port。
+    let metrics = service
+        .command
+        .iter()
+        .any(|argument| argument == "--metrics.prometheus=true");
+    let metrics_port = service
+        .command
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--entrypoints.metrics.address=:"))
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(crate::spec::DEFAULT_METRICS_PORT);
+    let middlewares: BTreeMap<String, TraefikMiddlewareConfig> =
+        match spec.environment.get(super::traefik::MIDDLEWARES_KEY) {
+            Some(value) => serde_json::from_str(value)?,
+            None => BTreeMap::new(),
+        };
     Ok(TraefikConfig {
         format: FORMAT_VERSION,
         template: String::from("traefik"),
@@ -118,10 +160,17 @@ pub(super) fn export_traefik(spec: &StackSpec, config: &Config) -> anyhow::Resul
         http_port,
         https_port,
         dashboard_authelia,
+        metrics,
+        metrics_port,
+        middlewares,
     })
 }
 
 /// 从当前 IR 字段重建静态站点模板。
+///
+/// # 错误
+///
+/// 必需服务、路由或项目环境字段缺失时返回错误。
 pub(super) fn export_static(spec: &StackSpec) -> anyhow::Result<StaticConfig> {
     let service = only_named_service(spec, "web")?;
     let route = service
@@ -156,6 +205,7 @@ fn routes_to_config(routes: &[Route]) -> Option<TraefikRoutesConfig> {
             path_prefix: route.path_prefix.clone(),
             middlewares: route.middlewares.clone(),
             protocol: route.protocol.into(),
+            entrypoint: route.entrypoint_name().to_string(),
             sticky_cookie: route.sticky_cookie,
             pass_host_header: route.pass_host_header,
             priority: route.priority,
@@ -174,6 +224,7 @@ fn routes_to_config(routes: &[Route]) -> Option<TraefikRoutesConfig> {
                         port: Some(route.container_port),
                         middlewares: route.middlewares.clone(),
                         protocol: route.protocol.into(),
+                        entrypoint: route.entrypoint_name().to_string(),
                         sticky_cookie: route.sticky_cookie,
                         pass_host_header: route.pass_host_header,
                         priority: route.priority,
@@ -206,9 +257,17 @@ impl From<RouteProtocol> for TemplateRouteProtocol {
 }
 
 /// 将受支持的 Compose 健康检查转换回 TOML。
+///
+/// # 错误
+///
+/// 健康检查不是受支持的 `CMD` 或 `CMD-SHELL` 形式时返回错误。
 fn healthcheck_to_config(value: &Healthcheck) -> anyhow::Result<HealthcheckConfig> {
+    let command = match value.shell_command() {
+        Ok(command) => HealthcheckCommand::Shell(command.to_string()),
+        Err(_) => HealthcheckCommand::Exec(value.exec_arguments()?.to_vec()),
+    };
     Ok(HealthcheckConfig {
-        command: value.shell_command()?.to_string(),
+        command,
         interval: value.interval.clone(),
         timeout: value.timeout.clone(),
         start_period: value.start_period.clone(),
@@ -217,7 +276,11 @@ fn healthcheck_to_config(value: &Healthcheck) -> anyhow::Result<HealthcheckConfi
 }
 
 /// 从服务元数据标签推导唯一的项目模板类型。
-pub(super) fn detect_kind(spec: &StackSpec) -> anyhow::Result<TemplateKind> {
+///
+/// # 错误
+///
+/// 项目没有任何模板标记，或标记互相冲突时返回错误。
+pub fn detect_kind(spec: &StackSpec) -> anyhow::Result<TemplateKind> {
     let mut kind = None;
     for service in spec.document.services.values() {
         for label in &service.labels {
@@ -235,13 +298,22 @@ pub(super) fn detect_kind(spec: &StackSpec) -> anyhow::Result<TemplateKind> {
     })
 }
 
+/// 判断挂载是否为 `--files` 注入的 `files/` 目录源。
+fn is_files_mount(value: &str, project_name: &str) -> bool {
+    let marker = format!(
+        "/{project_name}/{}:",
+        crate::template::files::FILES_DIRECTORY
+    );
+    value.contains(&marker)
+}
+
 /// 从 Compose 网络字段推导高层网络模式。
 fn export_network(service: &Service, document: &Document) -> (AppNetwork, Option<String>) {
     if service.network_mode.as_deref() == Some("host") {
         return (AppNetwork::Host, None);
     }
     for key in &service.networks {
-        if key == "proxy" {
+        if key == "proxy" || key == "project" {
             continue;
         }
         if let Some(network) = document.networks.get(key)

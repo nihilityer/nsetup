@@ -1,10 +1,10 @@
 //! CLI 本地命令与远程 RPC 命令执行。
 
-use super::args::{Cli, Command};
+use super::args::{AssetsModeArg, Cli, Command};
 use super::edit::edit_request;
 use super::io::{
-    compact_status, read_assets, read_limited, write_diagnostic, write_line, write_new_file,
-    write_text,
+    compact_status, read_assets, read_files, read_limited, stdin_is_terminal, write_diagnostic,
+    write_line, write_new_file, write_text,
 };
 use super::progress::PullProgressRenderer;
 use crate::constants::MAX_CONFIG_SIZE;
@@ -12,7 +12,7 @@ use crate::install::{InstallOptions, install};
 use crate::rpc::proto;
 use crate::rpc::{Action, RpcClient};
 use crate::template::{TemplateKind, skeleton};
-use dialoguer::Confirm;
+use anyhow::Context;
 use tokio_stream::StreamExt;
 
 /// 执行已解析的命令。
@@ -70,24 +70,7 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
                 status.domain
             ))?;
         }
-        Command::Up(args) => {
-            let config_toml = read_limited(&args.file, MAX_CONFIG_SIZE)?;
-            let assets = args
-                .assets
-                .as_deref()
-                .map(read_assets)
-                .transpose()?
-                .unwrap_or_default();
-            let stream = client
-                .apply(proto::ApplyRequest {
-                    config_toml,
-                    assets,
-                    start: args.start,
-                    force: args.force,
-                })
-                .await?;
-            write_operation_stream(stream).await?;
-        }
+        Command::Up(args) => run_up(client, args).await?,
         Command::Import(args) => {
             let compose_yaml = read_limited(&args.file, MAX_CONFIG_SIZE)?;
             let env_file = args
@@ -105,14 +88,7 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
                 .await?;
             write_operation_stream(stream).await?;
         }
-        Command::Export(args) => {
-            let response = client.export(args.name).await?;
-            if let Some(path) = args.output {
-                write_new_file(&path, response.config_toml.as_bytes())?;
-            } else {
-                write_text(&response.config_toml)?;
-            }
-        }
+        Command::Export(args) => run_export(client, args).await?,
         Command::Edit(args) => {
             let stream = client.edit(edit_request(*args)?).await?;
             write_operation_stream(stream).await?;
@@ -136,13 +112,19 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
         Command::Show(args) => {
             let stack = client.get(args.name).await?;
             write_text(&format!(
-                "项目名: {}\n服务: {}\n状态: {}\n\n{}",
+                "项目名: {}\n服务: {}\n状态: {}\n",
                 stack.name,
                 stack.services.join(", "),
-                stack.status,
-                stack.compose_yaml
+                stack.status
             ))?;
+            if args.routes {
+                write_text(&render_routes(&stack.compose_yaml)?)?;
+            } else {
+                write_text(&format!("\n{}", stack.compose_yaml))?;
+            }
         }
+        Command::Doctor => run_doctor(client).await?,
+        Command::Config(args) => run_config(client, args).await?,
         Command::Start(args) => {
             run_action(client, args.name, Action::Start).await?;
         }
@@ -170,6 +152,54 @@ async fn dispatch_remote(client: &mut RpcClient, command: Command) -> anyhow::Re
     Ok(())
 }
 
+/// 读取声明与附属文件后发起 `up`。
+async fn run_up(client: &mut RpcClient, args: super::args::UpArgs) -> anyhow::Result<()> {
+    let config_toml = read_limited(&args.file, MAX_CONFIG_SIZE)?;
+    let assets = args
+        .assets
+        .as_deref()
+        .map(read_assets)
+        .transpose()?
+        .unwrap_or_default();
+    let project_files = read_files(&args.files)?;
+    let stream = client
+        .apply(proto::ApplyRequest {
+            config_toml,
+            assets,
+            start: args.start,
+            force: args.force,
+            project_files,
+            restart_dependents: args.restart_dependents,
+            assets_provided: args.assets.is_some(),
+            assets_mode: match args.assets_mode {
+                AssetsModeArg::Merge => proto::AssetsMode::Merge as i32,
+                AssetsModeArg::Replace => proto::AssetsMode::Replace as i32,
+            },
+            files_into: args.files_into,
+        })
+        .await?;
+    write_operation_stream(stream).await
+}
+
+/// 导出项目声明并写入文件或标准输出。
+async fn run_export(client: &mut RpcClient, args: super::args::ExportArgs) -> anyhow::Result<()> {
+    let response = client.export(args.name, args.keep_comments).await?;
+    match args.output {
+        Some(path) => write_new_file(&path, response.config_toml.as_bytes()),
+        None => write_text(&response.config_toml),
+    }
+}
+
+/// 输出 Traefik 接管情况报告，并在发现问题时返回非零退出状态。
+async fn run_doctor(client: &mut RpcClient) -> anyhow::Result<()> {
+    let response = client.doctor().await?;
+    write_text(&format!("{}\n", response.report))?;
+    if response.problems > 0 {
+        anyhow::bail!("doctor 发现 {} 个问题", response.problems);
+    }
+    Ok(())
+}
+
 /// 执行一个流式生命周期操作。
 async fn run_action(client: &mut RpcClient, name: String, action: Action) -> anyhow::Result<()> {
     let stream = client.action(name, action).await?;
@@ -193,9 +223,14 @@ async fn run_pull(client: &mut RpcClient, name: String) -> anyhow::Result<()> {
 }
 
 /// 完成确认后流式删除项目。
+///
+/// 非交互场景（管道、脚本、CI）不再返回 `not a terminal`，而是明确提示使用 `--force`。
 async fn run_remove(client: &mut RpcClient, name: String, force: bool) -> anyhow::Result<()> {
+    if !force && !stdin_is_terminal() {
+        anyhow::bail!("标准输入不是终端，无法交互确认删除项目 {name}；确认删除请使用 --force");
+    }
     let confirmed = force
-        || Confirm::new()
+        || dialoguer::Confirm::new()
             .with_prompt(format!("停止并删除项目 {name}？bind mount 数据会保留"))
             .default(false)
             .interact()?;
@@ -205,6 +240,144 @@ async fn run_remove(client: &mut RpcClient, name: String, force: bool) -> anyhow
     } else {
         write_line("已取消")
     }
+}
+
+/// 执行 `config` 子命令。
+async fn run_config(client: &mut RpcClient, args: super::args::ConfigArgs) -> anyhow::Result<()> {
+    match args.command {
+        super::args::ConfigCommand::Show => {
+            let status = client.status().await?;
+            write_line(&format!(
+                "domain = {:?}\nstacks_root = {:?}\nlisten = {:?}",
+                status.domain, status.stacks_root, status.listen
+            ))?;
+        }
+        super::args::ConfigCommand::Set(super::args::ConfigSetArgs {
+            item: super::args::ConfigItem::Domain(args),
+        }) => {
+            let response = client.set_domain(args.domain).await?;
+            write_line(&response.message)?;
+            if response.restart_required {
+                match std::process::Command::new("systemctl")
+                    .args(["restart", "nsetup.service"])
+                    .status()
+                {
+                    Ok(status) if status.success() => {
+                        write_line("daemon 已重启，新域名对后续命令生效")?;
+                    }
+                    Ok(status) => {
+                        write_diagnostic(&format!(
+                            "无法重启 daemon（退出码 {:?}），请手工执行 sudo systemctl restart nsetup.service",
+                            status.code()
+                        ))?;
+                    }
+                    Err(error) => {
+                        write_diagnostic(&format!(
+                            "无法执行 systemctl（{error}），请手工执行 sudo systemctl restart nsetup.service"
+                        ))?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 从 Compose YAML 渲染解析后的 Traefik 路由表。
+///
+/// # 错误
+///
+/// Compose YAML 或 Traefik label 无效时返回错误。
+fn render_routes(compose_yaml: &str) -> anyhow::Result<String> {
+    let document: crate::spec::Document =
+        serde_yaml::from_str(compose_yaml).context("无法解析项目 Compose YAML")?;
+    let mut rows = Vec::new();
+    for (service_name, service) in &document.services {
+        for identity in service.user_route_identities()? {
+            rows.push(RouteRow {
+                host: identity.host.clone(),
+                path: identity.path_prefix.clone(),
+                entrypoint: identity.entrypoint.clone(),
+                protocol: identity.protocol.as_str().to_string(),
+                service: service_name.clone(),
+                port: None,
+                middlewares: Vec::new(),
+                priority: None,
+                managed: false,
+            });
+        }
+        for route in service.routes("", service_name)? {
+            for host in &route.hosts {
+                rows.push(RouteRow {
+                    host: host.clone(),
+                    path: route.path_prefix.clone().unwrap_or_default(),
+                    entrypoint: route.entrypoint_name().to_string(),
+                    protocol: route.protocol.as_str().to_string(),
+                    service: service_name.clone(),
+                    port: Some(route.container_port),
+                    middlewares: route.middleware_references(),
+                    priority: route.priority,
+                    managed: true,
+                });
+            }
+        }
+    }
+    if rows.is_empty() {
+        return Ok(String::from("该项目没有 Traefik 路由\n"));
+    }
+    rows.sort_by(|left, right| {
+        (&left.host, &left.path, &left.entrypoint).cmp(&(
+            &right.host,
+            &right.path,
+            &right.entrypoint,
+        ))
+    });
+    let mut output = String::from("最终生效的 Traefik 路由\n");
+    output.push_str("HOST\tPATH\tENTRYPOINT\tSCHEME\tPRIORITY\tBACKEND\tMIDDLEWARES\t来源\n");
+    for row in rows {
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}:{}\t{}\t{}\n",
+            row.host,
+            if row.path.is_empty() { "/" } else { &row.path },
+            row.entrypoint,
+            row.protocol,
+            row.priority
+                .map_or_else(|| String::from("-"), |value| value.to_string()),
+            row.service,
+            row.port
+                .map_or_else(|| String::from("-"), |value| value.to_string()),
+            if row.middlewares.is_empty() {
+                String::from("-")
+            } else {
+                row.middlewares.join(",")
+            },
+            if row.managed { "nsetup" } else { "labels" }
+        ));
+    }
+    Ok(output)
+}
+
+/// 路由表的一行。
+#[derive(Debug)]
+struct RouteRow {
+    /// 匹配的主机名。
+    host: String,
+    /// 路径前缀；空表示整个主机。
+    path: String,
+    /// 监听的 entrypoint。
+    entrypoint: String,
+    /// 后端协议。
+    protocol: String,
+    /// 后端服务名。
+    service: String,
+    /// 后端容器端口；用户 label 路由未知时为 `None`。
+    port: Option<u16>,
+    /// 引用的中间件。
+    middlewares: Vec<String>,
+    /// 显式优先级。
+    priority: Option<u32>,
+    /// 是否由 nsetup 生成。
+    managed: bool,
 }
 
 /// 显示流式变更阶段，并仅把最终结果写入 stdout。

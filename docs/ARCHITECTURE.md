@@ -56,6 +56,8 @@ classDiagram
         +BTreeMap~String,String~ environment
         +Vec~String~ env_file
         +Vec~String~ labels
+        +Option~String~ user
+        +Vec~String~ group_add
         +Option~Healthcheck~ healthcheck
         +Option~Logging~ logging
     }
@@ -65,17 +67,28 @@ classDiagram
     class SemanticView["语义视图（由字段双向派生）"] {
         +routes() Vec~Route~
         +set_routes(routes, middlewares)
+        +user_route_identities() Vec~RouteIdentity~
+        +route_bindings() Vec~RouteBinding~
         +image_version() / set_image_version()
         +host_ports() Vec~PublishedPort~
-        +route_hosts() Vec~String~
+        +project_hooks() / service_hooks(stage)
     }
     Service ..> SemanticView : Traefik labels / image 字段解析
 ```
 
 - `Document`/`Service` 是 compose YAML 的强类型模型，serde 双向（序列化 +
   解析），全部 `deny_unknown_fields`：不在上表中的 compose 指令（如
-  `depends_on`、`build`、顶层 `volumes`、list 形式的 environment/labels）在
-  导入时直接报错，错误信息指出具体字段。
+  `depends_on`、`build`、顶层 `volumes`、list 形式的 environment/labels）不会
+  进入 IR。`nsetup import` 在解析前先按白名单剔除这些键并在结果中列出被忽略的
+  字段，因此接管既有 Compose 项目不会因为无关字段整体失败；受支持字段本身无效
+  时仍然报错。
+- 路由冲突判定使用 `host + path_prefix + entrypoint + protocol` 组合
+  （`RouteIdentity`），因此同一 host 下可以按路径或协议拆分多条路由。手写
+  `labels` 中的 router 只提取 `Host(...)` 身份用于诊断，不参与冲突校验；
+  `traefik.enable` 原样保留，仅在声明了路由时才由 nsetup 补齐。
+- 启动钩子（`[services.*.hooks]`）不属于 compose 字段，序列化到 `.env` 的
+  `NSETUP_APP_HOOKS_JSON` 中，由 daemon 在 compose up 前后以项目目录为工作目录
+  执行。
 - 语义视图不独立存储：路由、中间件、镜像版本由 labels 和 image 字段按需解析；
   修改时清除旧的生成 labels 再重新生成，派生数据与字段永远一致。
 - `.env` 解析为 `environment` 映射。模板附属文件（Traefik 中间件定义、站点
@@ -146,6 +159,12 @@ port = 9090
 `version` 分别表示所属模板的容器镜像版本），版本校验（C1）
 统一作用于该字段。
 
+服务只要有路由，就同时接入两个网络：外部共享的 `nsetup-proxy`（Traefik 回源）
+和项目网络 `project`。项目网络的 Docker 名被钉为 `<项目>_default`，与未显式声明
+`networks` 的服务所处的隐式默认网络同名，因此同一项目里带路由与不带路由的服务
+仍在同一个网络上。服务接入多个网络时额外生成
+`traefik.docker.network=nsetup-proxy`，避免 Traefik 选到项目网络而无法回源。
+
 ### traefik 模板：反向代理基础设施
 
 ```toml
@@ -207,7 +226,19 @@ jwk_private_key = """
 ...PKCS#8 或 PKCS#1 RSA 私钥...
 -----END PRIVATE KEY-----
 """
+
+# 可选：把 ID Token 之外的 claim 直接写入 ID Token。
+# 键名即客户端 claims_policy 引用的策略名。
+[oidc.claims_policies.default]
+id_token = ["groups", "email", "email_verified", "preferred_username", "name"]
 ```
+
+Authelia 默认只把协议必需的 claim 放进 ID Token，其余 claim 按规范通过
+UserInfo 端点交付。Grafana 等客户端不会主动请求 UserInfo，因此需要
+`claims_policies` 这一逃生舱把 `email`、`name`、`groups`、`preferred_username`
+写进 ID Token，否则登录可用但邮箱、显示名与角色映射全部为空。每个 policy 至少
+声明 `id_token` 或 `access_token` 之一；policy 属于 provider，由客户端用
+`claims_policy = "<名称>"` 引用，引用了未声明的策略时 Authelia 启动即报错。
 
 客户端不属于 Authelia TOML，而是由对应的 app TOML 声明。具名映射键是稳定的
 `client_id`：
@@ -222,6 +253,7 @@ scopes = ["openid", "profile", "email", "groups"]
 grant_types = ["authorization_code", "refresh_token"]
 require_pkce = false
 token_endpoint_auth_method = "client_secret_basic"
+claims_policy = "default"          # 可选；引用 Authelia 项目的 claims policy
 ```
 
 机密客户端只接受密钥摘要，不接受明文；客户端应用保存生成摘要时对应的明文。
@@ -259,6 +291,11 @@ TOML 声明管理，`watch = false`，并禁用容器内密码修改与重置，
 片段，为 Authelia 构造单一 `identity_providers.oidc.clients` 列表；provider 配置仍
 持久化在 Authelia 项目的受管 `.env` 中以支持独立导出。
 
+`claims_policies` 是 provider 级结构，应用片段无法贡献，且 Authelia 的配置模板
+过滤器不支持命名模板，因此由模板直接内联到生成的 YAML 中；没有已声明的客户端时
+整个 `identity_providers` 块都不会生成，也就不需要 provider 密钥。应用片段目录
+为空时不会产生空的 `clients` 键。
+
 Traefik 模板始终生成 `authelia@file` ForwardAuth 中间件，地址固定为共享
 `nsetup-proxy` 网络内的 `http://authelia:9091/api/authz/forward-auth`。普通应用在
 路由中使用 `middlewares = ["authelia"]` 即可启用认证；认证门户自身不使用该
@@ -275,8 +312,12 @@ version = "1.27"
 middlewares = ["gzip"]
 ```
 
-站点文件不写入 TOML，由 `up --assets <目录>` 随请求上传，落盘到项目目录后
-以白名单内绝对路径挂载。
+站点文件不写入 TOML，由 `up --assets <目录>` 随请求上传，落盘到项目目录的
+`site/`，再挂到 nginx 的 `/usr/share/nginx/html`。容器同时以只读方式获得整个
+项目目录（`/opt/nsetup`），把 `nginx.conf` 放进项目目录即可改写服务方式；默认
+站点配置由模板拥有的 `config/nginx/default.conf` 提供。`--assets-mode merge`
+（默认）只覆盖同名文件，`--assets-mode replace` 才清空站点目录；上传文件使用
+`0644`、目录 `0755`，使容器内非 root 进程可以读取。
 
 ## 数据流
 
@@ -429,7 +470,9 @@ bind mount 白名单 = `data_roots` ∪ `stacks_root` ∪ `docker_socket`（精�
 | 配置文件 | `/etc/nsetup/config.toml`（`root:nihility`、`0640`） |
 | TCP 认证 token | `/etc/nsetup/auth.token`（`0600`） |
 | gRPC socket | `/run/nsetup/nsetup.sock`（`root:nihility`、`0660`） |
-| 项目 | `stacks_root/<名称>/{compose.yaml, .env, config/, secrets/, site/}` |
+| 项目 | `stacks_root/<名称>/{compose.yaml, .env, config/, secrets/, site/, files/}` |
+| 项目 `--files` 上传内容 | `stacks_root/<名称>/files/`（`0644`/`0755`，容器内挂到 `/opt/nsetup/files`） |
+| Traefik 动态配置 | `stacks_root/traefik/config/dynamic/{nsetup.yml, custom.yml}`（`providers.file.directory`） |
 | Authelia 状态 | `data_roots[0]/authelia/{db.sqlite3, notification.txt}` |
 
 ## 模块划分
@@ -467,6 +510,20 @@ bind mount 白名单 = `data_roots` ∪ `stacks_root` ∪ `docker_socket`（精�
 | `rpc/client` | Unix socket 与认证 TCP 客户端 |
 | `rpc/transport` | UDS/TCP 监听、Bearer 认证和关闭信号 |
 | `rpc/conversion` | protobuf 线路表示与领域模型之间的转换和校验 |
+
+## 0.2.0 兼容性说明
+
+升级到 0.2.0 时注意以下行为变化：
+
+| 变化 | 说明 |
+| --- | --- |
+| Traefik 动态配置改为目录 | `config/dynamic.yml` 变为 `config/dynamic/nsetup.yml`，启动参数改用 `--providers.file.directory`；同目录的 `custom.yml` 与其它 `*.yml` 不会被 `up` 覆盖。重新部署 traefik 项目即可迁移。 |
+| 指标默认开启 | traefik 模板默认 `metrics = true`，在内网入口暴露 Prometheus 指标并绑定到宿主机回环地址；不需要时显式写 `metrics = false`。 |
+| 静态站点挂载点变化 | 项目目录整体挂到 `/opt/nsetup`，站点根目录由 `/usr/share/nginx/html` 变为 `/opt/nsetup/site`。 |
+| 路由冲突判定放宽 | 冲突按 `host + path_prefix + entrypoint + protocol` 判定，原先因同 host 被判重的配置升级后可以直接应用。 |
+| OIDC 客户端 PKCE 字段 | 仅在 `require_pkce = true` 时输出 `pkce_challenge_method: S256`，不再对全部客户端强制 PKCE。 |
+| 应用后重建容器 | 部署会整体替换项目目录，`up --start`（以及 `edit --start`）在项目有运行中容器时使用 `--force-recreate`，避免容器继续持有已被替换的目录 inode。 |
+| RPC 线路协议变化 | `Route.middlewares` 与 `EditRequest.middlewares` 由枚举改为字符串，并新增 `Doctor`、`SetDomain` 两个 RPC。升级时 CLI 与 daemon 必须来自同一版本；跨版本混用时新客户端调用新 RPC 会得到 `unimplemented`，中间件参数会自行校验失败而不是静默丢弃。 |
 
 ## 设计约束
 

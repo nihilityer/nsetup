@@ -1,6 +1,6 @@
 [package]
 name = "nsetup"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["nihilityer"]
 description = "Nihility 机器守护进程及其 nsetup 管理 CLI"
@@ -16,7 +16,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 dialoguer = "0.12"
-toml = "1"
+toml = "1.1.5"
 anyhow = "1.0"
 rand = "0.10"
 tracing = "0.1"

@@ -56,6 +56,10 @@ fn lexical_normalize(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// 校验全部生成的附属文件路径并拒绝重复项。
+///
+/// # 错误
+///
+/// 路径不是安全相对路径或出现重复时返回错误。
 pub(super) fn validate_generated_files(files: &[GeneratedFile]) -> anyhow::Result<()> {
     let mut paths = BTreeSet::new();
     for file in files {
@@ -93,7 +97,8 @@ pub(super) fn copy_auxiliary(source: &Path, target: &Path) -> anyhow::Result<()>
         }
         if metadata.is_dir() {
             fs::create_dir(&destination)?;
-            set_mode(&destination, 0o750)?;
+            // 附属目录要让容器内非 root 进程可以穿行，否则挂载点无法读取。
+            set_mode(&destination, 0o755)?;
             copy_auxiliary(&entry.path(), &destination)?;
         } else if metadata.is_file() {
             fs::copy(entry.path(), &destination)?;
@@ -106,7 +111,18 @@ pub(super) fn copy_auxiliary(source: &Path, target: &Path) -> anyhow::Result<()>
 }
 
 /// 将一个已校验的模板附属文件写入暂存目录。
-pub(super) fn write_attachment(root: &Path, file: &GeneratedFile) -> anyhow::Result<()> {
+///
+/// `directory_mode` 决定新建父目录的权限：模板附属文件沿用私有目录，上传给容器的
+/// 资源使用 `0755`，使容器内的非 root 用户也能读取。
+///
+/// # 错误
+///
+/// 路径不安全、父目录被符号链接占用或写入失败时返回错误。
+pub(super) fn write_attachment(
+    root: &Path,
+    file: &GeneratedFile,
+    directory_mode: u32,
+) -> anyhow::Result<()> {
     validate_relative_path(&file.path)?;
     let destination = root.join(&file.path);
     if !file.replace && destination.is_file() {
@@ -115,7 +131,7 @@ pub(super) fn write_attachment(root: &Path, file: &GeneratedFile) -> anyhow::Res
     let parent = destination
         .parent()
         .ok_or_else(|| anyhow::anyhow!("附属文件缺少父目录"))?;
-    create_safe_directories(root, parent)?;
+    create_safe_directories(root, parent, directory_mode)?;
     if let Ok(metadata) = fs::symlink_metadata(&destination)
         && (!metadata.is_file() || metadata.file_type().is_symlink())
     {
@@ -125,13 +141,21 @@ pub(super) fn write_attachment(root: &Path, file: &GeneratedFile) -> anyhow::Res
 }
 
 /// 原子替换项目内的单个受管附属文件。
-pub(super) fn replace_attachment(root: &Path, file: &GeneratedFile) -> anyhow::Result<()> {
+///
+/// # 错误
+///
+/// 路径不安全、父目录被符号链接占用或写入失败时返回错误。
+pub(super) fn replace_attachment(
+    root: &Path,
+    file: &GeneratedFile,
+    directory_mode: u32,
+) -> anyhow::Result<()> {
     validate_relative_path(&file.path)?;
     let destination = root.join(&file.path);
     let parent = destination
         .parent()
         .ok_or_else(|| anyhow::anyhow!("附属文件缺少父目录"))?;
-    create_safe_directories(root, parent)?;
+    create_safe_directories(root, parent, directory_mode)?;
     if let Ok(metadata) = fs::symlink_metadata(&destination)
         && (!metadata.is_file() || metadata.file_type().is_symlink())
     {
@@ -169,7 +193,11 @@ pub(super) fn remove_attachment(root: &Path, path: &Path) -> anyhow::Result<bool
 }
 
 /// 创建附属文件目录链，同时拒绝符号链接。
-fn create_safe_directories(root: &Path, destination: &Path) -> anyhow::Result<()> {
+fn create_safe_directories(
+    root: &Path,
+    destination: &Path,
+    directory_mode: u32,
+) -> anyhow::Result<()> {
     let relative = destination
         .strip_prefix(root)
         .map_err(|_| anyhow::anyhow!("附属文件越出项目目录"))?;
@@ -183,7 +211,7 @@ fn create_safe_directories(root: &Path, destination: &Path) -> anyhow::Result<()
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 fs::create_dir(&current)?;
-                set_mode(&current, 0o750)?;
+                set_mode(&current, directory_mode)?;
             }
             Err(error) => return Err(error.into()),
         }

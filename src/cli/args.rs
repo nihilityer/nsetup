@@ -91,7 +91,7 @@ pub enum Command {
     /// 列出受管项目。
     List,
     /// 显示单个受管项目。
-    Show(NameArgs),
+    Show(ShowArgs),
     /// 启动项目。
     Start(NameArgs),
     /// 停止项目。
@@ -107,6 +107,10 @@ pub enum Command {
     /// 停止并删除项目，同时保留 bind mount 数据。
     #[command(name = "rm")]
     Remove(RemoveArgs),
+    /// 比对容器 label 与 Traefik 实际加载的路由，报告未被接管的服务。
+    Doctor,
+    /// 查询或修改 daemon 配置。
+    Config(ConfigArgs),
     /// 为 systemd 运行特权 daemon。
     #[command(hide = true)]
     Daemon,
@@ -152,12 +156,29 @@ pub struct UpArgs {
     /// 静态站点资源目录。
     #[arg(long)]
     pub assets: Option<PathBuf>,
+    /// `--assets` 与既有站点内容的合并方式；支持 `merge`、`replace`。
+    #[arg(
+        long,
+        default_value = "merge",
+        hide_default_value = true,
+        hide_possible_values = true
+    )]
+    pub assets_mode: AssetsModeArg,
+    /// 上传到项目 `files/` 目录并挂载进容器的文件或目录；可重复指定。
+    #[arg(long = "files", value_name = "路径")]
+    pub files: Vec<PathBuf>,
+    /// `--files` 在容器内的挂载目标。
+    #[arg(long, default_value = "/opt/nsetup/files", hide_default_value = true)]
+    pub files_into: String,
     /// 应用成功后启动项目。
     #[arg(long)]
     pub start: bool,
     /// 替换现有项目。
     #[arg(long)]
     pub force: bool,
+    /// Authelia OIDC 客户端变化后顺带重启 authelia。
+    #[arg(long)]
+    pub restart_dependents: bool,
 }
 
 /// `import` 接受的参数。
@@ -184,6 +205,67 @@ pub struct ExportArgs {
     /// 输出文件；省略时写入标准输出。
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
+    /// 在结果前追加当前版本的带注释骨架。
+    #[arg(long)]
+    pub keep_comments: bool,
+}
+
+/// `show` 接受的参数。
+#[derive(Debug, Args)]
+pub struct ShowArgs {
+    /// 项目名。
+    pub name: String,
+    /// 输出解析后的 Traefik router / service / middleware 表。
+    #[arg(long)]
+    pub routes: bool,
+}
+
+/// `config` 接受的参数。
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    /// 配置子命令。
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+/// `config` 支持的子命令。
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// 显示当前 daemon 配置。
+    Show,
+    /// 修改 daemon 配置项。
+    Set(ConfigSetArgs),
+}
+
+/// `config set` 支持的配置项。
+#[derive(Debug, Args)]
+pub struct ConfigSetArgs {
+    /// 要修改的配置项。
+    #[command(subcommand)]
+    pub item: ConfigItem,
+}
+
+/// `config set` 支持的配置项列表。
+#[derive(Debug, Subcommand)]
+pub enum ConfigItem {
+    /// 更新基础域名，无需重装 daemon。
+    Domain(DomainArgs),
+}
+
+/// `config set domain` 接受的位置参数。
+#[derive(Debug, Args)]
+pub struct DomainArgs {
+    /// 新的基础域名。
+    pub domain: String,
+}
+
+/// `--assets` 的合并方式。
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AssetsModeArg {
+    /// 只覆盖同名文件，保留其它既有站点文件。
+    Merge,
+    /// 先清空站点目录再写入上传的文件。
+    Replace,
 }
 
 /// 简单项目命令共用的参数。
@@ -242,9 +324,12 @@ pub struct EditArgs {
     /// 应用于新路由的 URL 路径前缀。
     #[arg(long)]
     pub path_prefix: Option<String>,
-    /// 新路由中间件；可重复指定，支持 `authelia`、`gzip`、`forwarded-headers`、`internal-only`、`tls`。
-    #[arg(long = "middleware", hide_possible_values = true)]
-    pub middlewares: Vec<MiddlewareArg>,
+    /// 新路由的 entrypoint；省略时使用 `https`。
+    #[arg(long)]
+    pub entrypoint: Option<String>,
+    /// 新路由中间件；可重复指定，支持内置名称与自定义中间件名。
+    #[arg(long = "middleware")]
+    pub middlewares: Vec<String>,
     /// 新路由使用的后端协议；支持 `http`、`https`、`h2c`，默认为 `http`。
     #[arg(
         long,
@@ -252,7 +337,7 @@ pub struct EditArgs {
         hide_default_value = true,
         hide_possible_values = true
     )]
-    pub protocol: ProtocolArg,
+    pub protocol: String,
     /// 为新路由启用粘性 Cookie。
     #[arg(long)]
     pub sticky_cookie: bool,
@@ -283,6 +368,9 @@ pub struct EditArgs {
     /// `CMD-SHELL` 形式的健康检查命令。
     #[arg(long)]
     pub healthcheck_cmd: Option<String>,
+    /// `CMD`（argv）形式的健康检查参数；与 `--healthcheck-cmd` 互斥。
+    #[arg(long = "healthcheck-exec", num_args = 1..)]
+    pub healthcheck_exec: Vec<String>,
     /// 健康检查间隔。
     #[arg(long)]
     pub healthcheck_interval: Option<String>,
@@ -312,30 +400,4 @@ pub enum NetworkArg {
     Host,
     /// 指定名称的外部网络。
     External,
-}
-
-/// CLI 路由协议选项。
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ProtocolArg {
-    /// 普通 HTTP。
-    Http,
-    /// 连接后端的 HTTPS。
-    Https,
-    /// 明文 HTTP/2。
-    H2c,
-}
-
-/// CLI 中间件选项。
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum MiddlewareArg {
-    /// 通过 Authelia `ForwardAuth` 执行统一认证。
-    Authelia,
-    /// 响应压缩。
-    Gzip,
-    /// 转发请求头。
-    ForwardedHeaders,
-    /// 内网地址白名单。
-    InternalOnly,
-    /// TLS 安全响应头。
-    Tls,
 }

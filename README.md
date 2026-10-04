@@ -7,9 +7,11 @@ socket 调用，无需反复使用 `sudo`，也不会默认开放管理端口。
 ## 能做什么
 
 - 用 TOML 声明并管理单服务、多服务和静态站点；
-- 生成 Traefik 与 Authelia 基础设施；
-- 导入受支持的 Compose 项目，并从当前状态导出 TOML；
+- 生成 Traefik 与 Authelia 基础设施，同一域名下按路径或协议拆分多条路由；
+- 用 `--files` 上传宿主机文件、用 `[services.*.hooks]` 声明一次性初始化，无需 sudo；
+- 导入既有 Compose 项目（忽略不支持字段并列出清单），并从当前状态导出 TOML；
 - 统一执行启动、停止、升级、日志和删除等操作；
+- 用 `nsetup doctor` 比对容器 label 与 Traefik 实际加载的路由；
 - 限制 bind mount 根目录，并支持带 token 的远程 daemon。
 
 ## 快速开始
@@ -37,6 +39,8 @@ nsetup status
 nsetup template app > app.toml
 nsetup up -f app.toml --start
 nsetup list
+nsetup show app --routes
+nsetup doctor
 ```
 
 TOML 中的镜像必须使用独立、明确的 `version`，不能省略或使用 `latest`。短路由主机名

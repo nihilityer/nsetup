@@ -1,6 +1,6 @@
 //! 端口、挂载、健康检查、镜像与名称值对象。
 
-use super::{BindMount, Healthcheck, PortProtocol, PublishedPort, Route};
+use super::{BindMount, Healthcheck, PortProtocol, PublishedPort, Route, ServiceHooks};
 use crate::config::validate_domain;
 use anyhow::Context;
 use std::path::Path;
@@ -10,7 +10,7 @@ impl Route {
     ///
     /// # 错误
     ///
-    /// 缺少主机名，或 DNS 名称、路径、端口无效时返回错误。
+    /// 缺少主机名，或 DNS 名称、路径、入口、端口无效时返回错误。
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_name("Traefik 路由名", &self.name)?;
         if self.hosts.is_empty() {
@@ -23,6 +23,9 @@ impl Route {
             && (!path.starts_with('/') || path.contains('`'))
         {
             anyhow::bail!("path_prefix 必须以 / 开头且不能含反引号: {path}");
+        }
+        if !self.entrypoint.trim().is_empty() {
+            let _entrypoints = validate_entrypoints(&self.entrypoint)?;
         }
         if self.container_port == 0 {
             anyhow::bail!("路由容器端口必须在 1..=65535 范围内");
@@ -129,7 +132,29 @@ impl Healthcheck {
         }
     }
 
-    /// 当前健康检查受支持时返回 shell 命令。
+    /// 构造 exec 形式的 `CMD` 健康检查。
+    ///
+    /// 没有 shell 的镜像只能用这种形式；等价于 Dockerfile 的 `HEALTHCHECK CMD`。
+    ///
+    /// # 错误
+    ///
+    /// 参数列表为空时返回错误。
+    pub fn exec(arguments: &[String]) -> anyhow::Result<Self> {
+        if arguments.is_empty() {
+            anyhow::bail!("CMD 健康检查至少需要一个参数");
+        }
+        let mut test = vec![String::from("CMD")];
+        test.extend(arguments.iter().cloned());
+        Ok(Self {
+            test,
+            interval: None,
+            timeout: None,
+            start_period: None,
+            retries: None,
+        })
+    }
+
+    /// 当前健康检查为 `CMD-SHELL` 形式时返回 shell 命令。
     ///
     /// # 错误
     ///
@@ -137,18 +162,156 @@ impl Healthcheck {
     pub fn shell_command(&self) -> anyhow::Result<&str> {
         match self.test.as_slice() {
             [kind, command] if kind == "CMD-SHELL" && !command.is_empty() => Ok(command),
-            _ => anyhow::bail!("healthcheck.test 只支持 [CMD-SHELL, command]"),
+            _ => anyhow::bail!("healthcheck.test 不是 [CMD-SHELL, command] 形式"),
+        }
+    }
+
+    /// 当前健康检查为 exec 形式时返回参数列表。
+    ///
+    /// # 错误
+    ///
+    /// 健康检查不是 `CMD` 形式时返回错误。
+    pub fn exec_arguments(&self) -> anyhow::Result<&[String]> {
+        match self.test.split_first() {
+            Some((kind, arguments)) if kind == "CMD" && !arguments.is_empty() => Ok(arguments),
+            _ => anyhow::bail!("healthcheck.test 不是 [CMD, ..] 形式"),
         }
     }
 
     /// 校验受支持的健康检查表示。
-    pub(super) fn validate(&self) -> anyhow::Result<()> {
-        let _command = self.shell_command()?;
+    ///
+    /// # 错误
+    ///
+    /// 测试命令不受支持或重试次数为 0 时返回错误。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.test.len() > 64 {
+            anyhow::bail!("healthcheck.test 参数过多");
+        }
+        let shell = self.shell_command().is_ok();
+        let exec = match self.exec_arguments() {
+            Ok(arguments) => {
+                arguments.iter().all(|value| !value.is_empty())
+                    && arguments
+                        .iter()
+                        .all(|value| !value.contains(['\n', '\r', '\0']))
+            }
+            Err(_) => false,
+        };
+        if !shell && !exec {
+            anyhow::bail!("healthcheck.test 只支持 [CMD-SHELL, command] 或 [CMD, arg, ..]");
+        }
+        if let Ok(command) = self.shell_command()
+            && command.contains('\0')
+        {
+            anyhow::bail!("healthcheck.test 命令不能包含空字符");
+        }
         if self.retries == Some(0) {
             anyhow::bail!("healthcheck.retries 必须大于 0");
         }
         Ok(())
     }
+}
+
+/// 校验容器运行用户覆盖值。
+///
+/// # 错误
+///
+/// 值不是 `UID[:GID]` 形式的数字时返回错误。
+pub fn validate_user(value: &str) -> anyhow::Result<()> {
+    let valid = !value.is_empty()
+        && value.len() <= 64
+        && !value.contains(char::is_whitespace)
+        && value.split(':').count() <= 2
+        && value
+            .split(':')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    if !valid {
+        anyhow::bail!("user 必须是 UID[:GID] 形式的数字: {value}");
+    }
+    Ok(())
+}
+
+/// 校验补充用户组条目。
+///
+/// # 错误
+///
+/// 组名称为空、含控制字符或过长时返回错误。
+pub fn validate_group(value: &str) -> anyhow::Result<()> {
+    let valid = !value.is_empty()
+        && value.len() <= 64
+        && !value.contains(char::is_whitespace)
+        && !value.chars().any(char::is_control);
+    if !valid {
+        anyhow::bail!("group_add 条目无效: {value}");
+    }
+    Ok(())
+}
+
+/// 校验服务启动钩子命令。
+///
+/// # 错误
+///
+/// 命令为空、过长或含空字符时返回错误。
+pub fn validate_hooks(label: &str, hooks: &ServiceHooks) -> anyhow::Result<()> {
+    for stage in [super::HookStage::PreStart, super::HookStage::PostStart] {
+        for command in hooks.commands(stage) {
+            if command.trim().is_empty() {
+                anyhow::bail!("{label} 的 hooks.{} 命令不能为空", stage.label());
+            }
+            if command.len() > 4096 {
+                anyhow::bail!("{label} 的 hooks.{} 命令过长", stage.label());
+            }
+            if command.contains('\0') {
+                anyhow::bail!("{label} 的 hooks.{} 命令不能包含空字符", stage.label());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 校验自定义 Traefik 中间件名称。
+///
+/// 中间件名可以携带 `@file`、`@docker` 等 provider 后缀；裸名称默认指向
+/// `@file`，与内置中间件保持一致。
+///
+/// # 错误
+///
+/// 名称为空或包含无法出现在 Traefik label 中的字符时返回错误。
+pub fn validate_middleware(value: &str) -> anyhow::Result<()> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@'));
+    if !valid {
+        anyhow::bail!("Traefik 中间件名无效: {value}");
+    }
+    Ok(())
+}
+
+/// 校验 Traefik entrypoint 列表。
+///
+/// # 错误
+///
+/// 列表为空或含非法名称时返回错误。
+pub fn validate_entrypoints(value: &str) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for name in value.split(',') {
+        let name = name.trim();
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            anyhow::bail!("Traefik entrypoint 无效: {value}");
+        }
+        names.push(name.to_string());
+    }
+    if names.is_empty() {
+        anyhow::bail!("Traefik entrypoint 不能为空: {value}");
+    }
+    Ok(names)
 }
 
 /// 校验受管项目名或服务名。

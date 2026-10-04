@@ -114,6 +114,7 @@ fn route_from_proto(route: proto::Route) -> anyhow::Result<Route> {
             proto::RouteProtocol::Https => RouteProtocol::Https,
             proto::RouteProtocol::H2c => RouteProtocol::H2c,
         },
+        entrypoint: route.entrypoint.unwrap_or_default(),
         sticky_cookie: route.sticky_cookie,
         pass_host_header: route.pass_host_header,
         priority: route.priority,
@@ -157,23 +158,19 @@ fn network_from_proto(value: i32, external: Option<&str>) -> anyhow::Result<Netw
     }
 }
 
-/// 将中间件枚举数值转换为稳定的模板名称。
+/// 校验路由或编辑请求引用的 Traefik 中间件名称。
+///
+/// 中间件不再限制为内置枚举：`authelia`、`gzip` 等由 traefik 模板生成，其它名称
+/// 允许引用用户通过 `[traefik.middlewares]` 或 `files/` 追加的自定义中间件。
 ///
 /// # 错误
 ///
-/// 枚举值未知或未指定时返回错误。
-fn middleware_names(values: &[i32]) -> anyhow::Result<Vec<String>> {
-    values
-        .iter()
-        .map(|value| match proto::Middleware::try_from(*value)? {
-            proto::Middleware::Unspecified => anyhow::bail!("middleware 不能为 unspecified"),
-            proto::Middleware::Authelia => Ok(String::from("authelia")),
-            proto::Middleware::Gzip => Ok(String::from("gzip")),
-            proto::Middleware::ForwardedHeaders => Ok(String::from("forwarded-headers")),
-            proto::Middleware::InternalOnly => Ok(String::from("internal-only")),
-            proto::Middleware::Tls => Ok(String::from("tls")),
-        })
-        .collect()
+/// 名称为空或包含无法出现在 Traefik label 中的字符时返回错误。
+fn middleware_names(values: &[String]) -> anyhow::Result<Vec<String>> {
+    for value in values {
+        crate::spec::validate_middleware(value)?;
+    }
+    Ok(values.to_vec())
 }
 
 /// 将线路健康检查转换为 Compose IR 表示。
@@ -182,16 +179,19 @@ fn middleware_names(values: &[i32]) -> anyhow::Result<Vec<String>> {
 ///
 /// 命令为空或重试次数无效时返回错误。
 fn healthcheck_from_proto(value: proto::Healthcheck) -> anyhow::Result<Healthcheck> {
-    if value.command.is_empty() {
-        anyhow::bail!("healthcheck command 不能为空");
-    }
     if value.retries == Some(0) {
         anyhow::bail!("healthcheck retries 必须大于 0");
     }
-    let mut output = Healthcheck::command(value.command);
+    let mut output = match (value.command.is_empty(), value.exec.is_empty()) {
+        (false, true) => Healthcheck::command(value.command),
+        (true, false) => Healthcheck::exec(&value.exec)?,
+        (false, false) => anyhow::bail!("healthcheck 不能同时使用 command 与 exec"),
+        (true, true) => anyhow::bail!("healthcheck 需要 command 或 exec"),
+    };
     output.interval = value.interval;
     output.timeout = value.timeout;
     output.start_period = value.start_period;
     output.retries = value.retries;
+    output.validate()?;
     Ok(output)
 }

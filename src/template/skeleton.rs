@@ -31,8 +31,15 @@ port = 8080
 # [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp|udp]。
 # publish = ["127.0.0.1:12780:8080/tcp"]
 
-# bind mount。宿主机路径必须是 data_roots/stacks_root 下的绝对路径；仅支持可选 :ro。
+# bind mount。宿主机路径必须是 data_roots/stacks_root 或本项目目录内的绝对路径；
+# 仅支持可选 :ro。日常部署优先用 nsetup up -f app.toml --files <路径>。
 # volumes = ["/var/lib/nsetup/data/media:/data"]
+
+# 容器运行用户。需要以固定用户（尤其 root）读取宿主机文件时使用 UID[:GID]。
+# user = "0:0"
+
+# 除主用户组外额外加入的补充组；可用组名或数字 GID。
+# group_add = ["988"]
 
 # 容器环境变量。键和值都使用字符串；密钥应优先放在权限受控的文件中。
 # environment = { LOG_LEVEL = "info", TZ = "Asia/Shanghai" }
@@ -55,20 +62,30 @@ port = 8080
 # 额外 Docker labels，格式为 KEY=VALUE。Traefik 路由 labels 由 nsetup 自动生成。
 # labels = ["com.example.owner=infra"]
 
-# 可选 CMD-SHELL 健康检查。启用本表时 command 必填，其余字段省略则沿用镜像/Compose 行为。
+# 可选健康检查。不写本表时不会覆盖镜像自带的 HEALTHCHECK。
+# command 是 shell 字符串时为 CMD-SHELL；写成数组时是 CMD（argv），
+# 没有 shell 的镜像（如 tuwunel）只能用 argv 形式。
 # [services.web.healthcheck]
 # command = "wget -qO- http://127.0.0.1:8080/health || exit 1"
+# command = ["/usr/bin/curl", "-f", "http://127.0.0.1:8080/health"]
 # interval = "30s"       # 两次检查的间隔。
 # timeout = "3s"         # 单次检查的超时时间。
 # start_period = "20s"   # 容器启动后的失败宽限期。
 # retries = 3             # 判定 unhealthy 前的连续失败次数，必须大于 0。
+
+# 可选启动钩子。在 daemon 上以本项目目录为工作目录、通过 sh -c 顺序执行；
+# pre_start 在 compose up 之前、post_start 之后执行，post_start 仅在 --start 时运行。
+# [services.web.hooks]
+# pre_start = ["install -d -m 0755 data", "docker run --rm -v $PWD/data:/d alpine chown -R 1000 /d"]
+# post_start = ["docker exec web app init"]
 
 # 可选 Docker 日志配置。driver 必填；options 由所选驱动解释。
 # [services.web.logging]
 # driver = "json-file"
 # options = { max-size = "10m", max-file = "3" }
 
-# 可选 Traefik 紧凑路由。启用后服务自动加入 nsetup-proxy 网络并使用 HTTPS 入口。
+# 可选 Traefik 紧凑路由。启用后服务同时加入 nsetup-proxy 与项目默认网络：
+# 前者供 Traefik 回源，后者保证仍能访问同项目其它服务；入口固定为 HTTPS。
 [services.web.traefik]
 
 # 一个路由可匹配多个主机名；短名称会拼接 nsetup 的全局 domain。
@@ -77,11 +94,15 @@ hosts = ["media"]
 # 可选路径前缀，必须以 / 开头；省略时匹配整个主机。
 # path_prefix = "/api"
 
-# 可选内置中间件，按顺序执行：authelia、gzip、forwarded-headers、internal-only、tls。
+# 中间件按顺序执行。内置名称：authelia、gzip、forwarded-headers、internal-only、tls；
+# 其它名称引用 traefik.toml 的 [middlewares.<名称>] 或 files/ 里的自定义中间件。
 # middlewares = ["authelia", "gzip"]
 
 # Traefik 到容器的协议：http（默认）| https | h2c。
 # protocol = "http"
+
+# 路由监听的 entrypoint；省略时为 https。需要 http 明文访问时显式写 http。
+# entrypoint = "https"
 
 # 是否启用负载均衡粘性 Cookie，默认 false。
 # sticky_cookie = false
@@ -92,6 +113,8 @@ hosts = ["media"]
 # 路由优先级。省略时由 Traefik 根据规则自动计算。
 # priority = 100
 
+# 同一 host 下可以按 path_prefix 或协议拆分多条路由，nsetup 只拒绝
+# host + path_prefix + entrypoint + protocol 完全相同的组合。
 # 需要不同端口、路径或协议的多条路由时，使用具名 routes 表。
 # route.port 省略时回退到 services.web.port；route.middlewares 省略时继承上面的 middlewares。
 # 通常在紧凑 hosts 与详细 routes 之间选择一种表达方式。
@@ -102,6 +125,7 @@ hosts = ["media"]
 # port = 9090
 # middlewares = ["authelia"]
 # protocol = "h2c"
+# entrypoint = "https"
 # sticky_cookie = true
 # pass_host_header = false
 # priority = 200
@@ -119,8 +143,16 @@ hosts = ["media"]
 # grant_types = ["authorization_code"]
 # require_pkce = false
 # token_endpoint_auth_method = "client_secret_basic" # 或 client_secret_post
+# 引用 authelia.toml 中 [oidc.claims_policies.<名称>] 声明的策略；Grafana 等不请求
+# UserInfo 的应用必须配置此项，否则 ID Token 里没有 groups 等 claim。
+# claims_policy = "my-app"
 # SPA/CLI 等公共客户端应省略 client_secret_hash，并设置 public = true、
 # require_pkce = true、token_endpoint_auth_method = "none"。
+
+# 需要把宿主机文件交给容器读取时，用 nsetup up -f app.toml --files ./config 上传：
+# 目录内容会写入项目目录的 files/ 并以只读方式挂到 /opt/nsetup/files
+# （可用 --files-into 改挂载点），无需 sudo 或一次性特权容器。
+# netbird 的 config.yaml 之类可以在 TOML 中直接引用 /opt/nsetup/files/config.yaml。
 
 # 多服务项目继续增加 [services.<名称>]；每个服务至少需要 image 与 version。
 # [services.worker]
@@ -141,6 +173,8 @@ pub(super) const AUTHELIA_SKELETON: &str = r#"# Authelia 基础认证设施模�
 # openssl rand -hex 64
 # openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out oidc-rs256.pem
 # OIDC 客户端不在此文件声明；请在对应应用中使用 [authelia.oidc_clients.<client_id>]。
+# 可选 claims_policies 用于把 ID Token 之外的 claim 直接写进 ID Token；Grafana 等
+# 不请求 UserInfo 的应用必须为客户端配置 claims_policy 才能拿到 email/name/groups。
 format = 1
 template = "authelia"
 host = "auth"
@@ -159,6 +193,20 @@ storage_encryption_key = "replace-with-at-least-32-random-characters"
 # replace-with-generated-rsa-private-key
 # -----END PRIVATE KEY-----
 # """
+# 可选具名 claims policy，键名由引用它的客户端 claims_policy 指定。
+# 每个 policy 至少声明 id_token 或 access_token 之一，claim 名区分大小写。
+# [oidc.claims_policies.default]
+# id_token = ["groups", "email", "email_verified", "preferred_username", "name"]
+#
+# 客户端只在 require_pkce = true 时才输出 pkce_challenge_method: S256；
+# Authelia 把该字段视为对该客户端强制 PKCE，会拒绝不发送 code_challenge 的客户端。
+
+# 可选自身遥测，默认不暴露指标也不导出 trace。
+# [telemetry]
+# metrics_address = "tcp://0.0.0.0:9959"
+# metrics_path = "/metrics"
+# tracing_address = "udp://otel-collector:4318"
+# tracing_sample_rate = 0.5
 
 [users.admin]
 display_name = "Administrator"
@@ -180,10 +228,31 @@ https_port = 443
 # 通过 Authelia ForwardAuth 保护 dashboard；仍保留内网来源限制。
 # 请先准备 Authelia 配置，再开启此项。
 dashboard_authelia = true
+# 暴露 Traefik 自身的 Prometheus 指标，默认开启。指标入口只在内网监听，
+# 同时以 127.0.0.1:<metrics_port> 绑定到宿主机回环地址，供本机采集器抓取。
+# metrics = true
+# metrics_port = 8081
+
+# 追加自定义中间件，供应用路由的 middlewares 引用。
+# [middlewares.replace-path]
+# kind = "replacePath"
+# args = { path = "/status" }
+#
+# [middlewares.strip-api]
+# kind = "stripPrefix"
+# args = { prefixes = ["/api"], forceSlash = true }
+
+# 生成的内置中间件写入 config/dynamic/nsetup.yml；同目录的 custom.yml 由用户拥有，
+# 不会被 nsetup up 覆盖，可以在其中追加路由与中间件。
 "#;
 
 /// CLI 输出的带注释静态站点模板。
-pub(super) const STATIC_SKELETON: &str = r#"# 静态 Nginx 站点；使用 --assets 上传文件
+pub(super) const STATIC_SKELETON: &str = r#"# 静态 Nginx 站点；使用 --assets 上传站点文件
+#
+# 上传目录整体位于项目目录的 site/，挂载到 /usr/share/nginx/html。容器同时以
+# 只读方式获得整个项目目录（/opt/nsetup），放入 nginx.conf 即可改写服务方式；
+# 默认站点配置由 config/nginx/default.conf 提供。
+# --assets-mode merge（默认）只覆盖同名文件，需要删除已下线文件时用 replace。
 format = 1
 template = "static"
 name = "docs"

@@ -5,7 +5,8 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::Permissions;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// 存储在 `/etc/nsetup/config.toml` 中的扁平 daemon 配置。
@@ -124,6 +125,44 @@ impl Default for Config {
 pub fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
     std::fs::set_permissions(path, Permissions::from_mode(mode))
         .with_context(|| format!("无法设置路径权限: {}", path.display()))
+}
+
+/// 原子替换系统配置文件并保持 `root:nihility` 属组。
+///
+/// # 错误
+///
+/// 写入、同步、授权或重命名失败时返回错误。
+pub fn write_system_config(config: &Config) -> anyhow::Result<()> {
+    let path = config_path();
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("配置路径缺少父目录: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_file_name(format!(".config.toml.tmp-{}", std::process::id()));
+    let content = toml::to_string_pretty(config)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o640)
+        .open(&temporary)
+        .with_context(|| format!("无法写入配置文件: {}", temporary.display()))?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    set_mode(&temporary, 0o640)?;
+    let status = std::process::Command::new("chown")
+        .arg(format!("root:{}", crate::constants::ADMIN_GROUP))
+        .arg(&temporary)
+        .status()
+        .context("无法执行 chown 设置配置文件属组")?;
+    if !status.success() {
+        let _removed = std::fs::remove_file(&temporary);
+        anyhow::bail!("无法设置配置文件属组，请以 root 运行");
+    }
+    std::fs::rename(&temporary, &path)
+        .with_context(|| format!("无法替换配置文件: {}", path.display()))?;
+    Ok(())
 }
 
 /// 校验路由与基础域名配置接受的 DNS 名称。

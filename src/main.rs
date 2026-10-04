@@ -4,6 +4,8 @@ mod cli;
 mod config;
 mod constants;
 mod docker;
+mod doctor;
+mod import;
 mod install;
 mod orchestrator;
 mod rpc;

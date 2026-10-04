@@ -2,9 +2,12 @@
 
 use super::service::{label_map, parse_hosts, validate_labels};
 use super::value::{
-    validate_docker_object_name, validate_relative_compose_path, validate_tagged_image,
+    validate_docker_object_name, validate_group, validate_relative_compose_path,
+    validate_tagged_image, validate_user,
 };
-use super::{BindMount, Document, PublishedPort, StackSpec, validate_name};
+use super::{
+    BindMount, Document, PublishedPort, RouteBinding, ServiceHooks, StackSpec, validate_name,
+};
 use crate::config::validate_domain;
 use crate::constants::{COMPOSE_FILE, ENV_FILE};
 use anyhow::Context;
@@ -21,6 +24,24 @@ impl StackSpec {
         validate_name("项目名", name)?;
         let document: Document =
             serde_yaml::from_str(compose_yaml).context("Compose YAML 含不支持的字段或值")?;
+        let spec = Self {
+            name: name.to_string(),
+            document,
+            environment: parse_env_file(env_file)?,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// 用已解析的 Compose 文档与项目环境构造并校验状态。
+    ///
+    /// 供宽容导入路径复用：YAML 由调用方解析并剔除不支持的键。
+    ///
+    /// # 错误
+    ///
+    /// 项目名、镜像、端口、label 或挂载无效时返回错误。
+    pub fn parse_compose(name: &str, document: Document, env_file: &str) -> anyhow::Result<Self> {
+        validate_name("项目名", name)?;
         let spec = Self {
             name: name.to_string(),
             document,
@@ -71,6 +92,12 @@ impl StackSpec {
             if let Some(container_name) = &service.container_name {
                 validate_docker_object_name("container_name", container_name)?;
             }
+            if let Some(user) = &service.user {
+                validate_user(user)?;
+            }
+            for group in &service.group_add {
+                validate_group(group)?;
+            }
             let resolved = interpolate_image(&service.image, &self.environment)?;
             validate_tagged_image(&resolved)?;
             if service
@@ -111,7 +138,8 @@ impl StackSpec {
                 route.validate()?;
             }
         }
-        let _route_hosts = self.route_hosts()?;
+        let _bindings = self.route_bindings()?;
+        let _hooks = self.project_hooks()?;
         Ok(())
     }
 
@@ -148,6 +176,21 @@ impl StackSpec {
             .collect()
     }
 
+    /// 返回全部由 nsetup 生成的路由绑定，用于跨项目冲突检查与诊断。
+    ///
+    /// # 错误
+    ///
+    /// 生成的路由 label 无效时返回错误。
+    pub fn route_bindings(&self) -> anyhow::Result<Vec<RouteBinding>> {
+        let mut bindings = Vec::new();
+        for (service_name, service) in &self.document.services {
+            for route in service.routes(&self.name, service_name)? {
+                bindings.extend(route.bindings(&self.name, service_name));
+            }
+        }
+        Ok(bindings)
+    }
+
     /// 返回 Traefik label 声明的全部主机名。
     ///
     /// # 错误
@@ -169,6 +212,76 @@ impl StackSpec {
             }
         }
         Ok(hosts)
+    }
+
+    /// 返回在项目中声明的全部主域名。
+    ///
+    /// 用于 `config set domain` 变更前提示哪些项目显式钉定了旧域名。
+    ///
+    /// # 错误
+    ///
+    /// 路由 label 无效时返回错误。
+    pub fn domains(&self) -> anyhow::Result<BTreeSet<String>> {
+        let mut domains = BTreeSet::new();
+        for host in self.route_hosts()? {
+            if let Some(rest) = host.split_once('.') {
+                domains.insert(rest.1.to_string());
+            }
+        }
+        Ok(domains)
+    }
+
+    /// 返回全部服务启动钩子，按 Compose 服务名排序。
+    ///
+    /// # 错误
+    ///
+    /// 项目环境中的钩子记录不是合法 JSON 时返回错误。
+    pub fn project_hooks(&self) -> anyhow::Result<BTreeMap<String, ServiceHooks>> {
+        match self.environment.get(super::HOOKS_KEY) {
+            Some(value) => Ok(serde_json::from_str(value)?),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// 记录服务启动钩子，仅保存非空条目。
+    ///
+    /// # 错误
+    ///
+    /// 序列化失败时返回错误。
+    pub fn set_project_hooks(
+        &mut self,
+        hooks: &BTreeMap<String, ServiceHooks>,
+    ) -> anyhow::Result<()> {
+        let hooks: BTreeMap<_, _> = hooks
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if hooks.is_empty() {
+            self.environment.remove(super::HOOKS_KEY);
+            return Ok(());
+        }
+        self.environment.insert(
+            String::from(super::HOOKS_KEY),
+            serde_json::to_string(&hooks)?,
+        );
+        Ok(())
+    }
+
+    /// 返回指定服务在给定阶段的钩子命令。
+    ///
+    /// # 错误
+    ///
+    /// 项目环境中的钩子记录不是合法 JSON 时返回错误。
+    pub fn service_hooks(&self, stage: super::HookStage) -> anyhow::Result<Vec<(String, String)>> {
+        let hooks = self.project_hooks()?;
+        let mut commands = Vec::new();
+        for (service, hook) in hooks {
+            for command in hook.commands(stage) {
+                commands.push((service.clone(), command.clone()));
+            }
+        }
+        Ok(commands)
     }
 }
 

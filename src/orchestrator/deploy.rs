@@ -8,15 +8,19 @@ use super::storage::{
 use crate::config::set_mode;
 use crate::constants::{COMPOSE_FILE, ENV_FILE};
 use crate::docker;
-use crate::spec::{BindMount, StackSpec, validate_name};
+use crate::spec::{BindMount, RouteBinding, RouteIdentity, StackSpec, validate_name};
 use crate::template::GeneratedFile;
 use anyhow::Context;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 impl Orchestrator {
     /// 执行全部检查、暂存全部文件并原子提交一个项目。
+    ///
+    /// # 错误
+    ///
+    /// 任一校验失败、暂存写入失败或 Compose 校验失败时返回错误；失败时原项目保持不变。
     pub(super) fn deploy(
         &self,
         spec: &StackSpec,
@@ -45,7 +49,8 @@ impl Orchestrator {
             if target.is_dir() {
                 copy_auxiliary(&target, &stage)?;
             }
-            for owned_directory in ["site", "config/oidc-clients"] {
+            // 受管目录在重新应用时整体替换，避免残留上一次部署的陈旧文件。
+            for owned_directory in super::OWNED_DIRECTORIES {
                 if files
                     .iter()
                     .any(|file| file.path.starts_with(owned_directory))
@@ -65,7 +70,7 @@ impl Orchestrator {
             )?;
             write_project_file(&stage.join(ENV_FILE), spec.env_file().as_bytes(), 0o600)?;
             for file in files {
-                write_attachment(&stage, file)?;
+                write_attachment(&stage, file, 0o750)?;
             }
             let _validated = docker::compose_config(&self.config, &stage, &spec.name)?;
             self.commit_stage(&stage, &target, &spec.name)?;
@@ -126,7 +131,7 @@ impl Orchestrator {
                     source == docker_socket || roots.iter().any(|root| source.starts_with(root));
                 if !allowed {
                     anyhow::bail!(
-                        "服务 {service_name} 的 bind mount 不在白名单内: {}",
+                        "服务 {service_name} 的 bind mount 不在白名单内: {}（只能是 data_roots、stacks_root 或 --files/--assets 部署的项目内文件）",
                         mount.host_path
                     );
                 }
@@ -135,41 +140,45 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// 拒绝全部受管项目之间重复的路由主机名或宿主机端口。
+    /// 拒绝全部受管项目之间重复的路由身份或宿主机端口。
+    ///
+    /// 路由冲突按 `host + path_prefix + entrypoint + protocol` 组合判定，因此同一
+    /// 域名下的不同路径或不同后端协议可以共存；报错包含冲突方，便于多项目共用域名
+    /// 时定位。
     fn ensure_no_conflicts(&self, requested: &StackSpec) -> anyhow::Result<()> {
-        let requested_hosts = unique_hosts(requested)?;
+        let requested_bindings = merge_bindings(requested.route_bindings()?)?;
         let requested_ports = unique_ports(requested)?;
-        if !self.config.stacks_root.is_dir() {
-            return Ok(());
+        let others = self.other_specs(&requested.name)?;
+        if let Some(message) = detect_conflicts(&requested_bindings, &requested_ports, &others)?
+            .into_iter()
+            .next()
+        {
+            anyhow::bail!("{message}");
         }
+        Ok(())
+    }
+
+    /// 加载除指定项目之外的全部现有受管项目。
+    fn other_specs(&self, excluded: &str) -> anyhow::Result<Vec<StackSpec>> {
+        if !self.config.stacks_root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut specs = Vec::new();
         for entry in fs::read_dir(&self.config.stacks_root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir()
-                || entry.file_name() == requested.name.as_str()
+                || entry.file_name() == excluded
                 || entry.file_name().to_string_lossy().starts_with('.')
                 || !entry.path().join(COMPOSE_FILE).is_file()
             {
                 continue;
             }
-            let existing = StackSpec::load(&entry.path())
-                .with_context(|| format!("无法检查现有项目冲突: {}", entry.path().display()))?;
-            for host in unique_hosts(&existing)? {
-                if requested_hosts.contains(&host) {
-                    anyhow::bail!("域名 {host} 已被项目 {} 使用", existing.name);
-                }
-            }
-            for port in unique_ports(&existing)? {
-                if requested_ports.contains(&port) {
-                    anyhow::bail!(
-                        "宿主机端口 {}/{} 已被项目 {} 使用",
-                        port.0,
-                        port.1.as_str(),
-                        existing.name
-                    );
-                }
-            }
+            specs
+                .push(StackSpec::load(&entry.path()).with_context(|| {
+                    format!("无法检查现有项目冲突: {}", entry.path().display())
+                })?);
         }
-        Ok(())
+        Ok(specs)
     }
 
     /// 加载单个项目当前由 Compose 支撑的状态。
@@ -193,12 +202,58 @@ impl Orchestrator {
     }
 }
 
-/// 收集路由主机名并拒绝同一项目内的重复值。
-fn unique_hosts(spec: &StackSpec) -> anyhow::Result<BTreeSet<String>> {
-    let hosts = spec.route_hosts()?;
-    let output: BTreeSet<String> = hosts.iter().cloned().collect();
-    if output.len() != hosts.len() {
-        anyhow::bail!("项目 {} 重复声明 Traefik host", spec.name);
+/// 在其它受管项目中查找与请求状态冲突的路由身份与宿主机端口。
+///
+/// # 错误
+///
+/// 任一其它项目的路由 label 无法解析时返回错误。
+fn detect_conflicts(
+    requested_bindings: &BTreeMap<RouteIdentity, String>,
+    requested_ports: &BTreeSet<(u16, crate::spec::PortProtocol)>,
+    others: &[StackSpec],
+) -> anyhow::Result<Vec<String>> {
+    let mut conflicts = Vec::new();
+    for existing in others {
+        for (identity, owner) in merge_bindings(existing.route_bindings()?)? {
+            if let Some(conflict) = requested_bindings.get(&identity) {
+                conflicts.push(format!(
+                    "Traefik 路由冲突：{} 已被 {owner} 使用，与 {conflict} 重复；\
+                     同一 host 下请改用不同的 path_prefix、entrypoint 或 protocol",
+                    identity.describe()
+                ));
+            }
+        }
+        for port in unique_ports(existing)? {
+            if requested_ports.contains(&port) {
+                conflicts.push(format!(
+                    "宿主机端口 {}/{} 已被项目 {} 使用",
+                    port.0,
+                    port.1.as_str(),
+                    existing.name
+                ));
+            }
+        }
+    }
+    Ok(conflicts)
+}
+
+/// 将路由绑定折叠为身份到占用方的映射，并在同一集合内拒绝重复身份。
+///
+/// # 错误
+///
+/// 同一集合中存在两条身份完全相同的路由时返回包含双方的错误。
+fn merge_bindings(bindings: Vec<RouteBinding>) -> anyhow::Result<BTreeMap<RouteIdentity, String>> {
+    let mut output: BTreeMap<RouteIdentity, String> = BTreeMap::new();
+    for binding in bindings {
+        let owner = binding.owner();
+        if let Some(previous) = output.get(&binding.identity) {
+            anyhow::bail!(
+                "Traefik 路由重复声明：{} 同时由 {previous} 与 {owner} 声明；\
+                 同一 host 下请改用不同的 path_prefix、entrypoint 或 protocol",
+                binding.identity.describe()
+            );
+        }
+        output.insert(binding.identity, owner);
     }
     Ok(output)
 }
@@ -214,4 +269,85 @@ fn unique_ports(spec: &StackSpec) -> anyhow::Result<BTreeSet<(u16, crate::spec::
         anyhow::bail!("项目 {} 重复发布宿主机端口", spec.name);
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detect_conflicts, merge_bindings};
+    use crate::spec::{PortProtocol, Route, RouteProtocol, Service, StackSpec};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// 同一 host 上不同路径的路由不再互相冲突（A1）。
+    #[test]
+    fn same_host_different_paths_do_not_conflict() -> anyhow::Result<()> {
+        let requested = spec("media", &[("web", Some("/api"))])?;
+        let bindings = merge_bindings(requested.route_bindings()?)?;
+        let existing = spec("other", &[("web", Some("/"))])?;
+        let conflicts =
+            detect_conflicts(&bindings, &BTreeSet::new(), std::slice::from_ref(&existing))?;
+        assert!(
+            conflicts.is_empty(),
+            "不同 path_prefix 不应冲突: {conflicts:?}"
+        );
+
+        let same = spec("other", &[("web", Some("/api"))])?;
+        let conflicts = detect_conflicts(&bindings, &BTreeSet::new(), &[same])?;
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].contains("other"), "{conflicts:?}");
+        assert!(conflicts[0].contains("media"), "{conflicts:?}");
+        Ok(())
+    }
+
+    /// 宿主机端口冲突仍然被拒绝并指出占用项目。
+    #[test]
+    fn host_port_conflicts_are_reported() -> anyhow::Result<()> {
+        let mut existing = spec("other", &[("web", None)])?;
+        existing
+            .document
+            .services
+            .get_mut("web")
+            .ok_or_else(|| anyhow::anyhow!("missing service"))?
+            .ports = vec![String::from("127.0.0.1:8080:80/tcp")];
+        let requested_ports = BTreeSet::from([(8080_u16, PortProtocol::Tcp)]);
+        let conflicts = detect_conflicts(&BTreeMap::new(), &requested_ports, &[existing])?;
+        assert_eq!(conflicts.len(), 1);
+        assert!(
+            conflicts[0].contains("宿主机端口 8080/tcp"),
+            "{conflicts:?}"
+        );
+        Ok(())
+    }
+
+    /// 构造一个带单条路由的测试项目。
+    fn spec(name: &str, routes: &[(&str, Option<&str>)]) -> anyhow::Result<StackSpec> {
+        let mut service = Service {
+            image: String::from("example/app:1"),
+            ..Service::default()
+        };
+        let routes: Vec<Route> = routes
+            .iter()
+            .enumerate()
+            .map(|(index, (_label, prefix))| Route {
+                name: format!("route{index}"),
+                hosts: vec![String::from("shared.example.com")],
+                path_prefix: prefix.map(str::to_string),
+                container_port: 80,
+                middlewares: Vec::new(),
+                protocol: RouteProtocol::Http,
+                entrypoint: String::from("https"),
+                sticky_cookie: false,
+                pass_host_header: None,
+                priority: None,
+            })
+            .collect();
+        service.set_routes(name, "web", &routes)?;
+        Ok(StackSpec {
+            name: name.to_string(),
+            document: crate::spec::Document {
+                services: BTreeMap::from([(String::from("web"), service)]),
+                networks: BTreeMap::new(),
+            },
+            environment: BTreeMap::new(),
+        })
+    }
 }

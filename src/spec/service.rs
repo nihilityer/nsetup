@@ -1,7 +1,11 @@
 //! 服务级镜像与 Traefik 路由语义转换。
 
 use super::value::validate_tagged_image;
-use super::{Route, RouteProtocol, Service, split_tagged_image, validate_version};
+use super::{
+    DEFAULT_ENTRYPOINT, HTTPS_ENTRYPOINT, Route, RouteBinding, RouteIdentity, RouteProtocol,
+    Service, split_tagged_image, validate_version,
+};
+use crate::constants::PROXY_NETWORK;
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -46,7 +50,7 @@ impl Service {
         Ok(())
     }
 
-    /// 从 Traefik label 派生生成的路由。
+    /// 从 Traefik label 派生由 nsetup 生成的语义路由。
     ///
     /// # 错误
     ///
@@ -98,6 +102,10 @@ impl Service {
                         .collect()
                 })
                 .unwrap_or_default();
+            let entrypoint = labels
+                .get(&format!("{prefix}.entrypoints"))
+                .map(|value| normalize_entrypoints(value))
+                .unwrap_or_else(|| String::from(DEFAULT_ENTRYPOINT));
             let sticky_cookie =
                 parse_optional_bool(labels.get(&format!("{service_prefix}.sticky.cookie")))?
                     .unwrap_or(false);
@@ -114,6 +122,7 @@ impl Service {
                 container_port,
                 middlewares,
                 protocol,
+                entrypoint,
                 sticky_cookie,
                 pass_host_header,
                 priority,
@@ -122,7 +131,60 @@ impl Service {
         Ok(routes)
     }
 
-    /// 替换为此项目服务生成的全部 label。
+    /// 返回用户手写 router label 声明的路由身份。
+    ///
+    /// `labels` 是受支持的逃生舱，因此这里对非法规则保持宽容：无法解析出主机名的
+    /// 自定义 router（例如 `HostRegexp`）不参与 host 冲突判定，而不是让整个项目
+    /// 校验失败。`traefik.enable=false` 的路由不会被 Traefik 加载，同样跳过。
+    ///
+    /// # 错误
+    ///
+    /// labels 本身不是合法 `KEY=VALUE` 列表时返回错误。
+    pub fn user_route_identities(&self) -> anyhow::Result<Vec<RouteIdentity>> {
+        let labels = label_map(&self.labels)?;
+        if labels
+            .get("traefik.enable")
+            .is_some_and(|value| value.trim() == "false")
+        {
+            return Ok(Vec::new());
+        }
+        let mut identities = Vec::new();
+        for (key, rule) in &labels {
+            let Some(rest) = key.strip_prefix("traefik.http.routers.") else {
+                continue;
+            };
+            let Some(router) = rest.strip_suffix(".rule") else {
+                continue;
+            };
+            if router.starts_with("nsetup-") || !rule.contains("Host(") {
+                continue;
+            }
+            let Ok(hosts) = parse_hosts(rule) else {
+                continue;
+            };
+            let path_prefix = parse_path_prefix(rule);
+            let entrypoint = labels
+                .get(&format!("traefik.http.routers.{router}.entrypoints"))
+                .map_or_else(
+                    || String::from(DEFAULT_ENTRYPOINT),
+                    |value| normalize_entrypoints(value),
+                );
+            let protocol = labels
+                .get(&format!(
+                    "traefik.http.services.{router}.loadbalancer.server.scheme"
+                ))
+                .and_then(|value| RouteProtocol::parse(value).ok())
+                .unwrap_or_default();
+            identities.extend(hosts.into_iter().map(|host| {
+                RouteIdentity::new(host, path_prefix.as_deref(), &entrypoint, protocol)
+            }));
+        }
+        identities.sort();
+        identities.dedup();
+        Ok(identities)
+    }
+
+    /// 替换为此项目服务生成的全部 label，并保留用户手写的 Traefik label。
     ///
     /// # 错误
     ///
@@ -135,9 +197,28 @@ impl Service {
     ) -> anyhow::Result<()> {
         let generated_prefix = format!("nsetup-{stack_name}-{service_name}-");
         let mut labels = label_map(&self.labels)?;
-        labels.retain(|key, _| !is_generated_traefik_key(key) && key != "traefik.enable");
-        if !routes.is_empty() {
+        labels.retain(|key, _| !is_generated_traefik_key(key));
+        // 用户显式声明的 `traefik.enable` 是逃生舱的一部分，必须原样保留；只有在
+        // 确实声明了路由时才由 nsetup 补上该字段。
+        let declared_enable =
+            match labels.get("traefik.enable") {
+                Some(value) => Some(value.trim().parse::<bool>().map_err(|_| {
+                    anyhow::anyhow!("traefik.enable 必须是 true 或 false: {value}")
+                })?),
+                None => None,
+            };
+        if declared_enable != Some(false) && !routes.is_empty() {
             labels.insert(String::from("traefik.enable"), String::from("true"));
+        }
+        if !routes.is_empty() {
+            // 服务同时接入多个网络时，必须固定 Traefik 走代理网络，否则容器有
+            // 多个 IP，Traefik 可能选到项目网络而无法回源。
+            if self.networks.len() > 1 {
+                labels.insert(
+                    String::from("traefik.docker.network"),
+                    String::from(PROXY_NETWORK),
+                );
+            }
         }
         let mut route_names = BTreeSet::new();
         for route in routes {
@@ -161,7 +242,10 @@ impl Service {
                 rule.push_str(&format!(" && PathPrefix(`{path}`)"));
             }
             labels.insert(format!("{router}.rule"), rule);
-            labels.insert(format!("{router}.entrypoints"), String::from("https"));
+            labels.insert(
+                format!("{router}.entrypoints"),
+                route.entrypoint_name().to_string(),
+            );
             labels.insert(format!("{router}.tls"), String::from("true"));
             labels.insert(
                 format!("{router}.tls.certresolver"),
@@ -207,6 +291,58 @@ impl Service {
             .map(|(key, value)| format!("{key}={value}"))
             .collect();
         Ok(())
+    }
+}
+
+impl Route {
+    /// 返回去掉 `@file` 后缀并附带 provider 后缀的中间件名称。
+    #[must_use]
+    pub fn middleware_references(&self) -> Vec<String> {
+        self.middlewares
+            .iter()
+            .map(|name| format!("{name}@file"))
+            .collect()
+    }
+
+    /// 返回此路由声明的 entrypoint；省略时使用 HTTPS 入口。
+    #[must_use]
+    pub fn entrypoint_name(&self) -> &str {
+        if self.entrypoint.trim().is_empty() {
+            HTTPS_ENTRYPOINT
+        } else {
+            self.entrypoint.as_str()
+        }
+    }
+
+    /// 将路由展开为按主机名拆分的冲突判定身份。
+    #[must_use]
+    pub fn identities(&self) -> Vec<RouteIdentity> {
+        self.hosts
+            .iter()
+            .map(|host| {
+                RouteIdentity::new(
+                    host.clone(),
+                    self.path_prefix.as_deref(),
+                    self.entrypoint_name(),
+                    self.protocol,
+                )
+            })
+            .collect()
+    }
+
+    /// 将路由转换为带归属的绑定，用于诊断与冲突报错。
+    #[must_use]
+    pub fn bindings(&self, project: &str, service: &str) -> Vec<RouteBinding> {
+        self.identities()
+            .into_iter()
+            .map(|identity| RouteBinding {
+                identity,
+                project: project.to_string(),
+                service: service.to_string(),
+                router: format!("nsetup-{project}-{service}-{}", self.name),
+                managed: true,
+            })
+            .collect()
     }
 }
 
@@ -256,8 +392,11 @@ pub(super) fn parse_hosts(rule: &str) -> anyhow::Result<Vec<String>> {
     Ok(hosts)
 }
 
-/// 识别由 nsetup 管理的路由器和服务 label。
+/// 识别由 nsetup 管理的路由器、服务与回源网络 label。
 fn is_generated_traefik_key(key: &str) -> bool {
+    if key == "traefik.docker.network" {
+        return true;
+    }
     ["traefik.http.routers.", "traefik.http.services."]
         .iter()
         .any(|prefix| {
@@ -272,6 +411,18 @@ fn parse_path_prefix(rule: &str) -> Option<String> {
     let start = rule.find("PathPrefix(`")? + 12;
     let end = rule[start..].find("`)")? + start;
     Some(rule[start..end].to_string())
+}
+
+/// 归一化 label 中的 entrypoint 列表。
+fn normalize_entrypoints(value: &str) -> String {
+    let mut names: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.join(",")
 }
 
 /// 解析可选布尔 label 值。

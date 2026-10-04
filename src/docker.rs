@@ -47,16 +47,154 @@ pub fn compose_config(
 
 /// 以后台模式启动整个项目或单个服务。
 ///
+/// `recreate` 为真时强制重新创建容器：受管项目目录是整体原子替换的，正在运行的
+/// 容器仍持有旧目录 inode，不重新创建就会看到被删除的空目录。
+///
 /// # 错误
 ///
 /// Docker Compose 执行失败时返回错误。
-pub fn compose_up(config: &Config, directory: &Path, service: Option<&str>) -> anyhow::Result<()> {
+pub fn compose_up(
+    config: &Config,
+    directory: &Path,
+    service: Option<&str>,
+    recreate: bool,
+) -> anyhow::Result<()> {
     let mut args = vec!["up", "-d"];
+    if recreate {
+        args.push("--force-recreate");
+    }
     if let Some(service) = service {
         args.push(service);
     }
     let _output = run_compose(config, directory, &args)?;
     Ok(())
+}
+
+/// 判断项目当前是否存在运行中的容器。
+#[must_use]
+pub fn compose_has_running(config: &Config, directory: &Path) -> bool {
+    compose_ps_json(config, directory)
+        .map(|containers| {
+            containers.iter().any(|container| {
+                container
+                    .get("State")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|state| state.eq_ignore_ascii_case("running"))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 以结构化列表返回全部运行中容器及其 label。
+///
+/// # 错误
+///
+/// Docker CLI 执行失败或输出无法解析时返回错误。
+pub fn running_containers(config: &Config) -> anyhow::Result<Vec<ContainerSummary>> {
+    let output = docker_command(config)
+        .args([
+            "ps",
+            "--no-trunc",
+            "--format",
+            "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Labels}}",
+        ])
+        .output()
+        .context("无法执行 docker ps")?;
+    ensure_success(&output, "docker ps")?;
+    let mut containers = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split('\t');
+        let Some(id) = fields.next() else { continue };
+        let names = fields.next().unwrap_or_default();
+        let image = fields.next().unwrap_or_default();
+        let state = fields.next().unwrap_or_default();
+        let labels = fields.next().unwrap_or_default();
+        if id.trim().is_empty() {
+            continue;
+        }
+        containers.push(ContainerSummary {
+            id: id.trim().to_string(),
+            name: names
+                .split(',')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            image: image.trim().to_string(),
+            state: state.trim().to_string(),
+            labels: parse_label_list(labels),
+        });
+    }
+    Ok(containers)
+}
+
+/// 单个运行中容器的精简视图。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerSummary {
+    /// 容器 ID。
+    pub id: String,
+    /// 容器名。
+    pub name: String,
+    /// 镜像引用。
+    pub image: String,
+    /// Docker 报告的状态。
+    pub state: String,
+    /// 容器 label 键值。
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// 解析 `docker ps` 输出的逗号分隔 label 列表。
+fn parse_label_list(value: &str) -> std::collections::BTreeMap<String, String> {
+    let mut output = std::collections::BTreeMap::new();
+    for item in value.split(',') {
+        if let Some((key, content)) = item.split_once('=') {
+            let key = key.trim();
+            if !key.is_empty() {
+                output.insert(key.to_string(), content.trim().to_string());
+            }
+        }
+    }
+    output
+}
+
+/// 返回指定网络的容器地址，用于从宿主机访问只在内网监听的入口。
+///
+/// # 错误
+///
+/// `docker inspect` 执行失败或输出无法解析时返回错误。
+pub fn container_address(config: &Config, name: &str, network: &str) -> anyhow::Result<String> {
+    let output = docker_command(config)
+        .args([
+            "inspect",
+            "--format",
+            "{{json .NetworkSettings.Networks}}",
+            name,
+        ])
+        .output()
+        .with_context(|| format!("无法执行 docker inspect {name}"))?;
+    ensure_success(&output, "docker inspect")?;
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("无法解析 docker inspect {name} 输出"))?;
+    let address = value
+        .get(network)
+        .and_then(|network| network.get("IPAddress"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("容器 {name} 不在网络 {network} 上"))?;
+    Ok(address.to_string())
+}
+
+/// 将项目状态的 JSON 输出解析为容器列表。
+fn compose_ps_json(config: &Config, directory: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+    let output = compose_ps(config, directory)?;
+    if let Ok(serde_json::Value::Array(containers)) = serde_json::from_str(&output) {
+        return Ok(containers);
+    }
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).map_err(anyhow::Error::from))
+        .collect()
 }
 
 /// 停止项目容器但不删除容器。

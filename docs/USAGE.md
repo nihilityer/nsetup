@@ -65,12 +65,76 @@ port = 9001
 路由名会进入 Traefik router/backend 名称。旧的
 `[[services.*.traefik.routes]]` 顺序数组不受支持。
 
+同一个 host 下可以按路径或协议拆分多条路由：冲突判定使用
+`host + path_prefix + entrypoint + protocol` 组合，因此下面这种官方
+NetBird 模板里的三段式路由是合法的，`entrypoint` 省略时为 `https`：
+
+```toml
+[services.dashboard.traefik.routes.web]
+hosts = ["netbird"]
+
+[services.dashboard.traefik.routes.api]
+hosts = ["netbird"]
+path_prefix = "/api"
+
+[services.dashboard.traefik.routes.grpc]
+hosts = ["netbird"]
+path_prefix = "/grpc"
+port = 10000
+protocol = "h2c"
+```
+
+手写 `labels` 仍是逃生舱：其中的 `Host(...)` 规则不参与冲突校验，
+`traefik.enable` 也不会被剥离。`middlewares` 除内置的 `authelia`、`gzip`、
+`forwarded-headers`、`internal-only`、`tls` 外，还可以引用 traefik.toml 里
+`[middlewares.<名称>]` 声明的自定义中间件（例如 `replacePath`、`stripPrefix`）。
+
 应用配置并启动；更新已有项目时增加 `--force`：
 
 ```bash
 nsetup up -f app.toml --start
 nsetup up -f app.toml --force --start
 ```
+
+### 宿主机文件与启动钩子
+
+需要把宿主机文件交给容器读取时，不必使用 sudo 或一次性特权容器：`--files`
+把路径上传到项目目录的 `files/`，并以只读方式挂到每个服务的
+`/opt/nsetup/files`（用 `--files-into` 改挂载点）。目录参数会展开其中所有文件，
+单个文件参数按文件名上传：
+
+```bash
+nsetup up -f app.toml --files ./netbird.yaml --start
+# 容器内读取 /opt/nsetup/files/netbird.yaml
+```
+
+一次性初始化动作（建库、生成注册令牌、初始化 owner）用启动钩子声明。钩子在
+daemon 上以项目目录为工作目录、通过 `sh -c` 顺序执行，因此可以使用 shell 语法与
+项目内相对路径；`post_start` 只在 `--start` 时执行：
+
+```toml
+[services.gitea.hooks]
+pre_start = ["install -d -m 0755 data"]
+post_start = ["docker exec gitea gitea admin user create --username owner"]
+```
+
+容器需要以固定用户（尤其 root）读取宿主机文件时使用 `user` 与 `group_add`：
+
+```toml
+[services.otel-collector]
+user = "0:0"
+group_add = ["988"]
+```
+
+健康检查不写时不会覆盖镜像自带探针；没有 shell 的镜像必须使用 argv 形式：
+
+```toml
+[services.tuwunel.healthcheck]
+command = ["/usr/bin/curl", "-f", "http://127.0.0.1:8008/health"]
+```
+
+同样的选择在 `edit` 上对应 `--healthcheck-cmd`（shell 字符串）与
+`--healthcheck-exec`（argv 列表，两者互斥）。
 
 ### 基础设施与静态站点
 
@@ -86,29 +150,36 @@ nsetup up -f app.toml --start
 Authelia 的用户、TOTP、ForwardAuth、OIDC 和密钥操作见
 [Authelia 认证](AUTHELIA.md)。
 
-静态站点的文件通过 `--assets` 上传。再次上传会整体替换已有站点文件：
+静态站点的文件通过 `--assets` 上传，站点根目录是容器内的 `/opt/nsetup/site`。
+默认 `--assets-mode merge` 只覆盖同名文件，因此 `--force` 不会清空站点；需要删除
+已下线的旧文件时显式整体替换：
 
 ```bash
 nsetup up -f static.toml --assets ./dist --start
+nsetup up -f static.toml --assets ./dist --assets-mode replace --force --start
 ```
 
 ## 导入、编辑与导出
 
-导入受支持字段子集内的 Compose 项目：
+导入既有 Compose 项目：
 
 ```bash
 nsetup import media -f compose.yaml --env-file .env --start
 ```
 
-未知 Compose 字段、命名卷、相对 bind mount 或未固定版本镜像会被拒绝。局部编辑
-单个服务或导出当前状态：
+IR 不支持但常见于生产文件的字段（`version`、`depends_on`、`deploy`、`x-*` 等）
+会被忽略，并在结果中列出清单；命名卷、相对 bind mount、未固定版本镜像等影响安全
+的字段仍会被拒绝。局部编辑单个服务或导出当前状态：
 
 ```bash
 nsetup edit media --service web --version 1.1 --start
 nsetup export media -o media.toml
+nsetup export media --keep-comments -o media.toml
 ```
 
-`export` 从当前 `compose.yaml` 与 `.env` 反解 TOML。目标文件已存在时不会覆盖。
+`export` 从当前 `compose.yaml` 与 `.env` 反解 TOML；原始注释无法从 Compose 状态
+恢复，`--keep-comments` 会在结果前追加当前版本的带注释骨架，使产物可以直接作为
+仓库交付物。目标文件已存在时不会覆盖。
 
 ## 日常操作
 
@@ -126,13 +197,32 @@ nsetup rm media
 ```
 
 删除项目会停止容器并移除受管项目目录，但不会删除 bind mount 指向的数据。
-`rm --force` 仅跳过交互确认。
+`rm --force` 仅跳过交互确认；标准输入不是终端且未指定 `--force` 时直接报错并提示，
+而不是返回 `not a terminal`。
+
+自查域名 404 / 502 时使用 `doctor`；它比对容器上的 Traefik label 与 Traefik 实际
+加载的 router，列出未被接管的服务与原因，并在发现问题时以非零状态退出：
+
+```bash
+nsetup show media --routes
+nsetup doctor
+```
 
 查询结果与最终操作结果写入 stdout，诊断和中间进度写入 stderr。`pull` 在终端中显示
 单行进度，重定向或管道中输出稳定的制表符分隔事件；`logs --follow` 在客户端退出后
 终止对应的 Compose 日志进程。
 
 ## daemon 配置与安全边界
+
+主域名可以不重装 daemon 直接更新：
+
+```bash
+nsetup config set domain example.com
+```
+
+命令由 daemon 校验域名并原子改写 `/etc/nsetup/config.toml`，然后重启
+`nsetup.service`。已部署项目中的完整域名不会被自动改写，输出会列出仍需手工调整
+的项目。
 
 daemon 配置位于 `/etc/nsetup/config.toml`：
 

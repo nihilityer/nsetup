@@ -13,7 +13,144 @@ mod tests;
 /// 端口、挂载、健康检查与公共校验。
 mod value;
 
-pub use value::{split_tagged_image, validate_name, validate_version};
+pub use value::{
+    split_tagged_image, validate_entrypoints, validate_group, validate_hooks, validate_middleware,
+    validate_name, validate_user, validate_version,
+};
+
+/// 应用模板在项目 `.env` 中持久化服务启动钩子的键。
+pub const HOOKS_KEY: &str = "NSETUP_APP_HOOKS_JSON";
+/// Traefik router 未声明 entrypoint 时 Traefik 使用的默认入口名。
+pub const DEFAULT_ENTRYPOINT: &str = "default";
+/// nsetup 生成的路由固定使用的 HTTPS 入口名。
+pub const HTTPS_ENTRYPOINT: &str = "https";
+/// traefik 模板为自身指标暴露的内网入口名。
+pub const METRICS_ENTRYPOINT: &str = "metrics";
+/// traefik 模板为自身指标使用的容器端口。
+pub const DEFAULT_METRICS_PORT: u16 = 8081;
+
+/// 插入固定的共享反向代理网络定义。
+pub fn add_proxy_network(document: &mut Document, external: bool) {
+    document.networks.insert(
+        String::from("proxy"),
+        Network {
+            external,
+            name: Some(String::from(crate::constants::PROXY_NETWORK)),
+        },
+    );
+}
+
+/// 插入与项目隐式默认网络同名的项目网络定义。
+///
+/// 服务一旦显式声明 `networks`，Compose 就不再为项目创建 `<项目>_default`；这里用
+/// 同名定义把它钉住，使带路由的服务与项目内其他服务仍处于同一个网络上。
+pub fn add_project_network(document: &mut Document, stack_name: &str) {
+    document.networks.insert(
+        String::from("project"),
+        Network {
+            external: false,
+            name: Some(format!("{stack_name}_default")),
+        },
+    );
+}
+
+/// 一个 Traefik router 的路由冲突判定身份。
+///
+/// Traefik 允许同一 `host` 上存在多条路由，只要它们的路径前缀、入口或后端协议不同；
+/// 因此 host 冲突必须按这四个字段的组合判定，而不能只看 `Host()` 规则。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RouteIdentity {
+    /// 路由声明的 DNS 主机名。
+    pub host: String,
+    /// 归一化的 URL 路径前缀；省略或 `/` 视为匹配整个主机。
+    pub path_prefix: String,
+    /// 路由监听的 Traefik entrypoint。
+    pub entrypoint: String,
+    /// Traefik 连接后端时使用的协议。
+    pub protocol: RouteProtocol,
+}
+
+impl RouteIdentity {
+    /// 用路由字段构造归一化身份，并把空 entrypoint 归一为默认入口。
+    #[must_use]
+    pub fn new(
+        host: impl Into<String>,
+        path_prefix: Option<&str>,
+        entrypoint: &str,
+        protocol: RouteProtocol,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            path_prefix: normalize_path_prefix(path_prefix),
+            entrypoint: normalize_entrypoint(entrypoint),
+            protocol,
+        }
+    }
+
+    /// 返回用于诊断输出的稳定描述，例如 `a.example.com/api (https, http)`。
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "{} ({}, {})",
+            if self.path_prefix.is_empty() {
+                self.host.clone()
+            } else {
+                format!("{}{}", self.host, self.path_prefix)
+            },
+            self.entrypoint,
+            self.protocol.as_str()
+        )
+    }
+}
+
+/// 一条已声明路由及其归属，用于跨项目冲突检查与诊断。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteBinding {
+    /// 冲突判定身份。
+    pub identity: RouteIdentity,
+    /// 声明该路由的项目名。
+    pub project: String,
+    /// 声明该路由的服务名。
+    pub service: String,
+    /// 稳定的 router 名；用户手写路由使用其 labels 中的原始名称。
+    pub router: String,
+    /// 是否由 nsetup 从路由声明生成。
+    pub managed: bool,
+}
+
+impl RouteBinding {
+    /// 返回用于报错定位的占用方描述。
+    #[must_use]
+    pub fn owner(&self) -> String {
+        format!(
+            "项目 {} 的服务 {} 路由 {}",
+            self.project, self.service, self.router
+        )
+    }
+}
+
+/// 将路由路径前缀归一化，使 `/` 与省略等价。
+fn normalize_path_prefix(value: Option<&str>) -> String {
+    match value.map(str::trim) {
+        None | Some("") | Some("/") => String::new(),
+        Some(other) => other.trim_end_matches('/').to_string(),
+    }
+}
+
+/// 将 entrypoint 列表归一化并排序，使声明顺序不影响冲突判定。
+fn normalize_entrypoint(value: &str) -> String {
+    let mut names: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        return String::from(DEFAULT_ENTRYPOINT);
+    }
+    names.sort_unstable();
+    names.dedup();
+    names.join(",")
+}
 
 /// 完整的受管项目。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +210,12 @@ pub struct Service {
     /// 列表形式的 Docker label。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// 覆盖镜像内置用户的 `UID[:GID]`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// 除主用户组外额外加入的补充组。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_add: Vec<String>,
     /// 可选容器健康检查。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<Healthcheck>,
@@ -97,7 +240,7 @@ pub struct Network {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Healthcheck {
-    /// Compose 健康检查测试，通常为 `CMD-SHELL` 加一条命令。
+    /// Compose 健康检查测试，为 `[CMD, ..]` 或 `[CMD-SHELL, command]` 形式。
     pub test: Vec<String>,
     /// 检查间隔。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +267,58 @@ pub struct Logging {
     pub options: BTreeMap<String, String>,
 }
 
+/// 一个服务的启动钩子。
+///
+/// 钩子在 daemon 上以项目目录为工作目录执行，因此同一份声明不依赖 TOML 文件的
+/// 绝对位置。`pre_start` 在 Compose 启动之前执行，`post_start` 在之后执行。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceHooks {
+    /// Compose 启动前按顺序执行的 shell 命令。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_start: Vec<String>,
+    /// Compose 启动后按顺序执行的 shell 命令。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_start: Vec<String>,
+}
+
+impl ServiceHooks {
+    /// 判断钩子是否为空。
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.pre_start.is_empty() && self.post_start.is_empty()
+    }
+
+    /// 返回指定阶段的命令列表。
+    #[must_use]
+    pub fn commands(&self, stage: HookStage) -> &[String] {
+        match stage {
+            HookStage::PreStart => &self.pre_start,
+            HookStage::PostStart => &self.post_start,
+        }
+    }
+}
+
+/// 启动钩子的执行阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookStage {
+    /// Compose 启动之前。
+    PreStart,
+    /// Compose 启动之后。
+    PostStart,
+}
+
+impl HookStage {
+    /// 返回稳定名称与中文说明。
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PreStart => "pre_start",
+            Self::PostStart => "post_start",
+        }
+    }
+}
+
 /// 从 label 派生的 Traefik 语义路由。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
@@ -139,6 +334,8 @@ pub struct Route {
     pub middlewares: Vec<String>,
     /// 后端协议。
     pub protocol: RouteProtocol,
+    /// 路由监听的 entrypoint。
+    pub entrypoint: String,
     /// 是否启用负载均衡粘性 Cookie。
     pub sticky_cookie: bool,
     /// 可选的 `passHostHeader` 覆盖值。
@@ -148,7 +345,7 @@ pub struct Route {
 }
 
 /// 受支持的 Traefik 后端协议。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RouteProtocol {
     /// 普通 HTTP。
     #[default]

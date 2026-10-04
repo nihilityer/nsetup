@@ -40,7 +40,7 @@ fn authelia_skeleton_documents_oidc_configuration() {
 fn authelia_oidc_provider_round_trip() -> anyhow::Result<()> {
     let input = valid_authelia_oidc_provider_config();
     let config = Config::default();
-    let generated = apply(input, &config)?;
+    let generated = apply(input, &config, None)?;
     let service = &generated.spec.document.services["authelia"];
     assert_eq!(
         service.environment.get("X_AUTHELIA_CONFIG_FILTERS"),
@@ -93,7 +93,7 @@ fn authelia_oidc_provider_round_trip() -> anyhow::Result<()> {
     let exported = export(&restored, &config)?;
     assert!(exported.contains("[oidc]"));
     assert!(!exported.contains("oidc_clients"));
-    assert_eq!(generated, apply(&exported, &config)?);
+    assert_eq!(generated, apply(&exported, &config, None)?);
     Ok(())
 }
 
@@ -102,7 +102,7 @@ fn authelia_oidc_provider_round_trip() -> anyhow::Result<()> {
 fn app_owned_oidc_clients_round_trip() -> anyhow::Result<()> {
     let input = valid_app_oidc_config();
     let config = Config::default();
-    let generated = apply(input, &config)?;
+    let generated = apply(input, &config, None)?;
     let fragment = super::super::app_oidc_client_fragment(&generated.spec)?
         .ok_or_else(|| anyhow::anyhow!("missing app OIDC fragment"))?;
     assert_eq!(
@@ -126,7 +126,7 @@ fn app_owned_oidc_clients_round_trip() -> anyhow::Result<()> {
     assert!(exported.contains("[authelia.oidc_clients.cli]"));
     assert!(exported.contains("[authelia.oidc_clients.gitea]"));
     assert!(exported.contains("client_secret_hash ="));
-    assert_eq!(generated, apply(&exported, &config)?);
+    assert_eq!(generated, apply(&exported, &config, None)?);
     Ok(())
 }
 
@@ -137,7 +137,7 @@ fn authelia_oidc_client_rejects_plaintext_secret() {
         "$pbkdf2-sha512$310000$c2FsdA$ZGlnZXN0ZGlnZXN0ZGlnZXN0ZGlnZXN0",
         "plaintext-client-secret",
     );
-    assert!(apply(&input, &Config::default()).is_err());
+    assert!(apply(&input, &Config::default(), None).is_err());
 }
 
 /// OIDC 公共客户端必须使用 PKCE，不能退化为无客户端认证的裸授权码流程。
@@ -147,7 +147,7 @@ fn authelia_oidc_public_client_requires_pkce() {
         "redirect_uris = [\"http://127.0.0.1:17890/oauth/callback\"]\nscopes = [\"openid\", \"profile\"]\nrequire_pkce = true",
         "redirect_uris = [\"http://127.0.0.1:17890/oauth/callback\"]\nscopes = [\"openid\", \"profile\"]\nrequire_pkce = false",
     );
-    assert!(apply(&input, &Config::default()).is_err());
+    assert!(apply(&input, &Config::default(), None).is_err());
 }
 
 /// OIDC 回调仅允许 HTTPS，开发期 HTTP 只能绑定本机回环地址。
@@ -157,7 +157,102 @@ fn authelia_oidc_rejects_remote_http_callback() {
         "http://127.0.0.1:17890/oauth/callback",
         "http://client.example.com/oauth/callback",
     );
-    assert!(apply(&input, &Config::default()).is_err());
+    assert!(apply(&input, &Config::default(), None).is_err());
+}
+
+/// OIDC provider 的 claims policy 内联进配置，并可随客户端引用往返导出。
+#[test]
+fn authelia_oidc_claims_policy_round_trip() -> anyhow::Result<()> {
+    let clients = r#"
+format = 1
+name = "observability"
+[authelia.oidc_clients.grafana]
+client_name = "Grafana"
+client_secret_hash = '$pbkdf2-sha512$310000$c2FsdA$ZGlnZXN0ZGlnZXN0ZGlnZXN0ZGlnZXN0'
+redirect_uris = ["https://grafana.example.com/login/generic_oauth"]
+scopes = ["openid", "profile", "email", "groups"]
+claims_policy = "grafana"
+[services.web]
+image = "grafana/grafana"
+version = "13.2.0"
+"#;
+    apply(clients, &Config::default(), None)?;
+
+    let provider = format!(
+        "{}\n[oidc.claims_policies.grafana]\nid_token = [\"groups\", \"email\", \"name\", \"preferred_username\"]\n",
+        valid_authelia_oidc_provider_config()
+    );
+    let config = Config::default();
+    let generated = apply(&provider, &config, None)?;
+    let configuration =
+        String::from_utf8(generated_file(&generated, "configuration.yml")?.to_vec())?;
+    assert!(configuration.contains("    claims_policies:\n"));
+    assert!(configuration.contains("        id_token:\n        - groups\n"));
+    assert!(configuration.contains("        - preferred_username\n"));
+    assert!(configuration.contains("    clients:\n"));
+
+    let restored = crate::spec::StackSpec::parse(
+        &generated.spec.name,
+        &generated.spec.compose_yaml()?,
+        &generated.spec.env_file(),
+    )?;
+    let exported = export(&restored, &config)?;
+    assert!(exported.contains("[oidc.claims_policies.grafana]"));
+    assert_eq!(generated, apply(&exported, &config, None)?);
+    Ok(())
+}
+
+/// 未声明 claims policy 时不生成空的 `claims_policies` 块。
+#[test]
+fn authelia_oidc_claims_policy_absent_by_default() -> anyhow::Result<()> {
+    let generated = apply(
+        valid_authelia_oidc_provider_config(),
+        &Config::default(),
+        None,
+    )?;
+    let configuration =
+        String::from_utf8(generated_file(&generated, "configuration.yml")?.to_vec())?;
+    assert!(!configuration.contains("claims_policies"));
+    Ok(())
+}
+
+/// claims policy 必须至少声明一个 claim，且 claim 名不得破坏 YAML。
+#[test]
+fn authelia_oidc_claims_policy_rejects_invalid_input() {
+    let empty = format!(
+        "{}\n[oidc.claims_policies.grafana]\n",
+        valid_authelia_oidc_provider_config()
+    );
+    assert!(apply(&empty, &Config::default(), None).is_err());
+
+    let invalid_claim = format!(
+        "{}\n[oidc.claims_policies.grafana]\nid_token = [\"groups: bad\"]\n",
+        valid_authelia_oidc_provider_config()
+    );
+    assert!(apply(&invalid_claim, &Config::default(), None).is_err());
+}
+
+/// app 拥有的客户端只接受合法的 `claims_policy` 名称。
+#[test]
+fn app_oidc_client_rejects_invalid_claims_policy() {
+    let input = valid_app_oidc_config().replace(
+        "token_endpoint_auth_method = \"client_secret_basic\"",
+        "token_endpoint_auth_method = \"client_secret_basic\"\nclaims_policy = \"bad name\"",
+    );
+    assert!(apply(&input, &Config::default(), None).is_err());
+}
+
+/// 读取生成结果中的指定文件。
+fn generated_file<'a>(
+    generated: &'a super::super::TemplateOutput,
+    name: &str,
+) -> anyhow::Result<&'a [u8]> {
+    generated
+        .files
+        .iter()
+        .find(|file| file.path.ends_with(name))
+        .map(|file| file.content.as_slice())
+        .ok_or_else(|| anyhow::anyhow!("missing {name}"))
 }
 
 /// 返回只声明 OIDC provider 的有效 Authelia TOML。

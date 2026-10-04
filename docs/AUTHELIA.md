@@ -85,6 +85,22 @@ jwk_private_key = """
 """
 ```
 
+## OIDC claims policy
+
+Authelia 默认只把协议必需的 claim 放进 ID Token，其余 claim 按规范通过 UserInfo
+端点交付。部分客户端（典型是 Grafana）不会主动请求 UserInfo，结果是能登录、却没有
+邮箱、显示名或 groups。这类客户端需要在 provider 侧用 claims policy 把 claim 直接
+写进 ID Token：
+
+```toml
+[oidc.claims_policies.default]
+id_token = ["groups", "email", "email_verified", "preferred_username", "name"]
+```
+
+policy 名称由引用它的客户端 `claims_policy = "default"` 指定；每个 policy 至少声明
+`id_token` 或 `access_token` 之一。引用了未声明的 policy 时 Authelia 启动即报错，
+不会静默降级。
+
 ## OIDC 客户端
 
 每个客户端由实际使用它的应用 TOML 管理，具名表键就是 `client_id`。生成客户端明文
@@ -108,19 +124,40 @@ scopes = ["openid", "profile", "email", "groups"]
 grant_types = ["authorization_code", "refresh_token"]
 require_pkce = false
 token_endpoint_auth_method = "client_secret_basic"
+claims_policy = "default"   # 可选；引用 Authelia 项目的 claims policy
 ```
 
 回调 URI 区分大小写，必须精确一致。公共 SPA 或 CLI 客户端省略
 `client_secret_hash`，并设置 `public = true`、`require_pkce = true` 和
-`token_endpoint_auth_method = "none"`。discovery 地址为：
+`token_endpoint_auth_method = "none"`。
+
+`pkce_challenge_method` 只在 `require_pkce = true` 时输出。Authelia 把该字段视为
+对该客户端强制 PKCE，即使同一片段里写着 `require_pkce = false` 也依然强制，因此
+不发送 `code_challenge` 的客户端（例如 Gitea）会收到
+`registered in a way that enforces PKCE` 而被拒绝。discovery 地址为：
 
 ```text
 https://<认证门户域名>/.well-known/openid-configuration
 ```
 
 应用执行 `nsetup up -f <应用>.toml --force` 后，客户端配置会同步到 Authelia 项目；
-删除声明或整个应用时，对应片段也会删除。客户端变更后执行
-`nsetup restart authelia`。所有应用的 `client_id` 必须全局唯一。
+片段确实发生变化时会自动重启 authelia 使其生效（可用 `--restart-dependents` 显式
+要求），删除声明或整个应用时对应片段也会删除。所有应用的 `client_id` 必须全局唯一。
+
+## 自身遥测
+
+Authelia 默认不暴露指标也不导出 trace；需要时在 authelia.toml 中声明：
+
+```toml
+[telemetry]
+metrics_address = "tcp://0.0.0.0:9959"
+metrics_path = "/metrics"
+tracing_address = "udp://otel-collector:4318"
+tracing_sample_rate = 0.5
+```
+
+`metrics_address` 与 `tracing_address` 使用 `host:port` 形式，允许
+`tcp://`、`udp://` 传输前缀。
 
 导出的 Authelia TOML 含密钥，使用 `-o` 写出的文件权限为 `0600`。Traefik 的
 `acme.json` 与 Authelia 的 SQLite 状态会在 `up --force` 时保留。

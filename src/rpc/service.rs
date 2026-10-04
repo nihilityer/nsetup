@@ -3,7 +3,8 @@
 use super::conversion::{edit_from_proto, stack_to_proto, status_from_error};
 use super::proto;
 use crate::config::Config;
-use crate::orchestrator::{Asset, Orchestrator};
+use crate::orchestrator::{ApplyRequest, Asset, FilesUpload, Orchestrator};
+use crate::template::{self, GeneratedFile};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -156,6 +157,7 @@ impl OrchestratorRpc for RpcService {
                     docker_available: crate::docker::available(config),
                     stacks_root: config.stacks_root.display().to_string(),
                     domain: config.domain.clone(),
+                    listen: config.listen.clone(),
                 })
             })
             .await?;
@@ -172,19 +174,43 @@ impl OrchestratorRpc for RpcService {
         Ok(Response::new(self.operation_stream(
             String::from("正在校验并应用项目配置"),
             move |manager| {
-                manager.apply(
-                    &request.config_toml,
-                    request
-                        .assets
-                        .into_iter()
-                        .map(|asset| Asset {
-                            path: PathBuf::from(asset.path),
-                            content: asset.content,
-                        })
-                        .collect(),
-                    request.force,
-                    request.start,
-                )
+                let assets: Vec<Asset> = request
+                    .assets
+                    .iter()
+                    .map(|asset| Asset {
+                        path: PathBuf::from(&asset.path),
+                        content: asset.content.clone(),
+                    })
+                    .collect();
+                let project_files = request
+                    .project_files
+                    .iter()
+                    .map(|asset| FilesUpload {
+                        path: PathBuf::from(&asset.path),
+                        file: GeneratedFile {
+                            path: PathBuf::from(template::files::FILES_DIRECTORY).join(&asset.path),
+                            content: asset.content.clone(),
+                            mode: 0o644,
+                            replace: true,
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                let files_into = if request.files_into.is_empty() {
+                    String::from(template::files::DEFAULT_FILES_TARGET)
+                } else {
+                    request.files_into.clone()
+                };
+                manager.apply(&ApplyRequest {
+                    config_toml: &request.config_toml,
+                    assets: &assets,
+                    assets_provided: request.assets_provided || !assets.is_empty(),
+                    replace_assets: request.assets_mode == proto::AssetsMode::Replace as i32,
+                    project_files: &project_files,
+                    files_into: &files_into,
+                    force: request.force,
+                    start: request.start,
+                    restart_dependents: request.restart_dependents,
+                })
             },
         )))
     }
@@ -213,9 +239,48 @@ impl OrchestratorRpc for RpcService {
         &self,
         request: Request<proto::ExportRequest>,
     ) -> Result<Response<proto::ExportResponse>, Status> {
-        let name = request.into_inner().name;
-        let config_toml = self.reading(move |manager| manager.export(&name)).await?;
+        let request = request.into_inner();
+        let name = request.name;
+        let keep_comments = request.keep_comments;
+        let config_toml = self
+            .reading(move |manager| manager.export(&name, keep_comments))
+            .await?;
         Ok(Response::new(proto::ExportResponse { config_toml }))
+    }
+
+    async fn doctor(
+        &self,
+        _request: Request<proto::DoctorRequest>,
+    ) -> Result<Response<proto::DoctorResponse>, Status> {
+        let report = self
+            .reading(|manager| crate::doctor::report(manager.config()))
+            .await?;
+        Ok(Response::new(proto::DoctorResponse {
+            report: report.text,
+            problems: report.problems,
+        }))
+    }
+
+    async fn set_domain(
+        &self,
+        request: Request<proto::SetDomainRequest>,
+    ) -> Result<Response<proto::SetDomainResponse>, Status> {
+        let domain = request.into_inner().domain;
+        let requested = domain.clone();
+        let affected = self
+            .reading(move |manager| manager.set_domain(&requested))
+            .await?;
+        let mut message = format!("主域名已更新为 {domain}；重启 daemon 后对新请求生效");
+        if !affected.is_empty() {
+            message.push_str(&format!(
+                "。以下项目仍钉定了其它域名，需要手工调整：{}",
+                affected.join(", ")
+            ));
+        }
+        Ok(Response::new(proto::SetDomainResponse {
+            message,
+            restart_required: true,
+        }))
     }
 
     type EditStream = RpcStream<proto::OperationProgress>;

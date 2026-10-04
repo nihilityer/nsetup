@@ -12,6 +12,12 @@ pub struct AutheliaOidcClientConfig {
     /// Authelia 保存的客户端密钥摘要；客户端应用使用对应明文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_secret_hash: Option<String>,
+    /// 引用的 provider 级 claims policy 名称。
+    ///
+    /// Grafana 一类客户端不会主动请求 UserInfo，需要 provider 通过 claims policy
+    /// 把 `email`、`name`、`groups` 等 claim 直接写入 ID Token。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims_policy: Option<String>,
     /// 是否为不能安全保存密钥的公共客户端。
     #[serde(default, skip_serializing_if = "is_false")]
     pub public: bool,
@@ -94,6 +100,9 @@ struct OidcClientDocument<'a> {
     client_name: &'a str,
     /// 机密客户端使用摘要，公共客户端使用空字符串。
     client_secret: &'a str,
+    /// 引用的 provider 级 claims policy。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claims_policy: Option<&'a str>,
     /// 是否为公共客户端。
     public: bool,
     /// 此客户端要求的授权策略。
@@ -108,8 +117,9 @@ struct OidcClientDocument<'a> {
     response_types: [&'static str; 1],
     /// 是否要求 PKCE。
     require_pkce: bool,
-    /// PKCE 固定使用 S256。
-    pkce_challenge_method: &'static str,
+    /// PKCE 固定使用 S256；仅在要求 PKCE 时输出。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pkce_challenge_method: Option<&'static str>,
     /// token endpoint 的客户端认证方式。
     token_endpoint_auth_method: &'static str,
 }
@@ -151,6 +161,11 @@ impl AutheliaOidcClientConfig {
             anyhow::bail!("Authelia OIDC 客户端 {client_id} 的 client_name 无效");
         }
         validate_client_secret(self, client_id)?;
+        if let Some(policy) = self.claims_policy.as_deref()
+            && !super::authelia::valid_claims_policy_name(policy)
+        {
+            anyhow::bail!("Authelia OIDC 客户端 {client_id} 的 claims_policy 名称无效: {policy}");
+        }
         if self.redirect_uris.is_empty() {
             anyhow::bail!("Authelia OIDC 客户端 {client_id} 至少需要一个 redirect_uri");
         }
@@ -172,6 +187,7 @@ impl AutheliaOidcClientConfig {
             client_id,
             client_name: &self.client_name,
             client_secret: self.client_secret_hash.as_deref().unwrap_or_default(),
+            claims_policy: self.claims_policy.as_deref(),
             public: self.public,
             authorization_policy: self.authorization_policy.as_str(),
             redirect_uris: &self.redirect_uris,
@@ -179,7 +195,10 @@ impl AutheliaOidcClientConfig {
             grant_types: &self.grant_types,
             response_types: ["code"],
             require_pkce: self.require_pkce,
-            pkce_challenge_method: "S256",
+            // Authelia 把 pkce_challenge_method 视为对该客户端的强制 PKCE 声明：
+            // 只要写了 S256，即使 require_pkce=false 也会拒绝不带 code_challenge
+            // 的授权请求（例如 Gitea）。因此只在确实要求 PKCE 时才输出该字段。
+            pkce_challenge_method: self.require_pkce.then_some("S256"),
             token_endpoint_auth_method: self.token_endpoint_auth_method.as_str(),
         }
     }

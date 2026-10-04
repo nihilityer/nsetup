@@ -34,6 +34,35 @@ service Orchestrator {
   rpc Build(ActionRequest) returns (stream OperationProgress);
   // 返回项目日志，并可持续跟随新增日志。
   rpc Logs(LogsRequest) returns (stream LogLine);
+  // 比对容器 label 与 Traefik 实际加载的路由，报告未被接管的服务。
+  rpc Doctor(DoctorRequest) returns (DoctorResponse);
+  // 在不重装 daemon 的前提下更新基础域名。
+  rpc SetDomain(SetDomainRequest) returns (SetDomainResponse);
+}
+
+// 诊断请求不需要参数。
+message DoctorRequest {}
+
+// 诊断报告。
+message DoctorResponse {
+  // 可直接显示给操作者的多行诊断报告。
+  string report = 1;
+  // 发现的问题数量；为 0 表示全部检查通过。
+  uint32 problems = 2;
+}
+
+// 主域名热更新请求。
+message SetDomainRequest {
+  // 新的基础 DNS 域名。
+  string domain = 1;
+}
+
+// 主域名热更新结果。
+message SetDomainResponse {
+  // 可直接显示给操作者的结果说明。
+  string message = 1;
+  // 是否需要重启 daemon 才能让新域名对全部客户端生效。
+  bool restart_required = 2;
 }
 
 // 状态查询不需要参数。
@@ -49,6 +78,8 @@ message StatusResponse {
   string stacks_root = 3;
   // 短主机名使用的主域名。
   string domain = 4;
+  // daemon 当前的 gRPC 监听地址。
+  string listen = 5;
 }
 
 // static 模板附带的单个站点文件。
@@ -69,6 +100,26 @@ message ApplyRequest {
   bool start = 3;
   // 是否允许整体替换已存在的同名项目。
   bool force = 4;
+  // `--files` 上传的项目附属文件；路径相对于 `files/` 目录。
+  repeated Asset project_files = 5;
+  // Authelia OIDC 客户端变化后是否顺带重启 authelia。
+  bool restart_dependents = 6;
+  // 客户端是否显式提供了 `--assets`。
+  bool assets_provided = 7;
+  // `--assets` 与既有站点内容的合并方式。
+  AssetsMode assets_mode = 8;
+  // `--files` 在容器内的挂载目标。
+  string files_into = 9;
+}
+
+// `--assets` 与既有站点内容的合并方式。
+enum AssetsMode {
+  // 未指定时按合并处理，保留未上传的既有站点文件。
+  ASSETS_MODE_UNSPECIFIED = 0;
+  // 合并：只覆盖同名文件，保留其它既有文件。
+  ASSETS_MODE_MERGE = 1;
+  // 整体替换：先清空站点目录再写入上传的文件。
+  ASSETS_MODE_REPLACE = 2;
 }
 
 // Compose 项目导入请求。
@@ -87,6 +138,8 @@ message ImportComposeRequest {
 message ExportRequest {
   // 要导出的项目名。
   string name = 1;
+  // 是否在结果前追加当前版本的带注释骨架。
+  bool keep_comments = 2;
 }
 
 // TOML 导出结果。
@@ -103,8 +156,8 @@ message Route {
   optional string path_prefix = 2;
   // Traefik 连接的容器端口。
   uint32 container_port = 3;
-  // 此路由引用的内置中间件。
-  repeated Middleware middlewares = 4;
+  // 此路由引用的中间件名称；裸名称指向 `@file` provider。
+  repeated string middlewares = 4;
   // Traefik 连接后端时使用的协议。
   RouteProtocol protocol = 5;
   // 是否启用负载均衡 sticky cookie。
@@ -115,6 +168,8 @@ message Route {
   optional uint32 priority = 8;
   // 在 TOML、Traefik router 和 backend 中保持稳定的路由名。
   string name = 9;
+  // 路由监听的 Traefik entrypoint；省略时使用 https。
+  optional string entrypoint = 10;
 }
 
 // 一个完整的宿主机端口映射。
@@ -141,8 +196,10 @@ message Volume {
 
 // 容器健康检查。
 message Healthcheck {
-  // CMD-SHELL 形式的检查命令。
+  // CMD-SHELL 形式的检查命令；与 exec 互斥。
   string command = 1;
+  // CMD（argv）形式的检查参数；没有 shell 的镜像必须使用它。
+  repeated string exec = 6;
   // 可选检查间隔，如 30s。
   optional string interval = 2;
   // 可选单次检查超时，如 3s。
@@ -180,7 +237,7 @@ message EditRequest {
   // external 网络模式使用的 Docker 网络名。
   optional string external_network = 12;
   // 应用于全部保留路由的新中间件列表。
-  repeated Middleware middlewares = 13;
+  repeated string middlewares = 13;
   // 按键替换的自定义 Docker 标签。
   repeated string labels = 14;
   // 新健康检查；提供时替换现有健康检查。
@@ -318,7 +375,10 @@ enum NetworkMode {
   NETWORK_MODE_EXTERNAL = 3;
 }
 
-// nsetup 内置并由 Traefik 模板提供的中间件。
+// nsetup 内置并由 Traefik 模板提供的中间件名称。
+//
+// 路由的 middlewares 字段使用字符串而不是枚举：除内置名称外，还允许引用由
+// `[traefik.middlewares]` 或 `files/` 追加的自定义中间件。此枚举只用于文档说明。
 enum Middleware {
   // 未指定中间件。
   MIDDLEWARE_UNSPECIFIED = 0;

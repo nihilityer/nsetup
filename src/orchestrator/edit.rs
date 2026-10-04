@@ -2,7 +2,6 @@
 
 use super::operations::oidc_update_suffix;
 use super::{Edit, NetworkEdit, Orchestrator};
-use crate::constants::PROXY_NETWORK;
 use crate::docker;
 use crate::spec::{BindMount, Document, Network, PublishedPort, Service, validate_name};
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +64,7 @@ impl Orchestrator {
         if let Some(network) = edit.network {
             apply_network(
                 &mut spec.document,
+                name,
                 &service_name,
                 &mut service,
                 network,
@@ -73,19 +73,32 @@ impl Orchestrator {
         } else if service.network_mode.as_deref() == Some("host") && !routes.is_empty() {
             anyhow::bail!("host 网络模式不能使用 Traefik 容器路由");
         }
-        if !routes.is_empty() && !service.networks.iter().any(|name| name == "proxy") {
-            add_proxy_network(&mut spec.document);
-            service.networks.push(String::from("proxy"));
+        if !routes.is_empty() {
+            // 有路由的服务同时接入代理网络与项目网络，才能既被 Traefik 回源、
+            // 又能访问同项目其它服务。
+            crate::spec::add_proxy_network(&mut spec.document, true);
+            crate::spec::add_project_network(&mut spec.document, name);
+            if !service.networks.iter().any(|value| value == "proxy") {
+                service.networks.push(String::from("proxy"));
+            }
+            if !service.networks.iter().any(|value| value == "project") {
+                service.networks.push(String::from("project"));
+            }
         }
         service.set_routes(name, &service_name, &routes)?;
         spec.document.services.insert(service_name.clone(), service);
         clean_unused_networks(&mut spec.document);
         spec.validate()?;
-        let oidc_fragment = self.prepare_oidc_client_fragment(&spec)?;
+        let oidc_change = self.prepare_oidc_change(&spec)?;
         self.deploy(&spec, &[], true)?;
-        let oidc_updated = self.sync_oidc_client_fragment(name, oidc_fragment.as_ref())?;
+        let oidc_updated = self.apply_oidc_change(name, oidc_change, true)?;
         if edit.start {
-            docker::compose_up(&self.config, &self.project_dir(name)?, Some(&service_name))?;
+            docker::compose_up(
+                &self.config,
+                &self.project_dir(name)?,
+                Some(&service_name),
+                true,
+            )?;
         }
         Ok(format!(
             "项目 {name} 的服务 {service_name} 已更新{}",
@@ -151,6 +164,7 @@ fn labels_to_map(values: &[String]) -> anyhow::Result<BTreeMap<String, String>> 
 /// 对暂时从文档移出的服务应用一次逻辑网络修改。
 fn apply_network(
     document: &mut Document,
+    stack_name: &str,
     service_name: &str,
     service: &mut Service,
     network: NetworkEdit,
@@ -160,8 +174,10 @@ fn apply_network(
     service.networks.clear();
     match network {
         NetworkEdit::Bridge if has_routes => {
-            add_proxy_network(document);
+            crate::spec::add_proxy_network(document, true);
+            crate::spec::add_project_network(document, stack_name);
             service.networks.push(String::from("proxy"));
+            service.networks.push(String::from("project"));
         }
         NetworkEdit::Bridge => {}
         NetworkEdit::Host if has_routes => {
@@ -179,23 +195,14 @@ fn apply_network(
             );
             service.networks.push(key);
             if has_routes {
-                add_proxy_network(document);
+                crate::spec::add_proxy_network(document, true);
+                crate::spec::add_project_network(document, stack_name);
                 service.networks.push(String::from("proxy"));
+                service.networks.push(String::from("project"));
             }
         }
     }
     Ok(())
-}
-
-/// 确保共享外部代理网络定义存在。
-fn add_proxy_network(document: &mut Document) {
-    document.networks.insert(
-        String::from("proxy"),
-        Network {
-            external: true,
-            name: Some(String::from(PROXY_NETWORK)),
-        },
-    );
 }
 
 /// 编辑后移除没有任何服务引用的顶层网络。

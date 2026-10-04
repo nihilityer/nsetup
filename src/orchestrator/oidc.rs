@@ -11,8 +11,31 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+/// Authelia 项目配置目录中客户端片段的私有目录权限。
+const FRAGMENT_DIRECTORY_MODE: u32 = 0o750;
+
+/// 一次应用对 Authelia 客户端片段造成的变更。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OidcChange {
+    /// 客户端片段无需变化。
+    Unchanged,
+    /// 应用拥有客户端，需要写入片段。
+    Sync(GeneratedFile),
+    /// 应用不再声明客户端，需要移除既有片段。
+    Remove,
+}
+
 impl Orchestrator {
+    /// 判断 Authelia 项目是否已部署。
+    pub(super) fn authelia_deployed(&self) -> anyhow::Result<bool> {
+        Ok(self.project_dir("authelia")?.is_dir())
+    }
+
     /// 在部署 Authelia 时附加全部现有应用拥有的 OIDC 客户端片段。
+    ///
+    /// # 错误
+    ///
+    /// 任一现有项目状态无效或 client ID 冲突时返回错误。
     pub(super) fn attach_oidc_client_fragments(
         &self,
         generated: &mut TemplateOutput,
@@ -27,23 +50,90 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// 校验应用的客户端 ID 不与其他项目冲突，并返回它拥有的片段。
-    pub(super) fn prepare_oidc_client_fragment(
-        &self,
-        requested: &StackSpec,
-    ) -> anyhow::Result<Option<GeneratedFile>> {
+    /// 计算本次应用需要对 Authelia 客户端片段做的变更。
+    ///
+    /// 同时校验 client ID 全局唯一，以及应用声明客户端时 provider 已启用。
+    ///
+    /// # 错误
+    ///
+    /// client ID 冲突、provider 未启用或既有片段无法读取时返回错误。
+    pub(super) fn prepare_oidc_change(&self, requested: &StackSpec) -> anyhow::Result<OidcChange> {
+        if requested.name == "authelia" {
+            return Ok(OidcChange::Unchanged);
+        }
+        let authelia = self.project_dir("authelia")?;
+        if !authelia.is_dir() {
+            // 还没有 Authelia 项目：仍然校验 client ID 唯一性，但不产生片段。
+            let _fragments = self.collect_oidc_fragments(Some(requested))?;
+            return Ok(OidcChange::Unchanged);
+        }
         let fragments = self.collect_oidc_fragments(Some(requested))?;
-        Ok(fragments
+        let desired = fragments
             .into_iter()
-            .find_map(|(name, fragment)| (name == requested.name).then_some(fragment).flatten()))
+            .find_map(|(name, fragment)| (name == requested.name).then_some(fragment).flatten());
+        let destination = authelia.join(oidc_fragment_path(&requested.name));
+        let Some(file) = desired else {
+            return Ok(match fs::symlink_metadata(&destination) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    OidcChange::Remove
+                }
+                Ok(_) => anyhow::bail!("OIDC 片段路径不是普通文件: {}", destination.display()),
+                Err(_) => OidcChange::Unchanged,
+            });
+        };
+        Ok(OidcChange::Sync(file))
     }
 
-    /// 将单个应用的期望 OIDC 片段同步到已部署的 Authelia 项目。
-    pub(super) fn sync_oidc_client_fragment(
+    /// 计算删除项目后需要移除的客户端片段。
+    ///
+    /// # 错误
+    ///
+    /// 既有片段路径不是普通文件时返回错误。
+    pub(super) fn prepare_oidc_removal(&self, name: &str) -> anyhow::Result<OidcChange> {
+        if name == "authelia" {
+            return Ok(OidcChange::Unchanged);
+        }
+        let authelia = self.project_dir("authelia")?;
+        if !authelia.is_dir() {
+            return Ok(OidcChange::Unchanged);
+        }
+        let destination = authelia.join(oidc_fragment_path(name));
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                Ok(OidcChange::Remove)
+            }
+            Ok(_) => anyhow::bail!("OIDC 片段路径不是普通文件: {}", destination.display()),
+            Err(_) => Ok(OidcChange::Unchanged),
+        }
+    }
+
+    /// 应用客户端片段变更，返回是否真的改动了 Authelia 项目的状态。
+    ///
+    /// `restart_dependents` 为真且确实发生变更时，顺带重启已部署的 Authelia 项目；
+    /// Authelia 只在进程启动时读取客户端片段，不重启则新客户端不会生效。
+    ///
+    /// # 错误
+    ///
+    /// 写入或删除片段失败，或重启 Authelia 失败时返回错误。
+    pub(super) fn apply_oidc_change(
         &self,
         project_name: &str,
-        fragment: Option<&GeneratedFile>,
+        change: OidcChange,
+        restart_dependents: bool,
     ) -> anyhow::Result<bool> {
+        let updated = self.write_oidc_change(project_name, change)?;
+        if updated && restart_dependents && self.authelia_deployed()? {
+            crate::docker::compose_restart(&self.config, &self.project_dir("authelia")?)?;
+        }
+        Ok(updated)
+    }
+
+    /// 将单个项目的期望客户端片段写入或移出已部署的 Authelia 项目。
+    ///
+    /// # 错误
+    ///
+    /// 写入或删除片段失败时返回错误。
+    fn write_oidc_change(&self, project_name: &str, change: OidcChange) -> anyhow::Result<bool> {
         if project_name == "authelia" {
             return Ok(false);
         }
@@ -52,8 +142,10 @@ impl Orchestrator {
             return Ok(false);
         }
         let relative = oidc_fragment_path(project_name);
-        match fragment {
-            Some(file) => {
+        match change {
+            OidcChange::Unchanged => Ok(false),
+            OidcChange::Remove => remove_attachment(&authelia, &relative),
+            OidcChange::Sync(file) => {
                 let destination = authelia.join(&relative);
                 let current = fs::symlink_metadata(&destination).ok();
                 let safe_file = current.as_ref().is_some_and(|metadata| {
@@ -68,10 +160,9 @@ impl Orchestrator {
                 {
                     return Ok(false);
                 }
-                replace_attachment(&authelia, file)?;
+                replace_attachment(&authelia, &file, FRAGMENT_DIRECTORY_MODE)?;
                 Ok(true)
             }
-            None => remove_attachment(&authelia, &relative),
         }
     }
 
@@ -210,7 +301,7 @@ image = "example/web"
 version = "1.0"
 "#
         );
-        Ok(crate::template::apply(&input, &Config::default())?.spec)
+        Ok(crate::template::apply(&input, &Config::default(), None)?.spec)
     }
 
     /// 生成启用或未启用 OIDC provider 的 Authelia IR。
@@ -246,6 +337,6 @@ password_hash = '$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA'
 email = "admin@example.com"
 "#
         );
-        Ok(crate::template::apply(&input, &Config::default())?.spec)
+        Ok(crate::template::apply(&input, &Config::default(), None)?.spec)
     }
 }

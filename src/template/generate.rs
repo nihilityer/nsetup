@@ -1,16 +1,18 @@
 //! 将各类 TOML 声明展开为统一 IR 与附属文件。
 
+use super::GeneratedFile;
 use super::{
     APP_OIDC_CLIENTS_KEY, AppConfig, AppNetwork, AppServiceConfig, FORMAT_VERSION,
-    HealthcheckConfig, StaticConfig, TemplateKind, TemplateOutput, oidc,
+    HealthcheckCommand, HealthcheckConfig, StaticConfig, TemplateKind, TemplateOutput, oidc,
 };
 use crate::config::Config;
-use crate::constants::PROXY_NETWORK;
 use crate::spec::{
-    Document, Healthcheck, Network, Route, RouteProtocol, Service, StackSpec, validate_name,
+    Document, Healthcheck, Network, Route, RouteProtocol, Service, StackSpec, validate_entrypoints,
+    validate_group, validate_hooks, validate_middleware, validate_name, validate_user,
     validate_version,
 };
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// 将应用文档转换为 Compose IR。
 pub(super) fn generate_app(input: AppConfig, config: &Config) -> anyhow::Result<TemplateOutput> {
@@ -35,10 +37,23 @@ pub(super) fn generate_app(input: AppConfig, config: &Config) -> anyhow::Result<
         anyhow::bail!("app 模板至少需要一个服务");
     }
     let mut document = Document::default();
+    let mut hooks = BTreeMap::new();
     for (service_name, service_config) in input.services {
         validate_name("服务名", &service_name)?;
         validate_version(&service_config.version)?;
         validate_repository(&service_config.image)?;
+        if let Some(user) = &service_config.user {
+            validate_user(user)?;
+        }
+        for group in &service_config.group_add {
+            validate_group(group)?;
+        }
+        if let Some(service_hooks) = &service_config.hooks {
+            validate_hooks(&format!("服务 {service_name}"), service_hooks)?;
+            if !service_hooks.is_empty() {
+                hooks.insert(service_name.clone(), service_hooks.clone());
+            }
+        }
         let routes = app_routes(&service_config, config)?;
         if !routes.is_empty() && service_config.network == AppNetwork::Host {
             anyhow::bail!("host 网络模式不能使用 Traefik 容器路由");
@@ -53,15 +68,22 @@ pub(super) fn generate_app(input: AppConfig, config: &Config) -> anyhow::Result<
             environment: service_config.environment,
             env_file: service_config.env_file,
             labels: service_config.labels,
-            healthcheck: service_config.healthcheck.map(healthcheck_from_config),
+            user: service_config.user,
+            group_add: service_config.group_add,
+            healthcheck: service_config
+                .healthcheck
+                .map(healthcheck_from_config)
+                .transpose()?,
             logging: service_config.logging,
             ..Service::default()
         };
         service.labels.push(String::from("io.nsetup.template=app"));
         match service_config.network {
             AppNetwork::Bridge if !routes.is_empty() => {
-                add_proxy_network(&mut document, true);
+                crate::spec::add_proxy_network(&mut document, true);
+                crate::spec::add_project_network(&mut document, &input.name);
                 service.networks.push(String::from("proxy"));
+                service.networks.push(String::from("project"));
             }
             AppNetwork::Bridge => {}
             AppNetwork::Host => service.network_mode = Some(String::from("host")),
@@ -80,19 +102,22 @@ pub(super) fn generate_app(input: AppConfig, config: &Config) -> anyhow::Result<
                 );
                 service.networks.push(key);
                 if !routes.is_empty() {
-                    add_proxy_network(&mut document, true);
+                    crate::spec::add_proxy_network(&mut document, true);
+                    crate::spec::add_project_network(&mut document, &input.name);
                     service.networks.push(String::from("proxy"));
+                    service.networks.push(String::from("project"));
                 }
             }
         }
         service.set_routes(&input.name, &service_name, &routes)?;
         document.services.insert(service_name, service);
     }
-    let spec = StackSpec {
+    let mut spec = StackSpec {
         name: input.name,
         document,
         environment,
     };
+    spec.set_project_hooks(&hooks)?;
     spec.validate()?;
     Ok(TemplateOutput {
         spec,
@@ -114,15 +139,27 @@ pub(super) fn generate_static(
     let host = expand_host(&input.host, &config.domain)?;
     let directory = config.stacks_root.join(&input.name);
     let mut document = Document::default();
-    add_proxy_network(&mut document, true);
+    crate::spec::add_proxy_network(&mut document, true);
+    // 静态站点把整个受管项目目录以只读方式挂进容器：站点文件放在 site/ 下，用户
+    // 只要把 nginx.conf 放进项目目录就同时改写服务方式，不必再借助特权容器写入。
     let mut service = Service {
         image: String::from("nginx:${NGINX_VERSION}"),
         restart: Some(String::from("unless-stopped")),
         networks: vec![String::from("proxy")],
-        volumes: vec![format!(
-            "{}/site:/usr/share/nginx/html:ro",
-            directory.display()
-        )],
+        volumes: vec![
+            format!("{}/site:/usr/share/nginx/html:ro", directory.display()),
+            format!("{}:/opt/nsetup:ro", directory.display()),
+        ],
+        environment: BTreeMap::from([
+            (
+                String::from("NGINX_ENTRYPOINT_WORKER_PROCESSES_AUTOTUNE"),
+                String::from("1"),
+            ),
+            (
+                String::from("NGINX_ENTRYPOINT_QUIET_LOGS"),
+                String::from("1"),
+            ),
+        ]),
         labels: vec![String::from("io.nsetup.template=static")],
         ..Service::default()
     };
@@ -136,6 +173,7 @@ pub(super) fn generate_static(
             container_port: 80,
             middlewares: input.middlewares,
             protocol: RouteProtocol::Http,
+            entrypoint: String::from("https"),
             sticky_cookie: false,
             pass_host_header: None,
             priority: None,
@@ -150,10 +188,54 @@ pub(super) fn generate_static(
     spec.validate()?;
     Ok(TemplateOutput {
         spec,
-        files: Vec::new(),
+        files: static_files(),
         kind: TemplateKind::Static,
     })
 }
+
+/// 静态站点最小的 nginx 站点配置。
+///
+/// 镜像自带的 `default.conf` 监听 80 并以 `/usr/share/nginx/html` 为根；这里补充
+/// gzip、静态资源缓存与 `/.well-known/`、`/healthz` 直达，避免用户为了生产可用的
+/// 默认值自建镜像。
+fn static_files() -> Vec<GeneratedFile> {
+    vec![GeneratedFile {
+        path: PathBuf::from("config/nginx/default.conf"),
+        content: STATIC_NGINX_CONFIG.as_bytes().to_vec(),
+        mode: 0o644,
+        replace: true,
+    }]
+}
+
+/// 默认站点配置正文；正则中的反斜杠必须原样保留，因此使用原始字符串。
+const STATIC_NGINX_CONFIG: &str = r"server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+    gzip_min_length 1024;
+
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 'ok';
+    }
+
+    location ~* ^/(\.well-known/.*|[^/]+\.(css|js|mjs|png|jpe?g|gif|svg|webp|ico|woff2?))$ {
+        access_log off;
+        add_header Cache-Control 'public, max-age=604800';
+        try_files $uri =404;
+    }
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+";
 
 /// 将紧凑或详细的 TOML 路由展开为语义路由。
 fn app_routes(service: &AppServiceConfig, config: &Config) -> anyhow::Result<Vec<Route>> {
@@ -161,6 +243,7 @@ fn app_routes(service: &AppServiceConfig, config: &Config) -> anyhow::Result<Vec
         return Ok(Vec::new());
     };
     validate_middlewares(&traefik.middlewares)?;
+    validate_entrypoint(&traefik.entrypoint)?;
     let mut output = Vec::new();
     if !traefik.hosts.is_empty() {
         let port = service
@@ -173,6 +256,7 @@ fn app_routes(service: &AppServiceConfig, config: &Config) -> anyhow::Result<Vec
             container_port: port,
             middlewares: traefik.middlewares.clone(),
             protocol: traefik.protocol.into(),
+            entrypoint: traefik.entrypoint.clone(),
             sticky_cookie: traefik.sticky_cookie,
             pass_host_header: traefik.pass_host_header,
             priority: traefik.priority,
@@ -180,6 +264,7 @@ fn app_routes(service: &AppServiceConfig, config: &Config) -> anyhow::Result<Vec
     }
     for (route_name, route) in &traefik.routes {
         validate_middlewares(&route.middlewares)?;
+        validate_entrypoint(&route.entrypoint)?;
         let port = route
             .port
             .or(service.port)
@@ -195,6 +280,11 @@ fn app_routes(service: &AppServiceConfig, config: &Config) -> anyhow::Result<Vec
                 route.middlewares.clone()
             },
             protocol: route.protocol.into(),
+            entrypoint: if route.entrypoint.trim().is_empty() {
+                traefik.entrypoint.clone()
+            } else {
+                route.entrypoint.clone()
+            },
             sticky_cookie: route.sticky_cookie,
             pass_host_header: route.pass_host_header,
             priority: route.priority,
@@ -206,25 +296,18 @@ fn app_routes(service: &AppServiceConfig, config: &Config) -> anyhow::Result<Vec
     Ok(output)
 }
 
-/// 将 TOML 健康检查转换为 Compose `CMD-SHELL` 形式。
-fn healthcheck_from_config(value: HealthcheckConfig) -> Healthcheck {
-    let mut healthcheck = Healthcheck::command(value.command);
+/// 将 TOML 健康检查转换为 Compose 测试命令。
+fn healthcheck_from_config(value: HealthcheckConfig) -> anyhow::Result<Healthcheck> {
+    let mut healthcheck = match &value.command {
+        HealthcheckCommand::Shell(command) => Healthcheck::command(command.clone()),
+        HealthcheckCommand::Exec(arguments) => Healthcheck::exec(arguments)?,
+    };
     healthcheck.interval = value.interval;
     healthcheck.timeout = value.timeout;
     healthcheck.start_period = value.start_period;
     healthcheck.retries = value.retries;
-    healthcheck
-}
-
-/// 插入固定名称的反向代理网络定义。
-fn add_proxy_network(document: &mut Document, external: bool) {
-    document.networks.insert(
-        String::from("proxy"),
-        Network {
-            external,
-            name: Some(String::from(PROXY_NETWORK)),
-        },
-    );
+    healthcheck.validate()?;
+    Ok(healthcheck)
 }
 
 /// 要求使用当前 TOML 模式版本。
@@ -271,16 +354,23 @@ fn validate_docker_name(label: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 根据模板内置中间件注册表检查名称。
+/// 校验路由引用的 Traefik 中间件名称。
+///
+/// 内置中间件由 traefik 模板生成；其它名称视为用户通过 `[traefik.middlewares]`
+/// 或 `files/` 追加的自定义中间件，因此只做安全性检查而不做白名单限制。
 fn validate_middlewares(values: &[String]) -> anyhow::Result<()> {
     for value in values {
-        if !matches!(
-            value.as_str(),
-            "authelia" | "gzip" | "forwarded-headers" | "internal-only" | "tls"
-        ) {
-            anyhow::bail!("未知内置 Traefik middleware: {value}");
-        }
+        validate_middleware(value)?;
     }
+    Ok(())
+}
+
+/// 校验可选的路由入口列表。
+fn validate_entrypoint(value: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty() {
+        return Ok(());
+    }
+    let _entrypoints = validate_entrypoints(value)?;
     Ok(())
 }
 
