@@ -335,13 +335,15 @@ mod tests {
                 name: format!("route{index}"),
                 hosts: vec![String::from("shared.example.com")],
                 path_prefix: prefix.map(str::to_string),
-                container_port: 80,
+                container_port: Some(80),
                 middlewares: Vec::new(),
                 protocol: RouteProtocol::Http,
                 entrypoint: String::from("https"),
                 sticky_cookie: false,
                 pass_host_header: None,
                 priority: None,
+                service: None,
+                tls_domains: Vec::new(),
             })
             .collect();
         service.set_routes(name, "web", &routes)?;

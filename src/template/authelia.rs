@@ -85,7 +85,7 @@ pub(super) struct AutheliaTelemetryConfig {
     /// 暴露 Prometheus 指标的监听地址，例如 `tcp://0.0.0.0:9959`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_address: Option<String>,
-    /// 指标路径，默认 `/metrics`。
+    /// 指标路径；Authelia 4.39.x 固定为 `/metrics`，其它取值只告警。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_path: Option<String>,
     /// 导出 trace 的地址，例如 `udp://otel-collector:4318`。
@@ -95,6 +95,9 @@ pub(super) struct AutheliaTelemetryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracing_sample_rate: Option<f64>,
 }
+
+/// Authelia 4.39.x 固定的指标路径。
+const METRICS_PATH: &str = "/metrics";
 
 impl AutheliaTelemetryConfig {
     /// 判断是否声明了任何遥测端点。
@@ -126,7 +129,7 @@ impl AutheliaTelemetryConfig {
         Ok(())
     }
 
-    /// 生成 `telemetry` YAML 块。
+    /// 生成 `telemetry` YAML 块；不写 `metrics.path`，该键会让 Authelia 启动即失败。
     fn yaml(&self) -> String {
         let mut output = String::from("telemetry:\n");
         if self.metrics_address.is_some() || self.metrics_path.is_some() {
@@ -137,9 +140,6 @@ impl AutheliaTelemetryConfig {
                     .unwrap_or("tcp://0.0.0.0:9959"),
             );
             output.push_str("'\n");
-            if let Some(path) = &self.metrics_path {
-                output.push_str(&format!("    path: '{path}'\n"));
-            }
         }
         if self.tracing_address.is_some() || self.tracing_sample_rate.is_some() {
             output.push_str("  tracing:\n    enabled: true\n");
@@ -278,13 +278,15 @@ pub(super) fn generate(input: &AutheliaConfig, config: &Config) -> anyhow::Resul
             name: String::from("default"),
             hosts: vec![host],
             path_prefix: None,
-            container_port: 9091,
+            container_port: Some(9091),
             middlewares: vec![String::from("tls")],
             protocol: RouteProtocol::Http,
             entrypoint: String::from("https"),
             sticky_cookie: false,
             pass_host_header: None,
             priority: None,
+            service: None,
+            tls_domains: Vec::new(),
         }],
     )?;
     document.services.insert(String::from("authelia"), service);
@@ -422,6 +424,15 @@ fn validate_input(input: &AutheliaConfig, config: &Config) -> anyhow::Result<()>
     }
     if let Some(telemetry) = &input.telemetry {
         telemetry.validate()?;
+        // 指标路径固定为 `/metrics`，其它取值忽略并告警（R9）。
+        if let Some(path) = &telemetry.metrics_path
+            && path != METRICS_PATH
+        {
+            tracing::warn!(
+                metrics_path = %path,
+                "Authelia 4.39.x 的指标路径固定为 {METRICS_PATH}，已忽略 telemetry.metrics_path"
+            );
+        }
     }
     if input.users.is_empty() {
         anyhow::bail!("Authelia 至少需要一个声明式用户");

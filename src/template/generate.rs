@@ -182,13 +182,15 @@ pub(super) fn generate_static(
             name: String::from("default"),
             hosts: vec![host],
             path_prefix: None,
-            container_port: 80,
+            container_port: Some(80),
             middlewares: input.middlewares,
             protocol: RouteProtocol::Http,
             entrypoint: String::from("https"),
             sticky_cookie: false,
             pass_host_header: None,
             priority: None,
+            service: None,
+            tls_domains: Vec::new(),
         }],
     )?;
     document.services.insert(String::from("web"), service);
@@ -274,13 +276,15 @@ fn app_routes(service: &AppServiceConfig, config: &Config) -> anyhow::Result<Vec
             name: String::from("default"),
             hosts: expand_hosts(&traefik.hosts, &config.domain)?,
             path_prefix: traefik.path_prefix.clone(),
-            container_port: port,
+            container_port: Some(port),
             middlewares: traefik.middlewares.clone(),
             protocol: traefik.protocol.into(),
             entrypoint: traefik.entrypoint.clone(),
             sticky_cookie: traefik.sticky_cookie,
             pass_host_header: traefik.pass_host_header,
             priority: traefik.priority,
+            service: None,
+            tls_domains: Vec::new(),
         });
     }
     for (route_name, route) in &traefik.routes {
@@ -294,7 +298,7 @@ fn app_routes(service: &AppServiceConfig, config: &Config) -> anyhow::Result<Vec
             name: route_name.clone(),
             hosts: expand_hosts(&route.hosts, &config.domain)?,
             path_prefix: route.path_prefix.clone(),
-            container_port: port,
+            container_port: Some(port),
             middlewares: if route.middlewares.is_empty() {
                 traefik.middlewares.clone()
             } else {
@@ -309,6 +313,8 @@ fn app_routes(service: &AppServiceConfig, config: &Config) -> anyhow::Result<Vec
             sticky_cookie: route.sticky_cookie,
             pass_host_header: route.pass_host_header,
             priority: route.priority,
+            service: None,
+            tls_domains: Vec::new(),
         });
     }
     if output.is_empty() {

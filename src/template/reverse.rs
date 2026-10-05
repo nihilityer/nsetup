@@ -23,10 +23,10 @@ pub(super) fn export_app(spec: &StackSpec) -> anyhow::Result<AppConfig> {
     let mut services = BTreeMap::new();
     for (name, source) in &spec.document.services {
         let (image, version) = source.image_version()?;
-        let routes = source.routes(&spec.name, name)?;
+        let routes = external_routes(source.routes(&spec.name, name)?);
         let port = routes
             .first()
-            .map(|route| route.container_port)
+            .and_then(|route| route.container_port)
             .or_else(|| {
                 source
                     .ports
@@ -101,16 +101,17 @@ pub(super) fn export_app(spec: &StackSpec) -> anyhow::Result<AppConfig> {
 pub(super) fn export_traefik(spec: &StackSpec, config: &Config) -> anyhow::Result<TraefikConfig> {
     let service = only_named_service(spec, "traefik")?;
     let routes = service.routes(&spec.name, "traefik")?;
-    let dashboard_host = routes
+    // dashboard 由模板重新生成，这里只把它当作导出参数的来源。
+    let dashboard = routes
+        .iter()
+        .find(|route| route.service.is_some())
+        .ok_or_else(|| anyhow::anyhow!("traefik 模板缺少 dashboard 路由"))?;
+    let dashboard_host = dashboard
+        .hosts
         .first()
-        .and_then(|route| route.hosts.first())
         .cloned()
         .unwrap_or_else(|| format!("traefik.{}", config.domain));
-    let dashboard_authelia = service.labels.iter().any(|label| {
-        label
-            .strip_prefix("traefik.http.routers.dashboard.middlewares=")
-            .is_some_and(|value| value.split(',').any(|name| name == "authelia@file"))
-    });
+    let dashboard_authelia = dashboard.middlewares.iter().any(|name| name == "authelia");
     let domain = spec
         .environment
         .get(super::traefik::DOMAIN_KEY)
@@ -197,6 +198,14 @@ pub(super) fn export_static(spec: &StackSpec) -> anyhow::Result<StaticConfig> {
     })
 }
 
+/// 过滤掉内置后端路由：它们由模板重新生成，导出会覆盖掉正确版本。
+fn external_routes(routes: Vec<Route>) -> Vec<Route> {
+    routes
+        .into_iter()
+        .filter(|route| route.service.is_none())
+        .collect()
+}
+
 /// 将单条语义路由压缩为紧凑形式，或导出多条详细路由。
 fn routes_to_config(routes: &[Route]) -> Option<TraefikRoutesConfig> {
     if routes.is_empty() {
@@ -225,7 +234,8 @@ fn routes_to_config(routes: &[Route]) -> Option<TraefikRoutesConfig> {
                     TraefikRouteConfig {
                         hosts: route.hosts.clone(),
                         path_prefix: route.path_prefix.clone(),
-                        port: Some(route.container_port),
+                        port: route.container_port,
+                        service: route.service.clone(),
                         middlewares: route.middlewares.clone(),
                         protocol: route.protocol.into(),
                         entrypoint: route.entrypoint_name().to_string(),

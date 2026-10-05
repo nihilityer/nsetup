@@ -195,13 +195,15 @@ fn single_network_service_skips_traefik_network_label() -> anyhow::Result<()> {
         name: String::from("default"),
         hosts: vec![String::from("legacy.example.com")],
         path_prefix: None,
-        container_port: 8080,
+        container_port: Some(8080),
         middlewares: Vec::new(),
         protocol: crate::spec::RouteProtocol::Http,
         entrypoint: String::from("https"),
         sticky_cookie: false,
         pass_host_header: None,
         priority: None,
+        service: None,
+        tls_domains: Vec::new(),
     };
     let mut single = crate::spec::Service {
         image: String::from("example/legacy:1.0"),
@@ -254,10 +256,10 @@ port = 9001
     let routes = service.routes("storage", "gateway")?;
     assert_eq!(routes[0].name, "api");
     assert_eq!(routes[0].hosts, ["s3.example.com"]);
-    assert_eq!(routes[0].container_port, 9000);
+    assert_eq!(routes[0].container_port, Some(9000));
     assert_eq!(routes[1].name, "console");
     assert_eq!(routes[1].hosts, ["s3c.example.com"]);
-    assert_eq!(routes[1].container_port, 9001);
+    assert_eq!(routes[1].container_port, Some(9001));
     assert!(service.labels.iter().any(|label| {
         label == "traefik.http.services.nsetup-storage-gateway-api.loadbalancer.server.port=9000"
     }));
@@ -346,6 +348,133 @@ fn authelia_skeleton_documents_storage_key_stability() {
     assert!(skeleton.contains("authelia storage encryption change-key"));
 }
 
+/// 读出模板生成的动态配置内容。
+fn dynamic_config(generated: &super::TemplateOutput) -> anyhow::Result<String> {
+    let file = generated
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("dynamic/nsetup.yml"))
+        .ok_or_else(|| anyhow::anyhow!("missing dynamic/nsetup.yml"))?;
+    Ok(String::from_utf8(file.content.clone())?)
+}
+
+/// dashboard 只保留一条 `api@internal` 路由，健康检查带 `--ping`（R10-A、R12）。
+#[test]
+fn traefik_dashboard_route_targets_internal_api() -> anyhow::Result<()> {
+    let input = r#"
+format = 1
+template = "traefik"
+domain = "example.com"
+acme_email = "admin@example.com"
+cloudflare_token = "secret"
+version = "v3.8.0"
+http_port = 8080
+https_port = 8443
+dashboard_authelia = true
+"#;
+    let generated = apply(input, &Config::default(), None)?;
+    let service = &generated.spec.document.services["traefik"];
+    let dashboard = "traefik.http.routers.nsetup-traefik-traefik-dashboard";
+    // dashboard 必须回源到 `api@internal`，不能是容器端口（R10-A）。
+    for expected in [
+        "rule=Host(`traefik.example.com`)".to_string(),
+        "service=api@internal".to_string(),
+        "middlewares=internal-only@file,authelia@file".to_string(),
+        "priority=1000".to_string(),
+        "tls.domains[0].main=example.com".to_string(),
+        "tls.domains[0].sans=*.example.com".to_string(),
+    ] {
+        assert!(
+            service.labels.contains(&format!("{dashboard}.{expected}")),
+            "缺少 label {dashboard}.{expected}"
+        );
+    }
+    assert!(service.labels.iter().all(|label| {
+        !label.starts_with("traefik.http.services.nsetup-traefik-traefik-dashboard.loadbalancer")
+    }));
+    assert!(
+        service
+            .labels
+            .iter()
+            .filter(|label| label.contains(".rule=Host(`traefik.example.com`)"))
+            .count()
+            == 1,
+        "dashboard 只能有一条抢同一 Host() 的路由"
+    );
+    // Docker HEALTHCHECK 是独立进程，读不到 command 里的 `--ping=true`（R12）。
+    let healthcheck = service
+        .healthcheck
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("traefik 模板缺少健康检查"))?;
+    assert_eq!(
+        healthcheck.test,
+        ["CMD", "traefik", "healthcheck", "--ping"].map(String::from)
+    );
+    Ok(())
+}
+
+/// 指标入口必须有 router：`/metrics` 与 `/api` 各自指向内置服务（R10-B）。
+#[test]
+fn traefik_metrics_entrypoint_has_routers() -> anyhow::Result<()> {
+    let input = r#"
+format = 1
+template = "traefik"
+domain = "example.com"
+acme_email = "admin@example.com"
+cloudflare_token = "secret"
+version = "v3.8.0"
+https_port = 8443
+"#;
+    let generated = apply(input, &Config::default(), None)?;
+    let dynamic = dynamic_config(&generated)?;
+    assert!(dynamic.contains("rule: Path(`/metrics`)"), "{dynamic}");
+    assert!(
+        dynamic.contains("service: prometheus@internal"),
+        "{dynamic}"
+    );
+    assert!(
+        dynamic.contains("rule: PathPrefix(`/api`) || PathPrefix(`/debug`)"),
+        "{dynamic}"
+    );
+    assert!(dynamic.contains("service: api@internal"), "{dynamic}");
+    assert!(
+        dynamic.contains(
+            "        - metrics
+"
+        ),
+        "{dynamic}"
+    );
+    Ok(())
+}
+
+/// 路由引用的内置 `tls`（HSTS）中间件必须继续生成（R10-C）。
+#[test]
+fn traefik_keeps_builtin_tls_middleware() -> anyhow::Result<()> {
+    let input = r#"
+format = 1
+template = "traefik"
+domain = "example.com"
+acme_email = "admin@example.com"
+cloudflare_token = "secret"
+version = "v3.8.0"
+https_port = 8443
+"#;
+    let generated = apply(input, &Config::default(), None)?;
+    let dynamic = dynamic_config(&generated)?;
+    assert!(
+        dynamic.contains("    tls:\n      headers:\n        stsSeconds: 31536000"),
+        "{dynamic}"
+    );
+    assert!(
+        dynamic.contains("        stsIncludeSubdomains: true"),
+        "{dynamic}"
+    );
+    assert!(dynamic.contains("X-Forwarded-Port: '8443'"), "{dynamic}");
+    assert!(dynamic.contains("address: 'http://authelia:9091/api/authz/forward-auth'"));
+    assert!(!dynamic.contains("defaultGeneratedCert"));
+    Ok(())
+}
+
 /// Traefik 状态、密钥与模板类型在 IR 导出后保持不变。
 #[test]
 fn traefik_template_round_trip() -> anyhow::Result<()> {
@@ -364,50 +493,20 @@ dashboard_authelia = true
     let generated = apply(input, &config, None)?;
     assert_eq!(generated.kind, TemplateKind::Traefik);
     let service = &generated.spec.document.services["traefik"];
-    assert!(service.labels.contains(&String::from(
-        "traefik.http.routers.dashboard.service=api@internal"
-    )));
-    assert!(service.labels.contains(&String::from(
-        "traefik.http.routers.dashboard.middlewares=internal-only@file,authelia@file"
-    )));
-    assert!(service.labels.iter().all(|label| {
-        !label.starts_with("traefik.http.services.dashboard.loadbalancer.server.port=")
-    }));
     assert!(service.command.contains(&String::from(
         "--certificatesresolvers.cloudflare.acme.keytype=EC256"
     )));
     assert!(service.command.contains(&String::from(
         "--certificatesresolvers.cloudflare.acme.dnschallenge.propagation.delaybeforechecks=30s"
     )));
+    assert!(service.command.contains(&String::from(
+        "--providers.file.directory=/etc/traefik/dynamic"
+    )));
     assert_eq!(
         service.logging.as_ref().map(|value| value.driver.as_str()),
         Some("json-file")
     );
     assert!(service.healthcheck.is_some());
-    let acme = generated
-        .files
-        .iter()
-        .find(|file| file.path.ends_with("acme.json"))
-        .ok_or_else(|| anyhow::anyhow!("missing acme.json"))?;
-    assert!(!acme.replace);
-    let dynamic = generated
-        .files
-        .iter()
-        .find(|file| file.path.ends_with("dynamic/nsetup.yml"))
-        .ok_or_else(|| anyhow::anyhow!("missing dynamic/nsetup.yml"))?;
-    let dynamic = String::from_utf8(dynamic.content.clone())?;
-    assert!(dynamic.contains("address: 'http://authelia:9091/api/authz/forward-auth'"));
-    assert!(dynamic.contains("X-Forwarded-Port: '8443'"));
-    assert!(!dynamic.contains("defaultGeneratedCert"));
-    let user_file = generated
-        .files
-        .iter()
-        .find(|file| file.path.ends_with("dynamic/custom.yml"))
-        .ok_or_else(|| anyhow::anyhow!("missing dynamic/custom.yml"))?;
-    assert!(!user_file.replace, "用户可编辑的动态配置不能被整体替换");
-    assert!(service.command.contains(&String::from(
-        "--providers.file.directory=/etc/traefik/dynamic"
-    )));
     assert!(
         service
             .command
@@ -425,10 +524,41 @@ dashboard_authelia = true
             .iter()
             .any(|argument| { argument == "--metrics.prometheus=false" })
     );
+    let acme = generated
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("acme.json"))
+        .ok_or_else(|| anyhow::anyhow!("missing acme.json"))?;
+    assert!(!acme.replace);
+    let user_file = generated
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("dynamic/custom.yml"))
+        .ok_or_else(|| anyhow::anyhow!("missing dynamic/custom.yml"))?;
+    assert!(!user_file.replace, "用户可编辑的动态配置不能被整体替换");
     let exported = export(&generated.spec, &config)?;
     assert!(exported.contains("dashboard_authelia = true"));
     let regenerated = apply(&exported, &config, None)?;
     assert_eq!(generated.spec, regenerated.spec);
+    Ok(())
+}
+
+/// 关闭 metrics 后不再生成指标入口上的内置 router（R10-B）。
+#[test]
+fn traefik_without_metrics_has_no_internal_routers() -> anyhow::Result<()> {
+    let input = r#"
+format = 1
+template = "traefik"
+domain = "example.com"
+acme_email = "admin@example.com"
+cloudflare_token = "secret"
+version = "v3.8.0"
+metrics = false
+"#;
+    let generated = apply(input, &Config::default(), None)?;
+    let dynamic = dynamic_config(&generated)?;
+    assert!(dynamic.contains("  routers: {}\n"), "{dynamic}");
+    assert!(!dynamic.contains("prometheus@internal"));
     Ok(())
 }
 
@@ -516,9 +646,65 @@ version = "v3.8.0"
     let generated = apply(input, &Config::default(), None)?;
     let labels = &generated.spec.document.services["traefik"].labels;
     assert!(labels.contains(&String::from(
-        "traefik.http.routers.dashboard.middlewares=internal-only@file"
+        "traefik.http.routers.nsetup-traefik-traefik-dashboard.middlewares=internal-only@file"
     )));
     assert!(labels.iter().all(|label| !label.contains("authelia@file")));
+    Ok(())
+}
+
+/// 声明 `metrics_path` 时不再生成 `telemetry.metrics.path`（R9）。
+#[test]
+fn authelia_telemetry_never_emits_metrics_path() -> anyhow::Result<()> {
+    let input = r#"
+format = 1
+template = "authelia"
+host = "auth"
+version = "4.39.20"
+default_redirection_url = "https://example.com"
+jwt_secret = "jwt-secret-value-0123456789-abcdef"
+session_secret = "session-secret-value-0123456789-ab"
+storage_encryption_key = "storage-secret-value-0123456789-a"
+
+[telemetry]
+metrics_address = "tcp://0.0.0.0:9959"
+metrics_path = "/metrics"
+tracing_address = "udp://otel-collector:4318"
+
+[users.admin]
+display_name = "Administrator"
+password_hash = '$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA'
+email = "admin@example.com"
+groups = ["admins"]
+"#;
+    let config = Config::default();
+    let generated = apply(input, &config, None)?;
+    let configuration = generated
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("config/configuration.yml"))
+        .ok_or_else(|| anyhow::anyhow!("Authelia 模板缺少 configuration.yml"))?;
+    let configuration = String::from_utf8(configuration.content.clone())?;
+    assert!(
+        configuration.contains(
+            "telemetry:\n  metrics:\n    enabled: true\n    address: 'tcp://0.0.0.0:9959'\n"
+        ),
+        "{configuration}"
+    );
+    assert!(
+        !configuration.contains("    path: '/metrics'\n"),
+        "{configuration}"
+    );
+    assert!(
+        configuration
+            .contains("  tracing:\n    enabled: true\n    address: 'udp://otel-collector:4318'\n"),
+        "{configuration}"
+    );
+    // 声明照旧保留在导出结果里，避免 export → up 丢字段。
+    let exported = export(&generated.spec, &config)?;
+    assert!(
+        exported.contains("metrics_path = \"/metrics\""),
+        "EXPORTED>>>{exported}"
+    );
     Ok(())
 }
 
@@ -778,12 +964,7 @@ args = { prefixes = ["/api", "/v1"], forceSlash = true }
 "#;
     let config = Config::default();
     let generated = apply(input, &config, None)?;
-    let dynamic = generated
-        .files
-        .iter()
-        .find(|file| file.path.ends_with("dynamic/nsetup.yml"))
-        .ok_or_else(|| anyhow::anyhow!("missing dynamic/nsetup.yml"))?;
-    let dynamic = String::from_utf8(dynamic.content.clone())?;
+    let dynamic = dynamic_config(&generated)?;
     let _yaml: serde_yaml::Value = serde_yaml::from_str(&dynamic)?;
     assert!(dynamic.contains("    replace-path:\n      replacePath:\n        path: /status"));
     assert!(dynamic.contains("        prefixes:\n          - /api\n          - /v1\n"));

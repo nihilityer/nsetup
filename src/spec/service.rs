@@ -2,8 +2,9 @@
 
 use super::value::validate_tagged_image;
 use super::{
-    DEFAULT_ENTRYPOINT, HTTPS_ENTRYPOINT, Route, RouteBinding, RouteIdentity, RouteProtocol,
-    Service, UserRoute, split_tagged_image, validate_version,
+    DEFAULT_ENTRYPOINT, HTTPS_ENTRYPOINT, INTERNAL_PROVIDER_SUFFIX, Route, RouteBinding,
+    RouteIdentity, RouteProtocol, Service, TlsDomain, UserRoute, split_tagged_image,
+    validate_version,
 };
 use crate::constants::PROXY_NETWORK;
 use anyhow::Context;
@@ -83,14 +84,21 @@ impl Service {
                 .get(&format!("{prefix}.service"))
                 .cloned()
                 .unwrap_or_else(|| router.clone());
-            let service_prefix = format!("traefik.http.services.{backend}.loadbalancer");
-            let container_port = labels
-                .get(&format!("{service_prefix}.server.port"))
-                .ok_or_else(|| anyhow::anyhow!("路由 {router} 缺少容器端口"))?
-                .parse::<u16>()
-                .with_context(|| format!("路由 {router} 容器端口无效"))?;
+            // 带提供者后缀的后端由 Traefik 提供，没有容器端口与负载均衡参数。
+            let internal = backend.contains(INTERNAL_PROVIDER_SUFFIX);
+            let service = internal.then(|| backend.clone());
+            let loadbalancer = format!("traefik.http.services.{backend}.loadbalancer");
+            let container_port = match labels.get(&format!("{loadbalancer}.server.port")) {
+                Some(value) => Some(
+                    value
+                        .parse::<u16>()
+                        .with_context(|| format!("路由 {router} 容器端口无效"))?,
+                ),
+                None if internal => None,
+                None => anyhow::bail!("路由 {router} 缺少容器端口"),
+            };
             let protocol = labels
-                .get(&format!("{service_prefix}.server.scheme"))
+                .get(&format!("{loadbalancer}.server.scheme"))
                 .map_or(Ok(RouteProtocol::Http), |value| RouteProtocol::parse(value))?;
             let middlewares = labels
                 .get(&format!("{prefix}.middlewares"))
@@ -107,10 +115,10 @@ impl Service {
                 .map(|value| normalize_entrypoints(value))
                 .unwrap_or_else(|| String::from(DEFAULT_ENTRYPOINT));
             let sticky_cookie =
-                parse_optional_bool(labels.get(&format!("{service_prefix}.sticky.cookie")))?
+                parse_optional_bool(labels.get(&format!("{loadbalancer}.sticky.cookie")))?
                     .unwrap_or(false);
             let pass_host_header =
-                parse_optional_bool(labels.get(&format!("{service_prefix}.passhostheader")))?;
+                parse_optional_bool(labels.get(&format!("{loadbalancer}.passhostheader")))?;
             let priority = labels
                 .get(&format!("{prefix}.priority"))
                 .map(|value| value.parse::<u32>().context("Traefik priority 无效"))
@@ -126,6 +134,8 @@ impl Service {
                 sticky_cookie,
                 pass_host_header,
                 priority,
+                service,
+                tls_domains: parse_tls_domains(&labels, &prefix),
             });
         }
         Ok(routes)
@@ -309,7 +319,18 @@ impl Service {
                 format!("{router}.tls.certresolver"),
                 String::from("cloudflare"),
             );
-            labels.insert(format!("{router}.service"), name.clone());
+            for (index, domain) in route.tls_domains.iter().enumerate() {
+                labels.insert(
+                    format!("{router}.tls.domains[{index}].main"),
+                    domain.main.clone(),
+                );
+                if !domain.sans.is_empty() {
+                    labels.insert(
+                        format!("{router}.tls.domains[{index}].sans"),
+                        domain.sans.join(","),
+                    );
+                }
+            }
             if !route.middlewares.is_empty() {
                 labels.insert(
                     format!("{router}.middlewares"),
@@ -324,24 +345,34 @@ impl Service {
             if let Some(priority) = route.priority {
                 labels.insert(format!("{router}.priority"), priority.to_string());
             }
-            labels.insert(
-                format!("{backend}.server.port"),
-                route.container_port.to_string(),
-            );
-            if route.protocol != RouteProtocol::Http {
-                labels.insert(
-                    format!("{backend}.server.scheme"),
-                    route.protocol.as_str().to_string(),
-                );
-            }
-            if route.sticky_cookie {
-                labels.insert(format!("{backend}.sticky.cookie"), String::from("true"));
-            }
-            if let Some(pass_host_header) = route.pass_host_header {
-                labels.insert(
-                    format!("{backend}.passhostheader"),
-                    pass_host_header.to_string(),
-                );
+            match &route.service {
+                // 内置服务由 Traefik 自己提供，不能声明 loadbalancer 端口：否则
+                // Traefik 会把 router 指向同名容器端口而不是 `api@internal`。
+                Some(service) => {
+                    labels.insert(format!("{router}.service"), service.clone());
+                }
+                None => {
+                    let port = route.container_port.ok_or_else(|| {
+                        anyhow::anyhow!("路由 {} 缺少 container_port 或 service", route.name)
+                    })?;
+                    labels.insert(format!("{router}.service"), name.clone());
+                    labels.insert(format!("{backend}.server.port"), port.to_string());
+                    if route.protocol != RouteProtocol::Http {
+                        labels.insert(
+                            format!("{backend}.server.scheme"),
+                            route.protocol.as_str().to_string(),
+                        );
+                    }
+                    if route.sticky_cookie {
+                        labels.insert(format!("{backend}.sticky.cookie"), String::from("true"));
+                    }
+                    if let Some(pass_host_header) = route.pass_host_header {
+                        labels.insert(
+                            format!("{backend}.passhostheader"),
+                            pass_host_header.to_string(),
+                        );
+                    }
+                }
             }
         }
         self.labels = labels
@@ -469,6 +500,48 @@ pub fn parse_path_prefix(rule: &str) -> Option<String> {
     let start = rule.find("PathPrefix(`")? + 12;
     let end = rule[start..].find("`)")? + start;
     Some(rule[start..end].to_string())
+}
+
+/// 解析 `traefik.http.routers.<名字>.tls.domains[<序号>]` 证书域名标签，按序号还原顺序。
+fn parse_tls_domains(labels: &BTreeMap<String, String>, prefix: &str) -> Vec<TlsDomain> {
+    let head = format!("{prefix}.tls.domains[");
+    let mut mains: BTreeMap<usize, String> = BTreeMap::new();
+    let mut sans: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (key, value) in labels {
+        let Some(rest) = key.strip_prefix(&head) else {
+            continue;
+        };
+        let Some((index, field)) = rest.split_once("].") else {
+            continue;
+        };
+        let Ok(index) = index.parse::<usize>() else {
+            continue;
+        };
+        match field {
+            "main" => {
+                mains.insert(index, value.clone());
+            }
+            "sans" => {
+                sans.insert(
+                    index,
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                );
+            }
+            _ => {}
+        }
+    }
+    mains
+        .into_iter()
+        .map(|(index, main)| TlsDomain {
+            main,
+            sans: sans.remove(&index).unwrap_or_default(),
+        })
+        .collect()
 }
 
 /// 归一化 label 中的 entrypoint 列表。

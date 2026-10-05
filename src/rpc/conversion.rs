@@ -107,7 +107,7 @@ fn route_from_proto(route: proto::Route) -> anyhow::Result<Route> {
         name: route.name,
         hosts: route.hosts,
         path_prefix: route.path_prefix,
-        container_port: u16::try_from(route.container_port).context("路由端口超出范围")?,
+        container_port: Some(u16::try_from(route.container_port).context("路由端口超出范围")?),
         middlewares: middleware_names(&route.middlewares)?,
         protocol: match proto::RouteProtocol::try_from(route.protocol)? {
             proto::RouteProtocol::Unspecified | proto::RouteProtocol::Http => RouteProtocol::Http,
@@ -118,6 +118,8 @@ fn route_from_proto(route: proto::Route) -> anyhow::Result<Route> {
         sticky_cookie: route.sticky_cookie,
         pass_host_header: route.pass_host_header,
         priority: route.priority,
+        service: None,
+        tls_domains: Vec::new(),
     })
 }
 

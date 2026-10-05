@@ -313,8 +313,11 @@ fn render_routes(project: &str, compose_yaml: &str) -> anyhow::Result<String> {
                     path: route.path_prefix.clone().unwrap_or_default(),
                     entrypoint: route.entrypoint_name().to_string(),
                     protocol: route.protocol.as_str().to_string(),
-                    service: service_name.clone(),
-                    port: Some(route.container_port),
+                    backend: route
+                        .service
+                        .clone()
+                        .unwrap_or_else(|| service_name.clone()),
+                    port: route.container_port,
                     middlewares: route.middleware_references(),
                     priority: route.priority,
                     managed: true,
@@ -340,16 +343,17 @@ fn render_routes(project: &str, compose_yaml: &str) -> anyhow::Result<String> {
     output.push_str("HOST\tPATH\tENTRYPOINT\tSCHEME\tPRIORITY\tBACKEND\tMIDDLEWARES\t来源\n");
     for row in rows {
         output.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}:{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             row.host,
             if row.path.is_empty() { "/" } else { &row.path },
             row.entrypoint,
             row.protocol,
             row.priority
                 .map_or_else(|| String::from("-"), |value| value.to_string()),
-            row.service,
-            row.port
-                .map_or_else(|| String::from("-"), |value| value.to_string()),
+            match row.port {
+                Some(port) => format!("{}:{port}", row.backend),
+                None => row.backend.clone(),
+            },
             if row.middlewares.is_empty() {
                 String::from("-")
             } else {
@@ -378,7 +382,7 @@ fn user_route_rows(
                 path: route.path_prefix.clone().unwrap_or_default(),
                 entrypoint: route.entrypoint.clone(),
                 protocol: route.protocol.as_str().to_string(),
-                service: service_name.to_string(),
+                backend: service_name.to_string(),
                 port: route.container_port,
                 middlewares: route.middlewares.clone(),
                 priority: route.priority,
@@ -400,9 +404,9 @@ struct RouteRow {
     entrypoint: String,
     /// 后端协议。
     protocol: String,
-    /// 后端服务名。
-    service: String,
-    /// 后端容器端口；用户 label 路由未知时为 `None`。
+    /// 后端名称：容器服务名或内置服务名（`api@internal`）。
+    backend: String,
+    /// 后端容器端口；内置服务与用户 label 路由未知时为 `None`。
     port: Option<u16>,
     /// 引用的中间件。
     middlewares: Vec<String>,

@@ -242,10 +242,13 @@ nsetup rm media
 而不是返回 `not a terminal`。
 
 自查域名 404 / 502 时使用 `doctor`；它比对容器上的 Traefik label 与 Traefik 实际
-加载的 router，列出未被接管的服务与原因，并在发现问题时以非零状态退出。
+加载的 router，列出未被接管的服务与原因，并在发现问题时以非零状态退出。它读的是
+Traefik 内置 API（`api@internal`），因此依赖 traefik 模板的 `metrics` 入口；该入口
+不可达时会明确降级为仅检查容器 label。
 `show --routes` 输出该项目最终生效的完整路由表：模板生成的（来源 `nsetup`）与用户
 手写 label 的（来源 `labels`）一起列出，包含 HOST、PATH、ENTRYPOINT、SCHEME、
-PRIORITY、BACKEND（`服务:端口`）与 MIDDLEWARES：
+PRIORITY、BACKEND 与 MIDDLEWARES。BACKEND 通常是 `服务:端口`；指向 Traefik 内置
+服务的路由（例如 traefik 项目的 dashboard）显示为 `api@internal`：
 
 ```bash
 nsetup show media --routes

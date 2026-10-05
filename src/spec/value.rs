@@ -1,6 +1,9 @@
 //! 端口、挂载、健康检查、镜像与名称值对象。
 
-use super::{BindMount, Healthcheck, PortProtocol, PublishedPort, Route, ServiceHooks};
+use super::{
+    BindMount, Healthcheck, INTERNAL_PROVIDER_SUFFIX, PortProtocol, PublishedPort, Route,
+    ServiceHooks,
+};
 use crate::config::validate_domain;
 use anyhow::Context;
 use std::path::Path;
@@ -10,7 +13,7 @@ impl Route {
     ///
     /// # 错误
     ///
-    /// 缺少主机名，或 DNS 名称、路径、入口、端口无效时返回错误。
+    /// 缺少主机名，或 DNS 名称、路径、入口、端口、后端服务无效时返回错误。
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_name("Traefik 路由名", &self.name)?;
         if self.hosts.is_empty() {
@@ -27,11 +30,37 @@ impl Route {
         if !self.entrypoint.trim().is_empty() {
             let _entrypoints = validate_entrypoints(&self.entrypoint)?;
         }
-        if self.container_port == 0 {
-            anyhow::bail!("路由容器端口必须在 1..=65535 范围内");
+        if let Some(service) = &self.service {
+            validate_backend_service(service)?;
+        } else if self.container_port.is_none() {
+            anyhow::bail!("路由必须声明 container_port 或内置后端 service");
+        }
+        for domain in &self.tls_domains {
+            validate_domain(&domain.main)?;
+            for san in &domain.sans {
+                validate_domain(san.trim_start_matches("*."))?;
+            }
         }
         Ok(())
     }
+}
+
+/// 校验非容器后端服务名，只接受 `name@provider` 形式的内置服务。
+fn validate_backend_service(value: &str) -> anyhow::Result<()> {
+    let (name, provider) = value
+        .split_once(INTERNAL_PROVIDER_SUFFIX)
+        .ok_or_else(|| anyhow::anyhow!("路由后端服务必须是 name@provider 形式: {value}"))?;
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 128
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    if !valid(name) || !valid(provider) {
+        anyhow::bail!("路由后端服务名无效: {value}");
+    }
+    Ok(())
 }
 
 impl PublishedPort {

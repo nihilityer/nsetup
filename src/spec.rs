@@ -320,7 +320,7 @@ impl HookStage {
 }
 
 /// 从 label 派生的 Traefik 语义路由。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Route {
     /// 在 TOML、Compose router 和 backend 中保持稳定的路由名。
     pub name: String,
@@ -328,8 +328,8 @@ pub struct Route {
     pub hosts: Vec<String>,
     /// 可选 URL 路径前缀。
     pub path_prefix: Option<String>,
-    /// 目标容器端口。
-    pub container_port: u16,
+    /// 目标容器端口；指定 [`Self::service`] 时省略。
+    pub container_port: Option<u16>,
     /// 不含提供者后缀的中间件名称。
     pub middlewares: Vec<String>,
     /// 后端协议。
@@ -342,7 +342,23 @@ pub struct Route {
     pub pass_host_header: Option<bool>,
     /// 可选路由优先级。
     pub priority: Option<u32>,
+    /// 可选的非容器后端服务名（`api@internal` 等）；由内置模板为自身保留。
+    pub service: Option<String>,
+    /// 该 router 向 ACME 申请的证书域名；为空时按 `Host()` 自动推导。
+    pub tls_domains: Vec<TlsDomain>,
 }
+
+/// router 显式声明的 ACME 证书域名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsDomain {
+    /// 证书主体域名。
+    pub main: String,
+    /// 附加到同一张证书的 SAN 域名。
+    pub sans: Vec<String>,
+}
+
+/// Traefik 内置（非容器）服务的提供者后缀。
+pub const INTERNAL_PROVIDER_SUFFIX: char = '@';
 
 /// 用户手写 label 声明的一条 Traefik 路由。
 ///

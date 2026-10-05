@@ -96,6 +96,8 @@ hosts = ["media"]
 
 # 中间件按顺序执行。内置名称：authelia、gzip、forwarded-headers、internal-only、tls；
 # 其它名称引用 traefik.toml 的 [middlewares.<名称>] 或 files/ 里的自定义中间件。
+# tls 是响应头中间件（HSTS：stsSeconds + includeSubDomains），不是路由级 TLS 开关；
+# 路由是否终止 TLS 由 entrypoint 决定。
 # middlewares = ["authelia", "gzip"]
 
 # Traefik 到容器的协议：http（默认）| https | h2c。
@@ -210,9 +212,10 @@ storage_encryption_key = "replace-with-at-least-32-random-characters"
 # 可选自身遥测，默认不暴露指标也不导出 trace。
 # [telemetry]
 # metrics_address = "tcp://0.0.0.0:9959"
-# metrics_path = "/metrics"
 # tracing_address = "udp://otel-collector:4318"
 # tracing_sample_rate = 0.5
+# metrics_path 已废弃：Authelia 4.39.x 固定 /metrics，写别的值会被当成未知配置键
+# 并 fatal 退出；字段仍可写出（export → up 无损），但不进入 configuration.yml。
 
 # 生成的 Compose 把 config/ 以可写方式挂到 /config、secrets/ 只读挂到 /secrets。
 # 官方镜像的 entrypoint 会按 PUID/PGID（镜像默认 0:0）执行 chown -R /config，
@@ -242,8 +245,8 @@ https_port = 443
 # 通过 Authelia ForwardAuth 保护 dashboard；仍保留内网来源限制。
 # 请先准备 Authelia 配置，再开启此项。
 dashboard_authelia = true
-# 暴露 Traefik 自身的 Prometheus 指标，默认开启。指标入口只在内网监听，
-# 同时以 127.0.0.1:<metrics_port> 绑定到宿主机回环地址，供本机采集器抓取。
+# 暴露 Traefik 自身的 Prometheus 指标，默认开启。入口只在内网监听，同时以
+# 127.0.0.1:<metrics_port> 绑定宿主机回环；/metrics 与 /api 的 router 一并生成。
 # metrics = true
 # metrics_port = 8081
 
@@ -258,6 +261,9 @@ dashboard_authelia = true
 
 # 生成的内置中间件写入 config/dynamic/nsetup.yml；同目录的 custom.yml 由用户拥有，
 # 不会被 nsetup up 覆盖，可以在其中追加路由与中间件。
+#
+# 固定生成、无需手工维护：dashboard 路由（traefik.<domain> → api@internal，
+# priority 1000，internal-only 可叠加 authelia）与健康检查（healthcheck --ping）。
 "#;
 
 /// CLI 输出的带注释静态站点模板。

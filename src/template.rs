@@ -332,6 +332,9 @@ pub struct TraefikRouteConfig {
     /// 可选的路由专用容器端口。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// 可选的非容器后端服务名，例如 Traefik 内置的 `api@internal`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
     /// 路由专用中间件。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub middlewares: Vec<String>,

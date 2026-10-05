@@ -36,7 +36,7 @@ impl Orchestrator {
                 anyhow::bail!("容器端口不能为 0");
             }
             for route in &mut routes {
-                route.container_port = port;
+                route.container_port = Some(port);
             }
         }
         if let Some(middlewares) = edit.middlewares {

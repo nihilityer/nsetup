@@ -1,9 +1,9 @@
 # nsetup 端到端验收测试
 
-在临时 daemon 与本机 Docker 上跑一遍 0.2.1 反馈清单（`../nsetup-0.2.1-feedback.md`）
-里的全部验收项，覆盖 R1–R8。与 `cargo test` 的分工：单元测试覆盖解析、生成、
-校验与存储语义；这里覆盖需要真实 daemon、真实文件系统权限和 `docker compose`
-的端到端行为。
+在临时 daemon 与本机 Docker 上跑一遍 0.2.1 / 0.2.2 反馈清单
+（`../nsetup-0.2.1-feedback.md`、`../nsetup-0.2.2-feedback.md`）里的可离线验收项，
+覆盖 R1–R12。与 `cargo test` 的分工：单元测试覆盖解析、生成、校验与存储语义；
+这里覆盖需要真实 daemon、真实文件系统权限和 `docker compose` 的端到端行为。
 
 ## 运行
 
@@ -34,7 +34,7 @@ tests/e2e/run.sh --work /tmp/nsetup-e2e --keep
 
 | 文件 | 覆盖 | 关键断言 |
 | --- | --- | --- |
-| `checks/01-templates.sh` | R1、D4 | 四模板骨架可直接应用；`name` 可省略也可写、写错报错；metrics 落到启动参数与 `127.0.0.1:8081`；telemetry 落到 `configuration.yml`；`export → up` 双向 round-trip |
+| `checks/01-templates.sh` | R1、D4、R9、R10、R11、R12 | 四模板骨架可直接应用；`name` 可省略也可写、写错报错；metrics 落到启动参数与 `127.0.0.1:8081`；traefik 只有一条 `api@internal` dashboard 路由（priority 1000，无容器回源端口）；healthcheck 带 `--ping`；`nsetup.yml` 里 `/metrics` → `prometheus@internal`、`/api` → `api@internal` 且保留内置 `tls` 中间件；doctor 不误报缺失/多余；authelia 的 `configuration.yml` 不含 `telemetry.metrics.path`；`export → up` 双向 round-trip |
 | `checks/02-assets.sh` | R2 | 上传目录 `0755`、文件 `0644`；`--assets-perms private` 为 `0750`/`0640`；`merge` 保留、`replace` 删除旧文件；static 模板接受 `group_add` 与 `[hooks]` |
 | `checks/03-routes.sh` | R3 | `show --routes` 同时列出模板生成路由与 label 路由，带 SCHEME、PRIORITY、BACKEND、来源列；无路由项目给出明确结论 |
 | `checks/04-mounts.sh` | R6 | 相对挂载源展开为项目内绝对路径且不残留 `./`；export 过滤 `--files` 注入挂载；命名卷与 `../` 被拒绝；`data_roots` 绝对路径继续可用 |
@@ -46,5 +46,8 @@ tests/e2e/run.sh --work /tmp/nsetup-e2e --keep
 
 - `07` 会在结束时用一次性容器把配置目录属主改回当前用户；真实 Authelia 镜像缺失时
   该项记为 `SKIP` 而不是失败。
-- 需要真机才能覆盖的两项（`doctor` 完整模式、`--restart-dependents` 对运行中
-  authelia 的 `StartedAt` 影响）不在这里，按反馈文档第 6 节在测试机上手工执行。
+- 需要真机才能覆盖的项（`doctor` 完整模式、`--restart-dependents` 对运行中
+  authelia 的 `StartedAt` 影响）不在这里，按反馈文档在测试机上手工执行。
+- R10 的运行时断言（302、`/metrics` 与 `/api/rawdata` 返回 200、HSTS）需要可解析
+  域名、ACME 与真实 Traefik 容器，在测试机上手工执行；这里断言的是决定这些结果的
+  生成产物（label、`nsetup.yml`、健康检查命令）。

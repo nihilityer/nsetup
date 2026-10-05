@@ -14,6 +14,66 @@ fn compose_unknown_field_is_rejected() {
     assert!(result.is_err());
 }
 
+/// 内置后端路由（无 `loadbalancer.server.port`）往返 label 与 YAML（R10）。
+#[test]
+fn internal_backend_route_round_trips() -> anyhow::Result<()> {
+    let expected = Route {
+        name: String::from("dashboard"),
+        hosts: vec![String::from("traefik.example.com")],
+        path_prefix: None,
+        container_port: None,
+        middlewares: vec![String::from("internal-only")],
+        protocol: RouteProtocol::Http,
+        entrypoint: String::from(HTTPS_ENTRYPOINT),
+        priority: Some(1000),
+        service: Some(String::from("api@internal")),
+        ..Route::default()
+    };
+    let mut service = Service {
+        image: String::from("traefik:v3.8.0"),
+        ..Service::default()
+    };
+    service.set_routes("traefik", "traefik", std::slice::from_ref(&expected))?;
+    assert!(service.labels.contains(&String::from(
+        "traefik.http.routers.nsetup-traefik-traefik-dashboard.service=api@internal"
+    )));
+    assert!(service.labels.iter().all(|label| {
+        !label.contains("traefik.http.services.nsetup-traefik-traefik-dashboard.loadbalancer")
+    }));
+    assert_eq!(
+        service.routes("traefik", "traefik")?,
+        vec![expected.clone()]
+    );
+
+    let document = Document {
+        services: BTreeMap::from([(String::from("traefik"), service)]),
+        networks: BTreeMap::new(),
+    };
+    let yaml = serde_yaml::to_string(&document)?;
+    let parsed: Document = serde_yaml::from_str(&yaml)?;
+    assert_eq!(
+        parsed.services["traefik"].routes("traefik", "traefik")?,
+        vec![expected],
+        "{yaml}"
+    );
+    Ok(())
+}
+
+/// 内置后端服务名必须是 `name@provider` 形式，否则 Traefik 会静默丢掉路由。
+#[test]
+fn rejects_internal_backend_without_provider() {
+    for service in ["api", "api@", "@internal", "api internal@internal"] {
+        let route = Route {
+            name: String::from("dashboard"),
+            hosts: vec![String::from("traefik.example.com")],
+            container_port: None,
+            service: Some(service.to_string()),
+            ..Route::default()
+        };
+        assert!(route.validate().is_err(), "{service} 应当被拒绝");
+    }
+}
+
 #[test]
 fn routes_round_trip_through_labels() -> anyhow::Result<()> {
     let mut service = Service {
@@ -24,13 +84,14 @@ fn routes_round_trip_through_labels() -> anyhow::Result<()> {
         name: String::from("default"),
         hosts: vec![String::from("app.example.com")],
         path_prefix: Some(String::from("/api")),
-        container_port: 8080,
+        container_port: Some(8080),
         middlewares: vec![String::from("gzip")],
         protocol: RouteProtocol::H2c,
         entrypoint: String::from("https"),
         sticky_cookie: true,
         pass_host_header: Some(false),
         priority: Some(100),
+        ..Route::default()
     };
     service.set_routes("demo", "web", std::slice::from_ref(&expected))?;
     assert!(service.labels.iter().any(|label| {
@@ -141,13 +202,15 @@ fn route_bindings_carry_ownership() -> anyhow::Result<()> {
             String::from("grpc.example.com"),
         ],
         path_prefix: None,
-        container_port: 10000,
+        container_port: Some(10000),
         middlewares: Vec::new(),
         protocol: RouteProtocol::H2c,
         entrypoint: String::from("https"),
         sticky_cookie: false,
         pass_host_header: None,
         priority: None,
+        service: None,
+        tls_domains: Vec::new(),
     };
     let bindings = route.bindings("netbird", "dashboard");
     assert_eq!(bindings.len(), 2);
@@ -259,13 +322,15 @@ fn generated_route() -> Route {
         name: String::from("default"),
         hosts: vec![String::from("demo.example.com")],
         path_prefix: None,
-        container_port: 80,
+        container_port: Some(80),
         middlewares: Vec::new(),
         protocol: RouteProtocol::Http,
         entrypoint: String::from(HTTPS_ENTRYPOINT),
         sticky_cookie: false,
         pass_host_header: None,
         priority: None,
+        service: None,
+        tls_domains: Vec::new(),
     }
 }
 

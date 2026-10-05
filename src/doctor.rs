@@ -142,16 +142,19 @@ fn check_container_labels(
     }
 }
 
-/// 比对预期 router 与 Traefik 实际加载的 router。
+/// 比对预期 router 与 Traefik 实际加载的 router；两侧名字先归一化再比。
 fn compare_with_traefik(
     expected: &[ExpectedRouter],
     loaded: &[LoadedRouter],
     lines: &mut Vec<String>,
     problems: &mut u32,
 ) {
-    let loaded_names: BTreeSet<&str> = loaded.iter().map(|router| router.name.as_str()).collect();
+    let loaded_names: BTreeSet<&str> = loaded
+        .iter()
+        .map(|router| normalized_router_name(&router.name))
+        .collect();
     for router in expected {
-        if !loaded_names.contains(router.name.as_str()) {
+        if !loaded_names.contains(normalized_router_name(&router.name)) {
             *problems += 1;
             lines.push(format!(
                 "- 路由 {} 未被 Traefik 加载（{}，规则 {}）",
@@ -159,10 +162,13 @@ fn compare_with_traefik(
             ));
         }
     }
-    let expected_names: BTreeSet<&str> =
-        expected.iter().map(|router| router.name.as_str()).collect();
+    let expected_names: BTreeSet<&str> = expected
+        .iter()
+        .map(|router| normalized_router_name(&router.name))
+        .collect();
     for router in loaded {
-        if router.name.starts_with("nsetup-") && !expected_names.contains(router.name.as_str()) {
+        let name = normalized_router_name(&router.name);
+        if name.starts_with("nsetup-") && !expected_names.contains(name) {
             *problems += 1;
             lines.push(format!(
                 "- Traefik 中存在 nsetup 已不再声明的路由 {}（规则 {}）",
@@ -170,6 +176,11 @@ fn compare_with_traefik(
             ));
         }
     }
+}
+
+/// 去掉 router 名的 `@<提供者>` 后缀，使两侧可以按同一形式比对。
+fn normalized_router_name(name: &str) -> &str {
+    name.split_once('@').map_or(name, |(head, _provider)| head)
 }
 
 /// 从全部受管项目收集预期存在的 nsetup router。
@@ -375,7 +386,61 @@ fn decode_chunked(body: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_chunked, decode_response};
+    use super::{
+        ExpectedRouter, LoadedRouter, compare_with_traefik, decode_chunked, decode_response,
+    };
+
+    /// Traefik API 的名字带 `@provider` 后缀，比对前必须归一化（R11）。
+    #[test]
+    fn compares_router_names_without_provider_suffix() {
+        let expected = vec![
+            ExpectedRouter {
+                name: String::from("nsetup-authelia-authelia-default"),
+                rule: String::from("Host(`auth.example.com`)"),
+                owner: String::from("项目 authelia 服务 authelia"),
+                container: String::from("authelia"),
+            },
+            ExpectedRouter {
+                name: String::from("nsetup-netbird-dashboard-default"),
+                rule: String::from("Host(`net.example.com`)"),
+                owner: String::from("项目 netbird 服务 dashboard"),
+                container: String::from("netbird-dashboard"),
+            },
+        ];
+        let loaded = vec![
+            LoadedRouter {
+                name: String::from("nsetup-authelia-authelia-default@docker"),
+                rule: String::from("Host(`auth.example.com`)"),
+            },
+            LoadedRouter {
+                name: String::from("nsetup-netbird-dashboard-default@docker"),
+                rule: String::from("Host(`net.example.com`)"),
+            },
+            LoadedRouter {
+                name: String::from("api@internal"),
+                rule: String::from("PathPrefix(`/api`)"),
+            },
+            LoadedRouter {
+                name: String::from("dashboard@internal"),
+                rule: String::from("(PathPrefix(`/api`) || PathPrefix(`/dashboard`))"),
+            },
+        ];
+        let mut lines = Vec::new();
+        let mut problems = 0;
+        compare_with_traefik(&expected, &loaded, &mut lines, &mut problems);
+        assert_eq!(problems, 0, "{lines:?}");
+        assert!(lines.is_empty(), "{lines:?}");
+
+        // 反向：既没有真正缺失，也不会把内置 router 当成「已不再声明」。
+        let mut lines = Vec::new();
+        let mut problems = 0;
+        compare_with_traefik(&expected, &loaded[..1], &mut lines, &mut problems);
+        assert_eq!(problems, 1, "{lines:?}");
+        assert!(
+            lines[0].contains("nsetup-netbird-dashboard-default"),
+            "{lines:?}"
+        );
+    }
 
     /// 固定长度响应正文可直接读出。
     #[test]

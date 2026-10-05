@@ -7,8 +7,8 @@ use super::{
 use crate::config::Config;
 use crate::constants::PROXY_NETWORK;
 use crate::spec::{
-    Document, Healthcheck, Logging, METRICS_ENTRYPOINT, Network, Service, StackSpec,
-    validate_entrypoints, validate_version,
+    Document, Healthcheck, Logging, METRICS_ENTRYPOINT, Network, Route, Service, StackSpec,
+    TlsDomain, validate_entrypoints, validate_version,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,6 +21,12 @@ pub(super) const MIDDLEWARES_KEY: &str = "NSETUP_TRAEFIK_MIDDLEWARES_JSON";
 const DYNAMIC_DIRECTORY: &str = "/etc/traefik/dynamic";
 /// 动态配置目录中由 nsetup 拥有的文件名。
 const DYNAMIC_FILE: &str = "nsetup.yml";
+/// Traefik 内置 dashboard API 的服务名。
+const API_SERVICE: &str = "api@internal";
+/// Traefik 内置 Prometheus 指标的服务名。
+const PROMETHEUS_SERVICE: &str = "prometheus@internal";
+/// dashboard router 必须压过同主机上的应用路由。
+const DASHBOARD_PRIORITY: u32 = 1000;
 
 /// 将 Traefik TOML 转换为 IR 与附属文件。
 pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result<TemplateOutput> {
@@ -36,8 +42,12 @@ pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result
             name: Some(String::from(PROXY_NETWORK)),
         },
     );
-    // `traefik healthcheck` 自带 ping 客户端，不需要镜像里存在 shell。
-    let healthcheck = Healthcheck::exec(&[String::from("traefik"), String::from("healthcheck")])?;
+    // HEALTHCHECK 是独立进程，读不到 command 里的 `--ping=true`，必须显式补上。
+    let healthcheck = Healthcheck::exec(&[
+        String::from("traefik"),
+        String::from("healthcheck"),
+        String::from("--ping"),
+    ])?;
     let mut service = Service {
         image: String::from("traefik:${TRAEFIK_VERSION}"),
         container_name: Some(String::from("traefik")),
@@ -60,7 +70,6 @@ pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result
             ),
             (String::from("ACME_EMAIL"), String::from("${ACME_EMAIL}")),
         ]),
-        labels: dashboard_labels(&dashboard_host, &input.domain, input.dashboard_authelia),
         healthcheck: Some(healthcheck),
         logging: Some(Logging {
             driver: String::from("json-file"),
@@ -71,20 +80,24 @@ pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result
         }),
         ..Service::default()
     };
+    service.labels = vec![String::from("io.nsetup.template=traefik")];
+    // 只生成一条 dashboard 路由，指容器端的应用式路由会抢掉同一个 Host()。
     service.set_routes(
         project,
         project,
-        &[crate::spec::Route {
+        &[Route {
             name: String::from("dashboard"),
             hosts: vec![dashboard_host],
             path_prefix: None,
-            container_port: 8080,
-            middlewares: Vec::new(),
+            container_port: None,
+            middlewares: dashboard_middlewares(input.dashboard_authelia),
             protocol: crate::spec::RouteProtocol::Http,
             entrypoint: String::from("https"),
             sticky_cookie: false,
             pass_host_header: None,
-            priority: None,
+            priority: Some(DASHBOARD_PRIORITY),
+            service: Some(String::from(API_SERVICE)),
+            tls_domains: wildcard_domains(&input.domain),
         }],
     )?;
     document.services.insert(String::from("traefik"), service);
@@ -242,32 +255,28 @@ fn traefik_ports(input: &TraefikConfig) -> Vec<String> {
     ports
 }
 
-/// 构造 dashboard 到 `api@internal` 的官方推荐路由标签。
-fn dashboard_labels(host: &str, domain: &str, authelia: bool) -> Vec<String> {
-    let middlewares = if authelia {
-        "internal-only@file,authelia@file"
+/// 返回 dashboard 的中间件：始终限制内网来源，可选叠加 Authelia。
+fn dashboard_middlewares(authelia: bool) -> Vec<String> {
+    if authelia {
+        vec![String::from("internal-only"), String::from("authelia")]
     } else {
-        "internal-only@file"
-    };
-    vec![
-        String::from("io.nsetup.template=traefik"),
-        String::from("traefik.enable=true"),
-        format!("traefik.docker.network={PROXY_NETWORK}"),
-        String::from("traefik.http.routers.dashboard.entrypoints=https"),
-        format!("traefik.http.routers.dashboard.rule=Host(`{host}`)"),
-        String::from("traefik.http.routers.dashboard.service=api@internal"),
-        String::from("traefik.http.routers.dashboard.tls=true"),
-        String::from("traefik.http.routers.dashboard.tls.certresolver=cloudflare"),
-        format!("traefik.http.routers.dashboard.tls.domains[0].main={domain}"),
-        format!("traefik.http.routers.dashboard.tls.domains[0].sans=*.{domain}"),
-        format!("traefik.http.routers.dashboard.middlewares={middlewares}"),
-    ]
+        vec![String::from("internal-only")]
+    }
+}
+
+/// 返回由主域名通配符证书覆盖的全部 router 共用的 TLS 域名声明。
+fn wildcard_domains(domain: &str) -> Vec<TlsDomain> {
+    vec![TlsDomain {
+        main: domain.to_string(),
+        sans: vec![format!("*.{domain}")],
+    }]
 }
 
 /// 构造内置中间件与用户自定义中间件共用的动态配置。
 fn dynamic_config(input: &TraefikConfig) -> String {
     let mut output = format!(
         r#"http:
+  routers:{internal_routers}
   middlewares:
     authelia:
       forwardAuth:
@@ -294,12 +303,15 @@ fn dynamic_config(input: &TraefikConfig) -> String {
           - 10.0.0.0/8
           - 172.16.0.0/12
           - 192.168.0.0/16
+    # HSTS 与其他安全响应头。名称历史上写在中间件里（例如 authelia 路由的
+    # middlewares = ["tls"]），因此这里必须继续按中间件生成。
     tls:
       headers:
         stsSeconds: 31536000
         stsIncludeSubdomains: true
 "#,
-        input.https_port
+        input.https_port,
+        internal_routers = internal_routers(input),
     );
     for (name, middleware) in &input.middlewares {
         output.push_str(&middleware_yaml(name, middleware));
@@ -312,6 +324,27 @@ fn dynamic_config(input: &TraefikConfig) -> String {
 "#,
     );
     output
+}
+
+/// 构造指标入口上的内置 router：没有 router 时该入口一律 404。
+fn internal_routers(input: &TraefikConfig) -> String {
+    if !input.metrics {
+        return String::from(" {}\n");
+    }
+    format!(
+        r#"
+    metrics:
+      rule: Path(`/metrics`)
+      entryPoints:
+        - {METRICS_ENTRYPOINT}
+      service: {PROMETHEUS_SERVICE}
+    api:
+      rule: PathPrefix(`/api`) || PathPrefix(`/debug`)
+      entryPoints:
+        - {METRICS_ENTRYPOINT}
+      service: {API_SERVICE}
+"#
+    )
 }
 
 /// 将单个自定义中间件渲染为动态配置片段。

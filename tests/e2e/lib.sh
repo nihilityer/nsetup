@@ -325,6 +325,8 @@ EOF
 # 启用 `[oidc]` 是必需的：应用只有在 Authelia 已启用 provider 时才允许声明客户端，
 # 而 OIDC 客户端片段正是 R8 要验证的写入路径。私钥使用结构合法的占位 PEM——端到端
 # 测试不启动 Authelia 进程，只需要通过 nsetup 的格式校验。
+#
+# 刻意保留 metrics_path：nsetup 必须忽略它（见 R9），检查脚本据此断言。
 write_authelia_toml() {
   local path=$1
   E template authelia \

@@ -189,11 +189,29 @@ forwarded-headers / internal-only / tls）。Traefik 项目与应用项目完全
 `authelia@file`，使控制台同时受内网来源限制与 Authelia 登录保护；关闭或省略时
 只保留内网限制。启用前应先准备可用的 Authelia 配置。
 
+dashboard 只生成一条 router（`nsetup-traefik-traefik-dashboard`）：后端固定是内置的
+`api@internal`（永远不写 `loadbalancer.server.port`），entrypoint 为 `https`，
+priority 1000，带内网来源限制与主域名通配符证书域名。0.2.1 曾经额外生成一条把容器
+8080 当后端的应用式路由，两条 router 抢同一个 `Host()`，实际命中的是回源到容器端口
+的那条（表现为 dashboard 404）；0.2.2 起不再生成。
+
+`metrics = true` 时除启动参数外，还会在 `config/dynamic/nsetup.yml` 里为指标入口
+生成两条 file provider router：`Path(`/metrics`)` → `prometheus@internal`，以及
+`PathPrefix(`/api`) || PathPrefix(`/debug`)` → `api@internal`。没有 router 时该入口
+一律 404，Prometheus 的 `traefik:8081` job 与 `nsetup doctor` 都无法工作。
+
+内置 `tls` 是响应头中间件（HSTS：`stsSeconds` + `stsIncludeSubdomains`），不是路由级
+TLS 开关；路由是否终止 TLS 由 entrypoint 决定。它必须继续生成，因为历史配置把 `tls`
+写在 `middlewares` 列表里，缺失会让整条路由报 `middleware "tls@file" does not exist`。
+
 Traefik 的运行默认值以 `main` 分支既有基础设施生成器为基线：dashboard 路由固定
 指向 `api@internal`；路由使用 `cloudflare` resolver 和主域名 + 通配符 SAN；关闭
-匿名统计、版本检查、access log、metrics 与 tracing；启用 ping 健康检查、HTTP/3、
-EC256、指定 DNS resolver、30 秒 DNS 传播等待，以及 `json-file` 日志滚动。当前
-架构只调整受管路径、网络名和新增的 Authelia 中间件，不重新猜测基础设施默认值。
+匿名统计、版本检查、access log 与 tracing；默认启用 Prometheus 指标、ping 健康
+检查、HTTP/3、EC256、指定 DNS resolver、30 秒 DNS 传播等待，以及 `json-file` 日志
+滚动。健康检查固定为 `CMD ["traefik", "healthcheck", "--ping"]`：Docker 的
+HEALTHCHECK 是独立进程，读不到容器 command 里的 `--ping=true`，缺 `--ping` 会一直报
+「please enable ping to use health check」而恒为 unhealthy。当前架构只调整受管路径、
+网络名和新增的 Authelia 中间件，不重新猜测基础设施默认值。
 
 ### authelia 模板：基础认证设施
 
@@ -281,6 +299,13 @@ TOML 声明管理，`watch = false`，并禁用容器内密码修改与重置，
 导出状态形成双重真相。用户名或密码哈希变更后必须显式重启容器加载新用户库。
 `storage_encryption_key` 是持久化状态的加密根密钥，数据库初始化后必须保持稳定；
 轮换必须先用旧密钥执行 Authelia 的 `storage encryption change-key`，不能仅重写配置。
+
+可选的 `[telemetry]` 只生成 `telemetry.metrics.address` 与 `telemetry.tracing.*`：
+Authelia 4.39.x 的指标路径固定为 `/metrics`，写出的 `telemetry.metrics.path` 会被
+当成未知配置键并 fatal 退出（`configuration key not expected: telemetry.metrics.path`），
+容器随即进入无限重启。声明里的 `metrics_path` 仍被接受并原样保留在导出结果中
+（`export → up` 无损），但不是 `/metrics` 时只记一条警告，不写入 YAML。
+
 二次验证固定使用 TOTP：将其显式启用并设为默认方法，同时禁用 WebAuthn；是否要求
 二次验证仍分别由 ForwardAuth 的 `default_policy` 和 OIDC 客户端的
 `authorization_policy` 决定。
@@ -540,6 +565,20 @@ bind mount 白名单 = `data_roots` ∪ `stacks_root` ∪ `docker_socket`（精�
 | 钩子输出与失败提示 | 钩子的 stdout/stderr 会作为进度信息回显；失败时的错误包含退出码、完整输出、容器当前状态与补救命令。`nsetup up --help` 说明钩子运行环境与 `/tmp` 只读。 |
 | Authelia `/config` 改为可写挂载 | 官方镜像 entrypoint 会执行 `chown -R ${PUID}:${PGID} /config`（镜像默认 `0:0`），只读挂载会让每次启动都往容器日志写 `chown: ... Read-only file system`；`/secrets` 保持只读。OIDC 片段改为原地重写，不再替换 inode。 |
 | `--restart-dependents` 文案 | 实际执行了重启时提示「已重启 authelia 使新客户端生效」，未重启时附带确切命令 `nsetup restart authelia`。 |
+
+## 0.2.2 兼容性说明
+
+升级到 0.2.2 时注意以下行为变化（全部来自 0.2.1 的实测反馈）：
+
+| 变化 | 说明 |
+| --- | --- |
+| Authelia 不再生成 `telemetry.metrics.path` | `metrics_path` 仍可写出、仍原样保留在 `export` 结果里，但不再进入 `configuration.yml`；Authelia 4.39.x 的指标路径固定为 `/metrics`，多出该键会让容器以 `configuration key not expected: telemetry.metrics.path` fatal 退出并无限重启。写上非 `/metrics` 的值时只记一条 warning。 |
+| traefik dashboard 只保留一条路由 | 不再额外生成把容器 8080 当后端的应用式路由。dashboard 固定 `api@internal`、priority 1000、`internal-only@file`（开启 `dashboard_authelia` 时再叠加 `authelia@file`），并显式声明主域名通配符证书域名。升级后重新 `nsetup up -f traefik.toml --force --start`，原先为绕开 404 而在 `dynamic/custom.yml` 里补的 `dashboard-managed` router 应当删除。 |
+| 指标入口自动生成 router | `metrics = true` 时 `config/dynamic/nsetup.yml` 里生成 `Path(`/metrics`)` → `prometheus@internal` 与 `PathPrefix(`/api`) \|\| PathPrefix(`/debug`)` → `api@internal`；`nsetup doctor` 因此不再降级为仅检查容器 label。为绕开 404 而在 `custom.yml` 里补的 `metrics-internal` / `api-internal` router 应当删除。 |
+| 内置 `tls` 中间件保证存在 | `tls` 是 HSTS 响应头中间件，继续随 `nsetup.yml` 生成，历史配置里的 `middlewares = ["tls"]` 不需要改；在 `custom.yml` 里补的 `tls` 定义应当删除（同名 file provider 中间件会被后加载的文件覆盖）。骨架与文档补上「不是路由级 TLS 开关」的说明。 |
+| traefik 健康检查带 `--ping` | 健康检查固定为 `CMD ["traefik", "healthcheck", "--ping"]`，容器不再恒为 `unhealthy`；用 `nsetup edit … --healthcheck-cmd` 打的补丁不再需要。 |
+| `nsetup doctor` 归一化 router 名 | 比对前去掉 Traefik API 名字里的 `@<provider>` 后缀，不再把正常路由同时报成「未被加载」和「已不再声明」，完整报告重新可用。 |
+| traefik 路由表 BACKEND 显示内置服务 | `nsetup show traefik --routes` 里 dashboard 的后端显示为 `api@internal`（不带端口），容器路由仍是 `服务:端口`。 |
 
 ## 设计约束
 
