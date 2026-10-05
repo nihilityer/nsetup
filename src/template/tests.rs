@@ -358,6 +358,56 @@ fn dynamic_config(generated: &super::TemplateOutput) -> anyhow::Result<String> {
     Ok(String::from_utf8(file.content.clone())?)
 }
 
+/// 读出模板生成的用户动态配置骨架。
+fn user_dynamic_file(generated: &super::TemplateOutput) -> anyhow::Result<&super::GeneratedFile> {
+    generated
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("dynamic/custom.yml"))
+        .ok_or_else(|| anyhow::anyhow!("missing dynamic/custom.yml"))
+}
+
+/// R13：播种的 `dynamic/custom.yml` 不能含任何生效的 YAML。
+///
+/// Traefik 的 `structures` 解码器把空映射判定为 standalone element，骨架里只要有
+/// `http: {}`、`routers: {}`、`services: {}`、`middlewares: {}` 之一，file provider
+/// 就会在构建动态配置时报错，同目录的 `nsetup.yml`（metrics / api 路由与内置 `tls`
+/// 中间件）随之整体失效。骨架因此只写注释。
+#[test]
+fn traefik_user_dynamic_skeleton_has_no_active_yaml() -> anyhow::Result<()> {
+    let input = r#"
+format = 1
+template = "traefik"
+domain = "example.com"
+acme_email = "admin@example.com"
+cloudflare_token = "secret"
+version = "v3.8.0"
+"#;
+    let generated = apply(input, &Config::default(), None)?;
+    let file = user_dynamic_file(&generated)?;
+    let skeleton = String::from_utf8(file.content.clone())?;
+    let active = skeleton
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    assert!(active.is_empty(), "骨架含生效的 YAML 行: {active:?}");
+    assert!(matches!(
+        serde_yaml::from_str::<serde_yaml::Value>(&skeleton)?,
+        serde_yaml::Value::Null
+    ));
+    // 说明必须留在文件里：空映射的失败现象是容器 healthy 但整个 file provider 失效。
+    assert!(skeleton.contains("standalone element"), "{skeleton}");
+    // 用户拥有：不整体替换，也不覆盖既有内容。
+    assert!(!file.replace && !file.overwrite);
+    // 但 nsetup 自己播种过的旧骨架必须能升级（R13）。
+    assert_eq!(file.legacy_contents.len(), 1);
+    let legacy = String::from_utf8(file.legacy_contents[0].clone())?;
+    assert!(legacy.contains("middlewares: {}"), "{legacy}");
+    assert!(legacy.contains("routers: {}"), "{legacy}");
+    Ok(())
+}
+
 /// dashboard 只保留一条 `api@internal` 路由，健康检查带 `--ping`（R10-A、R12）。
 #[test]
 fn traefik_dashboard_route_targets_internal_api() -> anyhow::Result<()> {
@@ -530,11 +580,7 @@ dashboard_authelia = true
         .find(|file| file.path.ends_with("acme.json"))
         .ok_or_else(|| anyhow::anyhow!("missing acme.json"))?;
     assert!(!acme.replace);
-    let user_file = generated
-        .files
-        .iter()
-        .find(|file| file.path.ends_with("dynamic/custom.yml"))
-        .ok_or_else(|| anyhow::anyhow!("missing dynamic/custom.yml"))?;
+    let user_file = user_dynamic_file(&generated)?;
     assert!(!user_file.replace, "用户可编辑的动态配置不能被整体替换");
     let exported = export(&generated.spec, &config)?;
     assert!(exported.contains("dashboard_authelia = true"));

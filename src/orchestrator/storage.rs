@@ -113,6 +113,8 @@ fn relative_path(path: &Path, owned: &Path) -> anyhow::Result<PathBuf> {
 /// 把受管目录中声明为「不替换」的既有文件读入内存，供目录重写后还原。
 ///
 /// 返回的文件路径已改为相对受管目录，可以交给 [`write_attachment`] 直接写回。
+/// 既有内容仍是 nsetup 播种过的旧版本（[`GeneratedFile::legacy_contents`]）时不进入
+/// 保留列表，交给本次生成覆盖，旧骨架因此可以在升级后自愈。
 ///
 /// # 错误
 ///
@@ -132,14 +134,43 @@ fn stage_preserved_files(
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             anyhow::bail!("受管附属路径不是普通文件: {}", source.display());
         }
+        let content = fs::read(&source)
+            .with_context(|| format!("无法读取既有附属文件: {}", source.display()))?;
+        if matches_legacy_content(file, &content) {
+            continue;
+        }
         preserved.push(GeneratedFile {
-            content: fs::read(&source)
-                .with_context(|| format!("无法读取既有附属文件: {}", source.display()))?,
+            content,
             directory_mode: metadata.permissions().mode() & 0o777,
             ..file.clone()
         });
     }
     Ok(preserved)
+}
+
+/// 判断既有内容是否与文件声明过的某个旧版本内容逐字节相同。
+fn matches_legacy_content(file: &GeneratedFile, content: &[u8]) -> bool {
+    file.legacy_contents.iter().any(|legacy| legacy == content)
+}
+
+/// 判断目标位置的既有内容是否仍是 nsetup 播种过的旧版本。
+///
+/// 文件不存在或没有声明旧版本内容时返回 `false`。
+///
+/// # 错误
+///
+/// 既有文件存在但无法读取时返回错误。
+fn existing_is_legacy(path: &Path, file: &GeneratedFile) -> anyhow::Result<bool> {
+    if file.legacy_contents.is_empty() {
+        return Ok(false);
+    }
+    match fs::read(path) {
+        Ok(existing) => Ok(matches_legacy_content(file, &existing)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("无法读取既有附属文件: {}", path.display()))
+        }
+    }
 }
 
 /// 删除一个受管目录，使其只保留本次写入的内容。
@@ -282,7 +313,7 @@ pub(super) fn write_attachment(
 ) -> anyhow::Result<()> {
     validate_relative_path(&file.path)?;
     let destination = root.join(&file.path);
-    if !file.overwrite && destination.is_file() {
+    if !file.overwrite && destination.is_file() && !existing_is_legacy(&destination, file)? {
         return Ok(());
     }
     let parent = destination
@@ -473,6 +504,7 @@ mod tests {
                 directory_mode: crate::template::ASSET_DIRECTORY_MODE,
                 replace: true,
                 overwrite: true,
+                legacy_contents: Vec::new(),
             }],
             kind: TemplateKind::App,
         };
@@ -511,6 +543,7 @@ mod tests {
                 directory_mode: crate::template::ASSET_DIRECTORY_MODE,
                 replace: true,
                 overwrite: true,
+                legacy_contents: Vec::new(),
             }],
             kind: TemplateKind::App,
         };
@@ -559,6 +592,47 @@ mod tests {
         Ok(())
     }
 
+    /// R13：命中 nsetup 旧骨架的既有文件被换成新内容，用户改过的内容逐字节保留。
+    ///
+    /// 0.2.0–0.2.2 播种的 `dynamic/custom.yml` 含空映射，会让 Traefik 的 file provider
+    /// 整体失败；这类文件只可能由 nsetup 自己写出，升级时必须自愈。用户动过的内容
+    /// 不在 `legacy_contents` 里，仍然逐字节保留。
+    #[test]
+    fn legacy_content_is_replaced_but_user_content_is_preserved() -> anyhow::Result<()> {
+        let root = crate::test_support::temp_directory("nsetup-legacy-content")?;
+        let dynamic = root.join("config/dynamic");
+        std::fs::create_dir_all(&dynamic)?;
+        let owned = user_file("config/dynamic/custom.yml");
+        let legacy = owned.legacy_contents[0].clone();
+        let generated = owned.content.clone();
+        let managed = file("config/dynamic/nsetup.yml", true);
+        let files = vec![managed.clone(), owned.clone()];
+        let owned_directory = std::path::Path::new("config/dynamic");
+
+        // 旧骨架：受管目录整体重写时必须换成新内容，而不是被当作「用户文件」保留。
+        std::fs::write(dynamic.join("custom.yml"), &legacy)?;
+        super::sync_owned_directory(&root, owned_directory, &files)?;
+        assert_eq!(std::fs::read(dynamic.join("custom.yml"))?, generated);
+        assert_eq!(std::fs::read(dynamic.join("nsetup.yml"))?, managed.content);
+
+        // 用户改过的内容：即使同一轮还会重写受管目录，也必须逐字节保留。
+        let edited = "# 用户自己的路由\n".as_bytes().to_vec();
+        std::fs::write(dynamic.join("custom.yml"), &edited)?;
+        super::sync_owned_directory(&root, owned_directory, &files)?;
+        assert_eq!(std::fs::read(dynamic.join("custom.yml"))?, edited);
+
+        // 不走受管目录同步的写入路径（直接写入附属文件的调用方）同样要生效。
+        let other = crate::test_support::temp_directory("nsetup-legacy-content-direct")?;
+        let direct = user_file("custom.yml");
+        std::fs::write(other.join("custom.yml"), &legacy)?;
+        super::write_attachment(&other, &direct, crate::template::PRIVATE_DIRECTORY_MODE)?;
+        assert_eq!(std::fs::read(other.join("custom.yml"))?, generated);
+        std::fs::write(other.join("custom.yml"), &edited)?;
+        super::write_attachment(&other, &direct, crate::template::PRIVATE_DIRECTORY_MODE)?;
+        assert_eq!(std::fs::read(other.join("custom.yml"))?, edited);
+        Ok(())
+    }
+
     /// 构造一个受管附属文件描述。
     fn file(path: &str, replace: bool) -> GeneratedFile {
         GeneratedFile {
@@ -568,13 +642,18 @@ mod tests {
             directory_mode: crate::template::ASSET_DIRECTORY_MODE,
             replace,
             overwrite: true,
+            legacy_contents: Vec::new(),
         }
     }
 
     /// 构造一个「用户拥有」的附属文件描述：不整体替换，也不覆盖既有内容。
+    ///
+    /// 同时声明一份「旧骨架」内容：命中它的既有文件允许升级为新内容。
     fn user_file(path: &str) -> GeneratedFile {
         GeneratedFile {
+            content: "# 新骨架\n".as_bytes().to_vec(),
             overwrite: false,
+            legacy_contents: vec!["# 旧骨架\n".as_bytes().to_vec()],
             ..file(path, false)
         }
     }

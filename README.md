@@ -68,7 +68,8 @@ cargo clippy --all-targets --quiet -- -D warnings
 git diff --check
 ```
 
-需要真实 daemon 与 Docker 的端到端验收（R1–R12：模板与骨架 round-trip、上传权限、
+需要真实 daemon 与 Docker 的端到端验收（R1–R13：模板与骨架 round-trip、上传权限、
 路由表、钩子、相对挂载、`--files-only`、Authelia 挂载与遥测、traefik 自路由 /
-metrics router / 健康检查、`doctor` 路由比对）用 `tests/e2e/run.sh`，它会在临时目录
-里起一个前台 daemon，不需要 root；详见 [tests/e2e/README.md](tests/e2e/README.md)。
+metrics router / 健康检查、`dynamic/custom.yml` 骨架与 Traefik file provider 实际
+加载、`doctor` 路由比对）用 `tests/e2e/run.sh`，它会在临时目录里起一个前台 daemon，
+不需要 root；详见 [tests/e2e/README.md](tests/e2e/README.md)。

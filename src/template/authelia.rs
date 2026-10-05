@@ -530,6 +530,7 @@ fn generated_file(path: &str, content: String, mode: u32) -> GeneratedFile {
         directory_mode: super::PRIVATE_DIRECTORY_MODE,
         replace: true,
         overwrite: true,
+        legacy_contents: Vec::new(),
     }
 }
 

@@ -580,6 +580,16 @@ bind mount 白名单 = `data_roots` ∪ `stacks_root` ∪ `docker_socket`（精�
 | `nsetup doctor` 归一化 router 名 | 比对前去掉 Traefik API 名字里的 `@<provider>` 后缀，不再把正常路由同时报成「未被加载」和「已不再声明」，完整报告重新可用。 |
 | traefik 路由表 BACKEND 显示内置服务 | `nsetup show traefik --routes` 里 dashboard 的后端显示为 `api@internal`（不带端口），容器路由仍是 `服务:端口`。 |
 
+## 0.2.3 兼容性说明
+
+升级到 0.2.3 时注意以下行为变化（来自 0.2.2 的实测反馈）：
+
+| 变化 | 说明 |
+| --- | --- |
+| 播种的 `dynamic/custom.yml` 只含注释 | 骨架不再写 `http: {}`、`routers: {}`、`services: {}`、`middlewares: {}`：Traefik 的 `structures` 解码器把空映射判定为 standalone element，file provider 按整目录构建，一个文件解析失败就让同目录 `nsetup.yml` 里的 metrics / api 路由与内置 `tls` 中间件一起失效（`/metrics` 404、响应缺 HSTS、`doctor` 降级），而容器健康检查只看 `--ping`，仍然是 `healthy`。注释与空文件都能正常加载，示例因此全部保持注释状态。 |
+| 旧骨架自动升级 | 0.2.0–0.2.2 播种的 `custom.yml` 会在下次 `nsetup up`（含 `--force`）时换成只含注释的新骨架，否则升级后故障仍在。只有内容与旧模板逐字节相同才替换；用户改过的内容仍逐字节保留。改过、但里面还留着空映射的文件不会被改写，需要手工删掉那些行。 |
+| `config/dynamic` 只保留两个文件 | 该目录是受管目录，`nsetup up` 会整体重写它，`nsetup.yml` 由模板拥有、`custom.yml` 由用户拥有，其余 `*.yml` 一律清除。0.2.0 起的骨架注释曾称「同目录新增其它 `*.yml` 效果相同」，该说法不成立，手工配置必须写在 `custom.yml` 里。 |
+
 ## 设计约束
 
 - **C1 镜像钉版本**：所有镜像必须带明确标签，拒绝 `latest` 与缺省标签；标签

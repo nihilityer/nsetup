@@ -132,10 +132,10 @@ pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result
                 directory_mode: crate::template::PRIVATE_DIRECTORY_MODE,
                 replace: true,
                 overwrite: true,
+                legacy_contents: Vec::new(),
             },
-            // 用户可以在同一目录里追加自己的动态配置文件，traefik 的 file
-            // provider 会加载目录中的全部 `*.yml`，因此 `nsetup up` 重写
-            // nsetup.yml 时不会清除手工追加的路由与中间件。
+            // `custom.yml` 是目录里唯一由用户拥有、`nsetup up` 不会清除的文件，因此
+            // 手工追加的路由与中间件都要写在它里面。
             GeneratedFile {
                 path: PathBuf::from("config/dynamic/custom.yml"),
                 content: USER_DYNAMIC_TEMPLATE.as_bytes().to_vec(),
@@ -144,6 +144,8 @@ pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result
                 replace: false,
                 // 用户拥有的文件：只做首次生成，之后不再覆盖。
                 overwrite: false,
+                // 例外：内容仍是 nsetup 自己播种过的旧骨架时，换成不含空映射的新骨架。
+                legacy_contents: legacy_user_dynamic_templates(),
             },
             GeneratedFile {
                 path: PathBuf::from("config/acme.json"),
@@ -153,6 +155,7 @@ pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result
                 replace: false,
                 // 已签发的 ACME 证书不能被覆盖，否则每次应用都会重新申请。
                 overwrite: false,
+                legacy_contents: Vec::new(),
             },
         ],
         kind: TemplateKind::Traefik,
@@ -160,7 +163,45 @@ pub(super) fn generate(input: &TraefikConfig, config: &Config) -> anyhow::Result
 }
 
 /// 用户可以自由编辑的附加动态配置模板。
+///
+/// 只写注释，不写任何生效的 YAML：Traefik 的 `structures` 解码器把**空映射**判定为
+/// standalone element，`http: {}`、`routers: {}`、`services: {}`、`middlewares: {}`
+/// 都会让 file provider 在构建动态配置时报错，同目录的 `nsetup.yml`（metrics / api
+/// 路由与内置 `tls` 中间件）随之整体失效，而容器健康检查与 file provider 无关，仍报
+/// `healthy`。注释与空文件都能被正常加载，因此示例一律保持注释状态。
 const USER_DYNAMIC_TEMPLATE: &str = "\
+# 手工追加的 Traefik 动态配置。
+#
+# 本文件与 nsetup.yml 位于同一个目录，traefik 的 file provider 会一并加载，因此这里
+# 的路由与中间件不会被 `nsetup up -f traefik.toml` 清除。
+# 本文件可以为空（只有注释），但不要留下空映射：`http: {}`、`routers: {}`、
+# `services: {}`、`middlewares: {}` 都会让 Traefik 报
+# `cannot be a standalone element`，并让整个 file provider（含 nsetup.yml 的 metrics
+# 与 api 路由、内置 tls 中间件）一起失效；映射里至少要有一个条目。
+# 同目录新增的其它 `*.yml` 会在 `nsetup up` 时被清除，手工配置请统一写在本文件里。
+#
+# 需要追加路由时取消下面的注释并填上真实取值：
+#
+# http:
+#   routers:
+#     example:
+#       rule: Host(`example.example.com`) && PathPrefix(`/`)
+#       entryPoints:
+#         - https
+#       service: example
+#   services:
+#     example:
+#       loadBalancer:
+#         servers:
+#           - url: http://example:8080
+";
+
+/// 0.2.0–0.2.2 播种的 `dynamic/custom.yml`。
+///
+/// 该骨架含空映射，会让 Traefik 的 file provider 整体构建失败（R13）。只有既有内容与
+/// 这里逐字节相同时才视为「用户从未改动的旧模板」并由新骨架覆盖；用户改过的内容一律
+/// 逐字节保留。
+const LEGACY_USER_DYNAMIC_TEMPLATES: &[&str] = &["\
 # 手工追加的 Traefik 动态配置。
 #
 # 本文件与 nsetup.yml 位于同一个目录，traefik 的 file provider 会加载目录中所有
@@ -170,7 +211,15 @@ http:
   routers: {}
   services: {}
   middlewares: {}
-";
+"];
+
+/// 把旧骨架常量转换成 [`GeneratedFile::legacy_contents`] 需要的字节列表。
+fn legacy_user_dynamic_templates() -> Vec<Vec<u8>> {
+    LEGACY_USER_DYNAMIC_TEMPLATES
+        .iter()
+        .map(|template| template.as_bytes().to_vec())
+        .collect()
+}
 
 /// 构造沿用 main 分支默认行为的 Traefik 启动参数。
 fn traefik_command(input: &TraefikConfig) -> Vec<String> {

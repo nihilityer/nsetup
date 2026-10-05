@@ -172,6 +172,14 @@ nsetup up -f app.toml --start
 `traefik` / `authelia` 模板的项目名固定，`name` 可以省略；`nsetup template` 的骨架与
 `nsetup export` 的产出都可以直接 `nsetup up`。
 
+Traefik 的手工动态配置写在 `<项目目录>/config/dynamic/custom.yml`：首次 `up` 时播种
+带注释的骨架，之后由用户拥有、不再被覆盖；同目录新增的其它 `*.yml` 会随受管目录在
+`nsetup up` 时被清除，手工配置请统一写在该文件里。骨架可以只有注释，但不要留下
+`middlewares: {}`、`routers: {}` 这类空映射——Traefik 会报
+`cannot be a standalone element`，并让整个 file provider（含 nsetup 生成的
+`/metrics`、`/api` 路由与内置 `tls` 中间件）一起失效，而容器仍是 healthy，从容器
+状态看不出问题。
+
 Authelia 的用户、TOTP、ForwardAuth、OIDC 和密钥操作见
 [Authelia 认证](AUTHELIA.md)。
 

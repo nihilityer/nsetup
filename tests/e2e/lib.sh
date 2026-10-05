@@ -168,6 +168,77 @@ stop_daemon() {
   fi
 }
 
+# ---- Traefik file provider 探针 ---------------------------------------------
+
+# 轮询一个 URL，直到状态码等于期望值或超时；回显最后一次状态码。
+#
+# 返回 0 表示在 `attempts` 次内取到了期望状态码（每次间隔 0.5 秒）。
+wait_http_status() {
+  local url=$1 expected=$2 attempts=${3:-20} code=""
+  local attempt=0
+  while [ "$attempt" -lt "$attempts" ]; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
+    if [ "$code" = "$expected" ]; then
+      printf '%s\n' "$code"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+  if [ -z "$code" ]; then
+    code="无响应"
+  fi
+  printf '%s\n' "$code"
+  return 1
+}
+
+# 选择一个可用于加载动态配置的本机 traefik 镜像。
+#
+# 优先使用项目 `.env` 里声明的版本，其次任意本地 `traefik:v3.*` 镜像（v2 的中间件名
+# 与 v3 不同，会让探针误报）；都没有时返回非零，调用方记为 SKIP，保证整套测试在没有
+# 镜像的机器上仍可离线运行。
+traefik_probe_image() {
+  local project=$1 tag candidate
+  tag=$(sed -n 's/^TRAEFIK_VERSION=//p' "$project/.env" 2>/dev/null | head -1)
+  if [ -n "$tag" ] && docker image inspect "traefik:$tag" >/dev/null 2>&1; then
+    printf 'traefik:%s\n' "$tag"
+    return 0
+  fi
+  candidate=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -m1 '^traefik:v3\.' || true)
+  if [ -n "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+# 启动一个只加载 file provider 的临时 traefik，回显它绑定到宿主机的 8081 端口。
+#
+# 静态参数取最小集：这里只要求 Traefik 真正解析目录里的 `nsetup.yml` 与
+# `custom.yml`。file provider 按整目录构建，任一文件解析失败都会整体失败，入口上的
+# `/metrics` 随即 404——正是 R13 的故障现象。宿主机端口用随机值，避免与测试机上真实
+# traefik 占用的 `127.0.0.1:8081` 冲突。
+traefik_probe_start() {
+  local image=$1 dynamic=$2 name=$3 port
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" \
+    -v "$dynamic":/etc/traefik/dynamic:ro \
+    -p '127.0.0.1::8081' \
+    "$image" \
+    --providers.file.directory=/etc/traefik/dynamic \
+    --providers.file.watch=true \
+    --entrypoints.metrics.address=:8081 \
+    --metrics.prometheus=true \
+    --api=true \
+    --ping=true \
+    --log.level=INFO >/dev/null 2>&1 || return 1
+  port=$(docker port "$name" 8081/tcp 2>/dev/null | head -1 | sed 's/.*://')
+  if [ -z "$port" ]; then
+    return 1
+  fi
+  printf '%s\n' "$port"
+}
+
 # ---- 夹具 -------------------------------------------------------------------
 
 # 生成静态站点资源目录。

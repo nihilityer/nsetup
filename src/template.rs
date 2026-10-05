@@ -90,6 +90,13 @@ pub struct GeneratedFile {
     /// 模板交给用户拥有的文件（例如 traefik 的 `dynamic/custom.yml`）为 `false`，
     /// 首次生成后不再覆盖用户编辑；上传资源与模板拥有的配置为 `true`。
     pub overwrite: bool,
+    /// 既有内容与其中一项逐字节相同时，仍然允许覆盖的旧版本内容。
+    ///
+    /// 只对 `overwrite = false` 的文件有意义：用户改动过的内容必须逐字节保留，但
+    /// nsetup 自己播种过、后来被判定为非法的旧模板要能升级。例如 0.2.0–0.2.2 的
+    /// `dynamic/custom.yml` 含空映射，会让 Traefik 的 file provider 整体失败，命中
+    /// 旧骨架的既有文件因此直接换成新骨架。
+    pub legacy_contents: Vec<Vec<u8>>,
 }
 
 /// 模板转换输出。
@@ -595,6 +602,7 @@ pub fn app_oidc_client_fragment(spec: &StackSpec) -> anyhow::Result<Option<Gener
         directory_mode: PRIVATE_DIRECTORY_MODE,
         replace: true,
         overwrite: true,
+        legacy_contents: Vec::new(),
     }))
 }
 

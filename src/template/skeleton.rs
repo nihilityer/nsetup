@@ -260,7 +260,10 @@ dashboard_authelia = true
 # args = { prefixes = ["/api"], forceSlash = true }
 
 # 生成的内置中间件写入 config/dynamic/nsetup.yml；同目录的 custom.yml 由用户拥有，
-# 不会被 nsetup up 覆盖，可以在其中追加路由与中间件。
+# 不会被 nsetup up 覆盖，可以在其中追加路由与中间件（同目录其它 *.yml 会被清除）。
+# custom.yml 里不要留 `middlewares: {}` 这类空映射：Traefik 会报
+# `cannot be a standalone element`，并让整个 file provider——包括 nsetup.yml 的
+# metrics / api 路由与内置 tls 中间件——一起失效，容器却仍然是 healthy。
 #
 # 固定生成、无需手工维护：dashboard 路由（traefik.<domain> → api@internal，
 # priority 1000，internal-only 可叠加 authelia）与健康检查（healthcheck --ping）。

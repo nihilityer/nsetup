@@ -217,6 +217,7 @@ impl OrchestratorRpc for RpcService {
                             directory_mode: template::ASSET_DIRECTORY_MODE,
                             replace: true,
                             overwrite: true,
+                            legacy_contents: Vec::new(),
                         },
                     })
                     .collect::<Vec<_>>();

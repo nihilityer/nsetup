@@ -227,6 +227,7 @@ fn static_files() -> Vec<GeneratedFile> {
         directory_mode: PRIVATE_DIRECTORY_MODE,
         replace: true,
         overwrite: true,
+        legacy_contents: Vec::new(),
     }]
 }
 

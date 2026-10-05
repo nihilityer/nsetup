@@ -519,6 +519,7 @@ fn attach_assets(
             replace,
             // `merge` 也要覆盖同名文件，`replace` 只决定是否清空既有目录。
             overwrite: true,
+            legacy_contents: Vec::new(),
         });
     }
 }
